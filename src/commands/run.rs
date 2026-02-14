@@ -18,26 +18,26 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>) -> Result<
 
     // Start tunnel first if ports specified
     if !ports.is_empty() {
-        println!("Starting tunnel for ports: {:?}", ports);
         ssh::start_tunnel(remote, &ports).await?;
-        // Give tunnel time to establish
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 
     let remote_path = format!("~/berth/projects/{}", name);
-    let full_cmd = format!("cd {} && {}", remote_path, cmd_str);
+    // Use nohup and disown to keep process alive after SSH closes
+    let full_cmd = format!(
+        "cd {} && nohup {} >/dev/null 2>&1 & disown",
+        remote_path, cmd_str
+    );
 
-    println!("Running on {}: {}", remote, full_cmd);
+    println!("Running on {}: cd {} && {}", remote, remote_path, cmd_str);
     
     let output = ssh::run_remote_command(remote, &full_cmd).await?;
     
-    println!("{}", output);
+    if !output.is_empty() {
+        println!("{}", output);
+    }
     
-    // If ports specified, keep tunnel running
     if !ports.is_empty() {
-        println!("\nTunnel running. Press Ctrl+C to stop...");
-        let _ = tokio::signal::ctrl_c().await;
-        println!("Stopping tunnel...");
+        println!("Tunnel active for port(s): {:?} -> http://localhost:{}", ports, ports[0]);
     }
     
     Ok(())

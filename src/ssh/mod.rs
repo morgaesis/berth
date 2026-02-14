@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::env;
 use std::process;
 use tokio::process::Command;
+use tokio::time::sleep;
 
 fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
@@ -55,16 +56,15 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
     }
     args.push(host.to_string());
 
-    println!("Starting SSH tunnel: ssh {}", args.join(" "));
-    println!("Forwarding ports: {:?}", ports);
-    println!("Access via: http://localhost:<port>");
-    println!("Tunnel running in background. Use 'pkill -f \"ssh -N\"' to stop.");
+    println!("Starting SSH tunnel for ports {:?}...", ports);
 
-    // Use std Command with -f to fork to background
-    // This returns immediately after forking
+    // Start tunnel in background, don't wait
     let _status = process::Command::new("ssh")
         .args(&args)
         .spawn()?;
+
+    // Wait a moment for tunnel to establish
+    sleep(tokio::time::Duration::from_millis(300)).await;
 
     Ok(())
 }
