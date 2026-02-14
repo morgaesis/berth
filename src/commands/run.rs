@@ -14,12 +14,12 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>, remote_ove
 
     // Ports require a remote
     if !ports.is_empty() && remote.is_none() {
-        anyhow::bail!("Ports (-p) require a remote. Use --remote or set remote in workspace config.");
+        eprintln!("Ports (-p) have no effect for local workspaces. Ignoring.");
     }
 
     let cmd_str = command.join(" ");
     if cmd_str.is_empty() {
-        anyhow::bail!("No command specified");
+        eprintln!("No command specified");
     }
 
     match remote {
@@ -62,7 +62,7 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>, remote_ove
                 .output()?;
 
             if !output.status.success() {
-                anyhow::bail!("Command failed: {}", String::from_utf8_lossy(&output.stderr));
+                eprintln!("Command failed: {}", String::from_utf8_lossy(&output.stderr));
             }
 
             println!("{}", String::from_utf8_lossy(&output.stdout));
