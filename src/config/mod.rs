@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::path::PathBuf;
 
@@ -50,6 +51,10 @@ impl Config {
     }
 
     pub fn config_dir() -> Result<PathBuf> {
+        if let Ok(dir) = env::var("BERTH_CONFIG_DIR") {
+            return Ok(PathBuf::from(dir));
+        }
+
         dirs::config_dir()
             .map(|p| p.join(super::BERTH_CONFIG_DIR))
             .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))

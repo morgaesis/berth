@@ -1,11 +1,20 @@
 use anyhow::Result;
+use std::env;
 use std::fs;
 use std::io::Write;
 
 const HOSTS_MARKER_START: &str = "# === BERTH START ===";
 const HOSTS_MARKER_END: &str = "# === BERTH END ===";
 
+fn skip_hosts() -> bool {
+    env::var("BERTH_SKIP_HOSTS").is_ok()
+}
+
 pub fn add_entry(name: &str) -> Result<()> {
+    if skip_hosts() {
+        return Ok(());
+    }
+
     let hosts_path = "/etc/hosts";
     let content = fs::read_to_string(hosts_path)?;
 
@@ -54,6 +63,10 @@ pub fn add_entry(name: &str) -> Result<()> {
 }
 
 pub fn remove_entry(name: &str) -> Result<()> {
+    if skip_hosts() {
+        return Ok(());
+    }
+
     let hosts_path = "/etc/hosts";
     let content = fs::read_to_string(hosts_path)?;
 
@@ -81,6 +94,10 @@ pub fn remove_entry(name: &str) -> Result<()> {
 }
 
 pub fn clean() -> Result<()> {
+    if skip_hosts() {
+        return Ok(());
+    }
+
     let hosts_path = "/etc/hosts";
     let content = fs::read_to_string(hosts_path)?;
 
