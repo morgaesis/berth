@@ -41,6 +41,12 @@ _berth_set_title() {
     fi
 }
 
+_berth_set_prompt() {
+    if [[ -n "$BERTH_WORKSPACE" ]]; then
+        PS1="[berth] $PS1"
+    fi
+}
+
 berth() {
     case "$1" in
         enter)
@@ -65,12 +71,13 @@ if [[ -n "$ZSH_VERSION" ]]; then
     autoload -U add-zsh-hook
     add-zsh-hook chpwd _berth_chpwd
     add-zsh-hook precmd _berth_set_title
+    add-zsh-hook precmd _berth_set_prompt
 elif [[ -n "$BASH_VERSION" ]]; then
     cd() {
         builtin cd "$@"
         _berth_chpwd
     }
-    PROMPT_COMMAND="_berth_set_title;${PROMPT_COMMAND:+$PROMPT_COMMAND;}"
+    PROMPT_COMMAND="_berth_set_title;_berth_set_prompt;${PROMPT_COMMAND:+$PROMPT_COMMAND;}"
 fi
 
 _berth_auto_enter

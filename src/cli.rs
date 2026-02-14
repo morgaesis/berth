@@ -59,7 +59,7 @@ enum Commands {
         remote: Option<String>,
         #[arg(short = 'p', long = "ports", help = "Start tunnel for these ports (requires remote)", value_delimiter = ',')]
         ports: Vec<u16>,
-        #[arg(last = true)]
+        #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
     #[command(about = "Print shell integration script")]

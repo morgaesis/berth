@@ -3,6 +3,10 @@ use berth::ssh;
 use anyhow::Result;
 use std::process::Command;
 
+fn remote_projects_path() -> String {
+    "$HOME/.local/share/berth/projects".to_string()
+}
+
 pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>, remote_override: Option<String>) -> Result<()> {
     let config = Config::load()?;
     
@@ -31,7 +35,7 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>, remote_ove
                 false
             };
 
-            let remote_path = format!("~/berth/projects/{}", name);
+            let remote_path = format!("{}/{}", remote_projects_path(), name);
             let full_cmd = format!(
                 "cd {} && nohup {} >/dev/null 2>&1 & disown",
                 remote_path, cmd_str

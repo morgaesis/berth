@@ -10,21 +10,31 @@ fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
 
+fn remote_projects_path() -> String {
+    "$HOME/.local/share/berth/projects".to_string()
+}
+
 pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool) -> Result<()> {
     if skip_ssh() {
         println!("[TEST MODE] Would SSH to {} and enter workspace {}", host, workspace_name);
         return Ok(());
     }
 
-    let remote_path = format!("~/berth/projects/{}", workspace_name);
+    let remote_path = format!("{}/{}", remote_projects_path(), workspace_name);
     let ensure_cmd = if ensure_dir {
-        format!("mkdir -p {} && cd {}", remote_path, remote_path)
+        format!(
+            "mkdir -p {} && cd {} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
+            remote_path, remote_path
+        )
     } else {
-        format!("cd {}", remote_path)
+        format!(
+            "cd {} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
+            remote_path
+        )
     };
 
     let status = Command::new("ssh")
-        .arg("-t")
+        .arg("-tt")
         .arg(host)
         .arg(&ensure_cmd)
         .arg("&&")

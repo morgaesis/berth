@@ -73,7 +73,7 @@ fn enter_local(name: String, path: &Path) -> Result<()> {
     let mut child = std::process::Command::new(&shell)
         .current_dir(path)
         .env("BERTH_WORKSPACE", &name)
-        .env("BERTH_PATH", path)
+        .env("BERTH_PATH", path.to_string_lossy().as_ref())
         .spawn()?;
     
     child.wait()?;
