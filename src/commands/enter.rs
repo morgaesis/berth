@@ -1,5 +1,4 @@
 use berth::config::{Config, Workspace};
-use berth::hosts;
 use berth::ssh;
 use anyhow::Result;
 use std::env;
@@ -56,10 +55,6 @@ pub async fn run(name: String, remote_override: Option<String>, ports_override: 
 }
 
 fn enter_local(name: String, path: &Path) -> Result<()> {
-    if let Err(e) = hosts::add_entry(&name) {
-        eprintln!("Warning: Could not add hosts entry: {}. Use 'berth hosts install' to set up DNS.", e);
-    }
-    
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     
     println!("\x1b]2;berth: {}\x07", name);
@@ -75,10 +70,6 @@ fn enter_local(name: String, path: &Path) -> Result<()> {
 }
 
 async fn enter_remote(name: String, host: &str, path: &Path, ports: Option<&[u16]>) -> Result<()> {
-    if let Err(e) = hosts::add_entry(&name) {
-        eprintln!("Warning: Could not add hosts entry: {}. Use 'berth hosts install' to set up DNS.", e);
-    }
-    
     if let Some(ports) = ports {
         let _tunnel = ssh::start_tunnel(host, ports).await?;
     }
