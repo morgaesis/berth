@@ -7,17 +7,23 @@ fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
 
-pub async fn ssh_interactive(host: &str, path: &Path) -> Result<()> {
+pub async fn ssh_interactive(host: &str, path: &Path, ensure_dir: bool) -> Result<()> {
     if skip_ssh() {
         println!("[TEST MODE] Would SSH to {} and cd to {}", host, path.display());
         return Ok(());
     }
 
+    let path_str = path.to_string_lossy();
+    let ensure_cmd = if ensure_dir {
+        format!("mkdir -p {} && cd {}", path_str, path_str)
+    } else {
+        format!("cd {}", path_str)
+    };
+
     let status = Command::new("ssh")
         .arg("-t")
         .arg(host)
-        .arg("cd")
-        .arg(path)
+        .arg(&ensure_cmd)
         .arg("&&")
         .arg("exec")
         .arg("$SHELL")

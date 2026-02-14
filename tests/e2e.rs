@@ -29,11 +29,18 @@ impl TestContext {
         cmd.env("BERTH_SKIP_HOSTS", "1");
         cmd.env("BERTH_SKIP_SSH", "1");
         cmd.env("HOME", self.temp_dir.path());
+        cmd.env("BERTH_PROJECTS_DIR", self.temp_dir.path());
         cmd
     }
 
     fn project_path(&self, name: &str) -> PathBuf {
-        self.temp_dir.path().join("projects").join(name)
+        self.temp_dir
+            .path()
+            .join(".local")
+            .join("share")
+            .join("berth")
+            .join("projects")
+            .join(name)
     }
 }
 

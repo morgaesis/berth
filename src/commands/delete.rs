@@ -1,5 +1,4 @@
 use berth::config::Config;
-use berth::hosts;
 use anyhow::{bail, Result};
 
 pub async fn run(name: String) -> Result<()> {
@@ -11,8 +10,6 @@ pub async fn run(name: String) -> Result<()> {
 
     config.workspaces.remove(&name);
     config.save()?;
-
-    hosts::remove_entry(&name)?;
 
     println!("Deleted workspace '{}'", name);
     Ok(())

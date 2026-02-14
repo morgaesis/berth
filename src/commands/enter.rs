@@ -5,15 +5,23 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+fn default_projects_path() -> std::path::PathBuf {
+    if let Ok(dir) = env::var("BERTH_PROJECTS_DIR") {
+        return std::path::PathBuf::from(dir).join("projects");
+    }
+    
+    dirs::data_local_dir()
+        .map(|p| p.join("berth").join("projects"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/berth/projects"))
+}
+
 pub async fn run(name: String, remote_override: Option<String>, ports_override: Vec<u16>) -> Result<()> {
     let mut config = Config::load()?;
     
     let workspace = if let Some(ws) = config.workspaces.get(&name) {
         ws.clone()
     } else {
-        let default_path = dirs::home_dir()
-            .map(|h| h.join("projects").join(&name))
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
+        let default_path = default_projects_path().join(&name);
         
         let path_str = default_path.to_string_lossy().to_string();
         
@@ -76,7 +84,7 @@ async fn enter_remote(name: String, host: &str, path: &Path, ports: Option<&[u16
 
     println!("\x1b]2;berth: {} [{}]\x07", name, host);
     
-    ssh::ssh_interactive(host, path).await?;
+    ssh::ssh_interactive(host, path, true).await?;
 
     Ok(())
 }

@@ -3,6 +3,12 @@ use anyhow::{bail, Result};
 use std::path::PathBuf;
 use std::fs;
 
+fn default_projects_path() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .map(|p| p.join("berth").join("projects"))
+        .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/berth/projects"))
+}
+
 pub async fn run(name: String, path: Option<String>, remote: Option<String>, ports: Vec<u16>) -> Result<()> {
     let mut config = Config::load()?;
     
@@ -12,9 +18,7 @@ pub async fn run(name: String, path: Option<String>, remote: Option<String>, por
 
     let workspace_path = match path {
         Some(p) => PathBuf::from(p),
-        None => dirs::home_dir()
-            .map(|h| h.join("projects").join(&name))
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?,
+        None => default_projects_path().join(&name),
     };
 
     if !workspace_path.exists() {

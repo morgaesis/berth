@@ -55,8 +55,8 @@ impl Config {
             return Ok(PathBuf::from(dir));
         }
 
-        dirs::config_dir()
+        dirs::data_local_dir()
             .map(|p| p.join(super::BERTH_CONFIG_DIR))
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine data directory"))
     }
 }
