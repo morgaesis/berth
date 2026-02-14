@@ -57,29 +57,14 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
 
     println!("Starting SSH tunnel: ssh {}", args.join(" "));
     println!("Forwarding ports: {:?}", ports);
-    println!("Access via: http://localhost:<port> or http://<workspace>.berth:<port>");
-    println!("Press Ctrl+C to stop.");
+    println!("Access via: http://localhost:<port>");
+    println!("Tunnel running in background. Use 'pkill -f \"ssh -N\"' to stop.");
 
     // Use std Command with -f to fork to background
     // This returns immediately after forking
-    let status = process::Command::new("ssh")
+    let _status = process::Command::new("ssh")
         .args(&args)
         .spawn()?;
-
-    // Give the tunnel time to establish
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-
-    // Wait for ctrl+c
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nStopping tunnel...");
-            // Try to kill the ssh process
-            let _ = std::process::Command::new("pkill")
-                .arg("-f")
-                .arg(format!("ssh -N -L.*{}", host))
-                .spawn();
-        }
-    }
 
     Ok(())
 }

@@ -55,6 +55,8 @@ enum Commands {
     #[command(about = "Run a command on a remote workspace")]
     Run {
         name: String,
+        #[arg(short = 'p', long = "ports", help = "Start tunnel for these ports", value_delimiter = ',')]
+        ports: Vec<u16>,
         #[arg(last = true)]
         command: Vec<String>,
     },
@@ -101,8 +103,8 @@ impl Cli {
                 Commands::Delete { name } => {
                     commands::delete::run(name).await
                 }
-                Commands::Run { name, command } => {
-                    commands::run::run(name, command).await
+                Commands::Run { name, command, ports } => {
+                    commands::run::run(name, command, ports).await
                 }
                 Commands::InitShell => {
                     commands::init_shell::run()
