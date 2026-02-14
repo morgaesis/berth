@@ -7,7 +7,16 @@ use clap::{Parser, Subcommand};
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+    
+    #[arg(required = false)]
+    name: Option<String>,
+    
+    #[arg(short, long)]
+    remote: Option<String>,
+    
+    #[arg(short, long, value_delimiter = ',')]
+    ports: Vec<u16>,
 }
 
 #[derive(Subcommand)]
@@ -19,11 +28,6 @@ enum Commands {
         remote: Option<String>,
         #[arg(short, long, value_delimiter = ',')]
         ports: Vec<u16>,
-    },
-    Enter {
-        name: String,
-        #[arg(short, long)]
-        remote: Option<String>,
     },
     List,
     Tunnel {
@@ -56,35 +60,38 @@ enum HostsCommands {
 
 impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
-        match self.command {
-            Commands::New { name, path, remote, ports } => {
-                commands::new::run(name, path, remote, ports).await
+        if let Some(cmd) = self.command {
+            match cmd {
+                Commands::New { name, path, remote, ports } => {
+                    commands::new::run(name, path, remote, ports).await
+                }
+                Commands::List => {
+                    commands::list::run().await
+                }
+                Commands::Tunnel { name, ports } => {
+                    commands::tunnel::run(name, ports).await
+                }
+                Commands::Stop { name } => {
+                    commands::stop::run(name).await
+                }
+                Commands::Delete { name } => {
+                    commands::delete::run(name).await
+                }
+                Commands::InitShell => {
+                    commands::init_shell::run()
+                }
+                Commands::Agent { ports } => {
+                    commands::agent::run(ports).await
+                }
+                Commands::Hosts { command } => match command {
+                    HostsCommands::Update => commands::hosts::update().await,
+                    HostsCommands::Clean => commands::hosts::clean().await,
+                },
             }
-            Commands::Enter { name, remote } => {
-                commands::enter::run(name, remote).await
-            }
-            Commands::List => {
-                commands::list::run().await
-            }
-            Commands::Tunnel { name, ports } => {
-                commands::tunnel::run(name, ports).await
-            }
-            Commands::Stop { name } => {
-                commands::stop::run(name).await
-            }
-            Commands::Delete { name } => {
-                commands::delete::run(name).await
-            }
-            Commands::InitShell => {
-                commands::init_shell::run()
-            }
-            Commands::Agent { ports } => {
-                commands::agent::run(ports).await
-            }
-            Commands::Hosts { command } => match command {
-                HostsCommands::Update => commands::hosts::update().await,
-                HostsCommands::Clean => commands::hosts::clean().await,
-            },
+        } else if let Some(name) = self.name {
+            commands::enter::run(name, self.remote, self.ports).await
+        } else {
+            commands::list::run().await
         }
     }
 }

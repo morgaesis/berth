@@ -27,6 +27,8 @@ impl TestContext {
         let mut cmd = Command::new(&self.bin);
         cmd.env("BERTH_CONFIG_DIR", &self.config_dir);
         cmd.env("BERTH_SKIP_HOSTS", "1");
+        cmd.env("BERTH_SKIP_SSH", "1");
+        cmd.env("HOME", self.temp_dir.path());
         cmd
     }
 
@@ -274,58 +276,127 @@ fn test_init_shell() {
 }
 
 #[test]
-fn test_enter_local_workspace() {
+fn test_default_command_creates_and_enters() {
     let ctx = TestContext::new();
-    let project_path = ctx.project_path("localproj");
+    let project_path = ctx.temp_dir.path().join("projects").join("newproj");
 
-    fs::create_dir_all(&project_path).expect("Failed to create project dir");
+    assert!(!project_path.exists(), "Project should not exist yet");
 
-    ctx.berth()
-        .args(["new", "localproj", project_path.to_str().unwrap()])
+    let list_before = ctx.berth().args(["list"]).output().expect("Failed to list");
+    assert!(!String::from_utf8_lossy(&list_before.stdout).contains("newproj"));
+
+    let output = ctx
+        .berth()
+        .args(["newproj"])
         .output()
-        .expect("Failed to create workspace");
+        .expect("Failed to run berth newproj");
 
-    let config_path = ctx.temp_dir.path().join("etc").join("hosts");
-    fs::create_dir_all(config_path.parent().unwrap()).ok();
-    fs::write(&config_path, "127.0.0.1 localhost\n").ok();
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(project_path.exists(), "Project directory should be created");
+
+    let list_after = ctx.berth().args(["list"]).output().expect("Failed to list");
+    assert!(String::from_utf8_lossy(&list_after.stdout).contains("newproj"));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Created directory") || stdout.contains("Created workspace"));
 }
 
 #[test]
-fn test_enter_nonexistent_workspace_fails() {
+fn test_default_command_enters_existing() {
+    let ctx = TestContext::new();
+    let project_path = ctx.project_path("existingproj");
+
+    ctx.berth()
+        .args(["new", "existingproj", project_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to create workspace");
+
+    let output = ctx
+        .berth()
+        .args(["existingproj"])
+        .output()
+        .expect("Failed to run berth existingproj");
+
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("Created workspace"),
+        "Should not recreate existing"
+    );
+}
+
+#[test]
+fn test_default_command_with_remote() {
     let ctx = TestContext::new();
 
     let output = ctx
         .berth()
-        .args(["enter", "nonexistent"])
+        .args(["remotedefault", "--remote", "user@remotehost"])
         .output()
-        .expect("Failed to run enter");
+        .expect("Failed to run berth with remote");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not found"));
+    assert!(output.status.success());
+
+    let config_path = ctx.config_dir.join("config.yaml");
+    let content = fs::read_to_string(&config_path).expect("Failed to read config");
+    assert!(content.contains("remotedefault"));
+    assert!(content.contains("user@remotehost"));
 }
 
 #[test]
-fn test_enter_nonexistent_path_fails() {
+fn test_default_command_with_ports() {
     let ctx = TestContext::new();
-    let project_path = ctx.project_path("badpath");
+
+    let output = ctx
+        .berth()
+        .args(["portdefault", "--ports", "3000,8080,9000"])
+        .output()
+        .expect("Failed to run berth with ports");
+
+    assert!(output.status.success());
+
+    let config_path = ctx.config_dir.join("config.yaml");
+    let content = fs::read_to_string(&config_path).expect("Failed to read config");
+    assert!(content.contains("portdefault"));
+    assert!(content.contains("3000"));
+    assert!(content.contains("8080"));
+    assert!(content.contains("9000"));
+}
+
+#[test]
+fn test_default_command_recreates_missing_path() {
+    let ctx = TestContext::new();
+    let project_path = ctx.project_path("recreateproj");
 
     ctx.berth()
-        .args(["new", "badpath", project_path.to_str().unwrap()])
+        .args(["new", "recreateproj", project_path.to_str().unwrap()])
         .output()
         .expect("Failed to create workspace");
 
     fs::remove_dir_all(&project_path).ok();
+    assert!(!project_path.exists());
 
     let output = ctx
         .berth()
-        .args(["enter", "badpath"])
+        .args(["recreateproj"])
         .output()
-        .expect("Failed to run enter");
+        .expect("Failed to run berth recreateproj");
 
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("does not exist"));
+    assert!(output.status.success());
+    assert!(
+        project_path.exists(),
+        "Project directory should be recreated"
+    );
 }
 
 #[test]
@@ -373,4 +444,19 @@ fn test_full_workflow() {
 
     let list_output2 = ctx.berth().args(["list"]).output().expect("Failed to list");
     assert!(!String::from_utf8_lossy(&list_output2.stdout).contains("workflow"));
+}
+
+#[test]
+fn test_no_args_shows_list() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args::<[&str; 0], &str>([])
+        .output()
+        .expect("Failed to run berth with no args");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No workspaces") || stdout.contains("NAME"));
 }

@@ -1,8 +1,18 @@
 use anyhow::Result;
+use std::env;
 use std::path::Path;
 use tokio::process::Command;
 
+fn skip_ssh() -> bool {
+    env::var("BERTH_SKIP_SSH").is_ok()
+}
+
 pub async fn ssh_interactive(host: &str, path: &Path) -> Result<()> {
+    if skip_ssh() {
+        println!("[TEST MODE] Would SSH to {} and cd to {}", host, path.display());
+        return Ok(());
+    }
+
     let status = Command::new("ssh")
         .arg("-t")
         .arg(host)
@@ -22,6 +32,11 @@ pub async fn ssh_interactive(host: &str, path: &Path) -> Result<()> {
 }
 
 pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
+    if skip_ssh() {
+        println!("[TEST MODE] Would start tunnel to {} for ports {:?}", host, ports);
+        return Ok(());
+    }
+
     let mut args = vec!["-N".to_string()];
     
     for port in ports {
@@ -54,6 +69,10 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
 }
 
 pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {
+    if skip_ssh() {
+        return Ok(format!("[TEST MODE] Would run on {}: {}", host, command));
+    }
+
     let output = Command::new("ssh")
         .arg(host)
         .arg(command)
