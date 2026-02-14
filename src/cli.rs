@@ -7,7 +7,7 @@ pub struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
     
-    #[arg(help = "Workspace name. Creates workspace if it doesn't exist.")]
+    #[arg(help = "Workspace name (org/project format allowed). Creates workspace if it doesn't exist.")]
     name: Option<String>,
     
     #[arg(short = 'r', long = "remote", help = "SSH connection string (user@host) for remote workspace")]
@@ -21,6 +21,7 @@ pub struct Cli {
 enum Commands {
     #[command(about = "Create a new workspace configuration")]
     New {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
         path: Option<String>,
         #[arg(short = 'r', long = "remote")]
@@ -30,6 +31,7 @@ enum Commands {
     },
     #[command(about = "Enter a workspace (creates if needed)")]
     Enter {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
         #[arg(short = 'r', long = "remote")]
         remote: Option<String>,
@@ -40,20 +42,24 @@ enum Commands {
     List,
     #[command(about = "Tunnel remote ports locally")]
     Tunnel {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
     },
     #[command(about = "Stop a workspace")]
     Stop {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
     },
     #[command(about = "Delete a workspace configuration")]
     Delete {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
     },
     #[command(about = "Run a command on a workspace")]
     Run {
+        #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
         #[arg(short = 'r', long = "remote", help = "Override remote SSH host")]
         remote: Option<String>,
@@ -88,24 +94,30 @@ impl Cli {
         if let Some(cmd) = self.command {
             match cmd {
                 Commands::New { name, path, remote, ports } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::new::run(name, path, remote, ports).await
                 }
                 Commands::Enter { name, remote, ports } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::enter::run(name, remote, ports).await
                 }
                 Commands::List => {
                     commands::list::run().await
                 }
                 Commands::Tunnel { name, ports } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::tunnel::run(name, ports).await
                 }
                 Commands::Stop { name } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::stop::run(name).await
                 }
                 Commands::Delete { name } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::delete::run(name).await
                 }
                 Commands::Run { name, command, ports, remote } => {
+                    berth::validate_workspace_name(&name)?;
                     commands::run::run(name, command, ports, remote).await
                 }
                 Commands::InitShell => {
@@ -121,6 +133,7 @@ impl Cli {
                 },
             }
         } else if let Some(name) = self.name {
+            berth::validate_workspace_name(&name)?;
             commands::enter::run(name, self.remote, self.ports).await
         } else {
             commands::list::run().await
