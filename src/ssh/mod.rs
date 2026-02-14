@@ -1,23 +1,22 @@
 use anyhow::Result;
 use std::env;
-use std::path::Path;
 use tokio::process::Command;
 
 fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
 
-pub async fn ssh_interactive(host: &str, path: &Path, ensure_dir: bool) -> Result<()> {
+pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool) -> Result<()> {
     if skip_ssh() {
-        println!("[TEST MODE] Would SSH to {} and cd to {}", host, path.display());
+        println!("[TEST MODE] Would SSH to {} and enter workspace {}", host, workspace_name);
         return Ok(());
     }
 
-    let path_str = path.to_string_lossy();
+    let remote_path = format!("~/berth/projects/{}", workspace_name);
     let ensure_cmd = if ensure_dir {
-        format!("mkdir -p {} && cd {}", path_str, path_str)
+        format!("mkdir -p {} && cd {}", remote_path, remote_path)
     } else {
-        format!("cd {}", path_str)
+        format!("cd {}", remote_path)
     };
 
     let status = Command::new("ssh")

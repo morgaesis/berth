@@ -77,14 +77,14 @@ fn enter_local(name: String, path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn enter_remote(name: String, host: &str, path: &Path, ports: Option<&[u16]>) -> Result<()> {
+async fn enter_remote(name: String, host: &str, _path: &Path, ports: Option<&[u16]>) -> Result<()> {
     if let Some(ports) = ports {
         let _tunnel = ssh::start_tunnel(host, ports).await?;
     }
 
     println!("\x1b]2;berth: {} [{}]\x07", name, host);
     
-    ssh::ssh_interactive(host, path, true).await?;
+    ssh::ssh_interactive(host, &name, true).await?;
 
     Ok(())
 }
