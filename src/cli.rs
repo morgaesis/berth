@@ -52,6 +52,12 @@ enum Commands {
     Delete {
         name: String,
     },
+    #[command(about = "Run a command on a remote workspace")]
+    Run {
+        name: String,
+        #[arg(last = true)]
+        command: Vec<String>,
+    },
     #[command(about = "Print shell integration script")]
     InitShell,
     #[command(about = "Run berth agent on remote machine")]
@@ -94,6 +100,9 @@ impl Cli {
                 }
                 Commands::Delete { name } => {
                     commands::delete::run(name).await
+                }
+                Commands::Run { name, command } => {
+                    commands::run::run(name, command).await
                 }
                 Commands::InitShell => {
                     commands::init_shell::run()

@@ -4,6 +4,7 @@ pub mod list;
 pub mod tunnel;
 pub mod stop;
 pub mod delete;
+pub mod run;
 pub mod init_shell;
 pub mod agent;
 pub mod hosts;
