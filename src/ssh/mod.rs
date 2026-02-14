@@ -4,6 +4,8 @@ use std::process;
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::tunnel::TunnelState;
+
 fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
@@ -38,17 +40,30 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
     Ok(())
 }
 
-pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<bool> {
+pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<bool> {
     if skip_ssh() {
         println!("[TEST MODE] Would start tunnel to {} for ports {:?}", host, ports);
         return Ok(true);
     }
 
-    // Check if any port is already in use locally
+    let mut state = TunnelState::load();
+
+    // Check if we already have this tunnel tracked
+    let already_running = ports.iter().all(|p| state.has_port(workspace, *p));
+    if already_running {
+        println!("Tunnel already active for workspace '{}' on ports {:?}", workspace, ports);
+        return Ok(true);
+    }
+
+    // Check for port conflicts with OTHER workspaces
     for port in ports {
         if is_port_in_use(*port) {
-            println!("Port {} is already in use (tunnel may already exist). Reusing existing tunnel.", port);
-            return Ok(true);
+            // Check if it's one of our tunnels
+            if state.has_port(workspace, *port) {
+                continue; // Our tunnel, OK
+            }
+            eprintln!("Error: Port {} is already in use by another process.", port);
+            return Ok(false);
         }
     }
 
@@ -70,8 +85,11 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<bool> {
 
     match result {
         Ok(_) => {
-            // Wait a moment for tunnel to establish
             sleep(tokio::time::Duration::from_millis(300)).await;
+            // Bookkeeping: record the tunnel
+            state.add(workspace, ports);
+            let _ = state.save();
+            println!("Started tunnel for '{}' on ports {:?}", workspace, ports);
             Ok(true)
         }
         Err(e) => {
@@ -79,6 +97,33 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<bool> {
             Ok(false)
         }
     }
+}
+
+pub fn stop_tunnel(workspace: &str, port: u16) -> Result<()> {
+    let mut state = TunnelState::load();
+    
+    if !state.has_port(workspace, port) {
+        println!("No tunnel found for '{}' on port {}", workspace, port);
+        return Ok(());
+    }
+
+    // Kill the SSH tunnel process
+    let output = process::Command::new("pkill")
+        .args(["-f", &format!("ssh -N.*{}", port)])
+        .output();
+
+    match output {
+        Ok(_) => {
+            state.remove_port(workspace, port);
+            let _ = state.save();
+            println!("Stopped tunnel for '{}' on port {}", workspace, port);
+        }
+        Err(e) => {
+            eprintln!("Failed to stop tunnel: {}", e);
+        }
+    }
+
+    Ok(())
 }
 
 fn is_port_in_use(port: u16) -> bool {

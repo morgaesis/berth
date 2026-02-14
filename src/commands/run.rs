@@ -18,7 +18,7 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>) -> Result<
 
     // Start tunnel first if ports specified
     let tunnel_active = if !ports.is_empty() {
-        ssh::start_tunnel(remote, &ports).await?
+        ssh::start_tunnel(remote, &name, &ports).await?
     } else {
         false
     };

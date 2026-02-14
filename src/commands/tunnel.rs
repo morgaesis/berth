@@ -24,7 +24,7 @@ pub async fn run(name: String, ports: Vec<u16>) -> Result<()> {
     println!("Tunneling ports {:?} from {}...", ports_to_forward, host);
     println!("Press Ctrl+C to stop.\n");
 
-    ssh::start_tunnel(host, &ports_to_forward).await?;
+    ssh::start_tunnel(host, &name, &ports_to_forward).await?;
     
     Ok(())
 }

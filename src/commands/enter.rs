@@ -82,7 +82,7 @@ fn enter_local(name: String, path: &Path) -> Result<()> {
 
 async fn enter_remote(name: String, host: &str, _path: &Path, ports: Option<&[u16]>) -> Result<()> {
     if let Some(ports) = ports {
-        let _tunnel = ssh::start_tunnel(host, ports).await?;
+        let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
     }
 
     println!("\x1b]2;berth: {} [{}]\x07", name, host);

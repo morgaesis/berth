@@ -1,6 +1,7 @@
 pub mod config;
 pub mod hosts;
 pub mod ssh;
+pub mod tunnel;
 
 pub const BERTH_DIR: &str = "berth";
 pub const BERTH_CONFIG_FILE_YAML: &str = "config.yaml";
