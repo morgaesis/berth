@@ -62,8 +62,7 @@ pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<
             if state.has_port(workspace, *port) {
                 continue; // Our tunnel, OK
             }
-            eprintln!("Error: Port {} is already in use by another process.", port);
-            return Ok(false);
+            anyhow::bail!("Port {} is already in use by another process. Choose a different port.", port);
         }
     }
 
@@ -93,8 +92,7 @@ pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<
             Ok(true)
         }
         Err(e) => {
-            eprintln!("Failed to start tunnel: {}", e);
-            Ok(false)
+            anyhow::bail!("Failed to start tunnel: {}", e);
         }
     }
 }

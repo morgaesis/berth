@@ -52,10 +52,12 @@ enum Commands {
     Delete {
         name: String,
     },
-    #[command(about = "Run a command on a remote workspace")]
+    #[command(about = "Run a command on a workspace")]
     Run {
         name: String,
-        #[arg(short = 'p', long = "ports", help = "Start tunnel for these ports", value_delimiter = ',')]
+        #[arg(short = 'r', long = "remote", help = "Override remote SSH host")]
+        remote: Option<String>,
+        #[arg(short = 'p', long = "ports", help = "Start tunnel for these ports (requires remote)", value_delimiter = ',')]
         ports: Vec<u16>,
         #[arg(last = true)]
         command: Vec<String>,
@@ -103,8 +105,8 @@ impl Cli {
                 Commands::Delete { name } => {
                     commands::delete::run(name).await
                 }
-                Commands::Run { name, command, ports } => {
-                    commands::run::run(name, command, ports).await
+                Commands::Run { name, command, ports, remote } => {
+                    commands::run::run(name, command, ports, remote).await
                 }
                 Commands::InitShell => {
                     commands::init_shell::run()
