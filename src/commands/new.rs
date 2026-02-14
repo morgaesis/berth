@@ -2,8 +2,16 @@ use berth::config::{Config, Workspace};
 use anyhow::{bail, Result};
 use std::path::PathBuf;
 use std::fs;
+use std::env;
 
 fn default_projects_path() -> std::path::PathBuf {
+    if let Ok(dir) = env::var("BERTH_DATA_DIR") {
+        return std::path::PathBuf::from(dir).join("projects");
+    }
+    if let Ok(dir) = env::var("XDG_DATA_HOME") {
+        return std::path::PathBuf::from(dir).join("berth").join("projects");
+    }
+    
     dirs::data_local_dir()
         .map(|p| p.join("berth").join("projects"))
         .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/berth/projects"))

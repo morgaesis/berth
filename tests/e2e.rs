@@ -29,7 +29,10 @@ impl TestContext {
         cmd.env("BERTH_SKIP_HOSTS", "1");
         cmd.env("BERTH_SKIP_SSH", "1");
         cmd.env("HOME", self.temp_dir.path());
-        cmd.env("BERTH_PROJECTS_DIR", self.temp_dir.path());
+        cmd.env(
+            "XDG_DATA_HOME",
+            self.temp_dir.path().join(".local").join("share"),
+        );
         cmd
     }
 
@@ -285,7 +288,7 @@ fn test_init_shell() {
 #[test]
 fn test_default_command_creates_and_enters() {
     let ctx = TestContext::new();
-    let project_path = ctx.temp_dir.path().join("projects").join("newproj");
+    let project_path = ctx.project_path("newproj");
 
     assert!(!project_path.exists(), "Project should not exist yet");
 

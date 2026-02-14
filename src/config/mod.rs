@@ -51,12 +51,15 @@ impl Config {
     }
 
     pub fn config_dir() -> Result<PathBuf> {
+        if let Ok(dir) = env::var("XDG_CONFIG_HOME") {
+            return Ok(PathBuf::from(dir).join(super::BERTH_DIR));
+        }
         if let Ok(dir) = env::var("BERTH_CONFIG_DIR") {
             return Ok(PathBuf::from(dir));
         }
 
-        dirs::data_local_dir()
-            .map(|p| p.join(super::BERTH_CONFIG_DIR))
-            .ok_or_else(|| anyhow::anyhow!("Cannot determine data directory"))
+        dirs::config_dir()
+            .map(|p| p.join(super::BERTH_DIR))
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))
     }
 }

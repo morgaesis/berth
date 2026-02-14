@@ -6,8 +6,11 @@ use std::fs;
 use std::path::Path;
 
 fn default_projects_path() -> std::path::PathBuf {
-    if let Ok(dir) = env::var("BERTH_PROJECTS_DIR") {
+    if let Ok(dir) = env::var("BERTH_DATA_DIR") {
         return std::path::PathBuf::from(dir).join("projects");
+    }
+    if let Ok(dir) = env::var("XDG_DATA_HOME") {
+        return std::path::PathBuf::from(dir).join("berth").join("projects");
     }
     
     dirs::data_local_dir()
