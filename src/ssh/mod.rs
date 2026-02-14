@@ -38,10 +38,18 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
     Ok(())
 }
 
-pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
+pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<bool> {
     if skip_ssh() {
         println!("[TEST MODE] Would start tunnel to {} for ports {:?}", host, ports);
-        return Ok(());
+        return Ok(true);
+    }
+
+    // Check if any port is already in use locally
+    for port in ports {
+        if is_port_in_use(*port) {
+            println!("Port {} is already in use (tunnel may already exist). Reusing existing tunnel.", port);
+            return Ok(true);
+        }
     }
 
     let mut args = vec![
@@ -56,17 +64,26 @@ pub async fn start_tunnel(host: &str, ports: &[u16]) -> Result<()> {
     }
     args.push(host.to_string());
 
-    println!("Starting SSH tunnel for ports {:?}...", ports);
-
-    // Start tunnel in background, don't wait
-    let _status = process::Command::new("ssh")
+    let result = process::Command::new("ssh")
         .args(&args)
-        .spawn()?;
+        .spawn();
 
-    // Wait a moment for tunnel to establish
-    sleep(tokio::time::Duration::from_millis(300)).await;
+    match result {
+        Ok(_) => {
+            // Wait a moment for tunnel to establish
+            sleep(tokio::time::Duration::from_millis(300)).await;
+            Ok(true)
+        }
+        Err(e) => {
+            eprintln!("Failed to start tunnel: {}", e);
+            Ok(false)
+        }
+    }
+}
 
-    Ok(())
+fn is_port_in_use(port: u16) -> bool {
+    use std::net::TcpListener;
+    TcpListener::bind(format!("127.0.0.1:{}", port)).is_err()
 }
 
 pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {

@@ -17,12 +17,13 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>) -> Result<
     }
 
     // Start tunnel first if ports specified
-    if !ports.is_empty() {
-        ssh::start_tunnel(remote, &ports).await?;
-    }
+    let tunnel_active = if !ports.is_empty() {
+        ssh::start_tunnel(remote, &ports).await?
+    } else {
+        false
+    };
 
     let remote_path = format!("~/berth/projects/{}", name);
-    // Use nohup and disown to keep process alive after SSH closes
     let full_cmd = format!(
         "cd {} && nohup {} >/dev/null 2>&1 & disown",
         remote_path, cmd_str
@@ -34,10 +35,12 @@ pub async fn run(name: String, command: Vec<String>, ports: Vec<u16>) -> Result<
     
     if !output.is_empty() {
         println!("{}", output);
+    } else {
+        println!("Command started successfully.");
     }
     
-    if !ports.is_empty() {
-        println!("Tunnel active for port(s): {:?} -> http://localhost:{}", ports, ports[0]);
+    if tunnel_active && !ports.is_empty() {
+        println!("Tunnel active: http://localhost:{}", ports[0]);
     }
     
     Ok(())
