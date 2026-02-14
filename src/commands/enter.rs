@@ -56,7 +56,9 @@ pub async fn run(name: String, remote_override: Option<String>, ports_override: 
 }
 
 fn enter_local(name: String, path: &Path) -> Result<()> {
-    hosts::add_entry(&name)?;
+    if let Err(e) = hosts::add_entry(&name) {
+        eprintln!("Warning: Could not add hosts entry: {}. Use 'berth hosts install' to set up DNS.", e);
+    }
     
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
     
@@ -73,7 +75,9 @@ fn enter_local(name: String, path: &Path) -> Result<()> {
 }
 
 async fn enter_remote(name: String, host: &str, path: &Path, ports: Option<&[u16]>) -> Result<()> {
-    hosts::add_entry(&name)?;
+    if let Err(e) = hosts::add_entry(&name) {
+        eprintln!("Warning: Could not add hosts entry: {}. Use 'berth hosts install' to set up DNS.", e);
+    }
     
     if let Some(ports) = ports {
         let _tunnel = ssh::start_tunnel(host, ports).await?;

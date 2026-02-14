@@ -56,6 +56,7 @@ enum Commands {
 enum HostsCommands {
     Update,
     Clean,
+    Install,
 }
 
 impl Cli {
@@ -86,6 +87,7 @@ impl Cli {
                 Commands::Hosts { command } => match command {
                     HostsCommands::Update => commands::hosts::update().await,
                     HostsCommands::Clean => commands::hosts::clean().await,
+                    HostsCommands::Install => commands::hosts::install().await,
                 },
             }
         } else if let Some(name) = self.name {

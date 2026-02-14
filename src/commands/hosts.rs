@@ -20,3 +20,7 @@ pub async fn clean() -> Result<()> {
     println!("Cleaned berth entries from /etc/hosts");
     Ok(())
 }
+
+pub async fn install() -> Result<()> {
+    hosts::install()
+}
