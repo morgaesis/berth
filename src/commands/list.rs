@@ -9,7 +9,7 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<10} {}", "NAME", "TYPE", "PATH");
+    println!("{:<20} {:<10} PATH", "NAME", "TYPE");
     println!("{}", "-".repeat(60));
 
     for (name, ws) in &config.workspaces {

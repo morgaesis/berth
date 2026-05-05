@@ -1,3 +1,5 @@
+#![allow(clippy::derivable_impls)]
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

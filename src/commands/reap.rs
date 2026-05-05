@@ -25,9 +25,8 @@ pub async fn run_once() -> Result<Summary> {
     let expired = state
         .environments
         .iter()
-        .filter_map(|(key, environment)| {
-            should_reap(environment, now).then(|| (key.clone(), environment.clone()))
-        })
+        .filter(|(_, environment)| should_reap(environment, now))
+        .map(|(key, environment)| (key.clone(), environment.clone()))
         .collect::<Vec<_>>();
 
     for (key, environment) in expired {

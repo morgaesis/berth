@@ -162,10 +162,10 @@ pub fn check_dnsmasq_available() -> bool {
 pub fn print_dnsmasq_setup() {
     println!("# To enable *.berth DNS resolution without sudo, add to /etc/dnsmasq.d/berth:");
     println!("address=/berth/127.0.0.1");
-    println!("");
+    println!();
     println!("# Then restart dnsmasq:");
     println!("sudo systemctl restart dnsmasq");
-    println!("");
+    println!();
     println!("# Or if using systemd-resolved, add to /etc/systemd/resolved.conf:");
     println!("[Resolve]");
     println!("DNS=127.0.0.1");
@@ -174,13 +174,13 @@ pub fn print_dnsmasq_setup() {
 
 pub fn install() -> Result<()> {
     println!("=== Berth DNS Setup ===");
-    println!("");
+    println!();
     println!("This will add a wildcard entry to /etc/hosts for *.berth domains.");
     println!("This requires sudo access and will prompt for your password.");
-    println!("");
+    println!();
     println!("Alternative: Use dnsmasq or systemd-resolved for DNS-based resolution.");
     println!("Run 'berth hosts setup-dns' for instructions.");
-    println!("");
+    println!();
 
     let hosts_path = hosts_path();
     let content = fs::read_to_string(&hosts_path)?;

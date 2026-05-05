@@ -39,12 +39,12 @@ impl TestContext {
         cmd
     }
 
-    fn berth_with_auto_discovery(&self, fake_bin: &PathBuf) -> Command {
+    fn berth_with_auto_discovery(&self, fake_bin: &std::path::Path) -> Command {
         let mut cmd = self.berth();
         cmd.env_remove("BERTH_AUTO_DISCOVERY");
         let path = std::env::var_os("PATH").unwrap_or_default();
         let mut paths = std::env::split_paths(&path).collect::<Vec<_>>();
-        paths.insert(0, fake_bin.clone());
+        paths.insert(0, fake_bin.to_path_buf());
         let joined = std::env::join_paths(paths).expect("Failed to build test PATH");
         cmd.env("PATH", joined);
         cmd
