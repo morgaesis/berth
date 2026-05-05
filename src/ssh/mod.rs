@@ -124,50 +124,33 @@ fn remote_enter_command(
         Runtime::Auto => "exec ${SHELL:-/bin/sh}".to_string(),
     };
 
+    let escaped_workspace = shell_escape_arg(workspace_name);
     let escaped_session = shell_escape_arg(&session);
     let escaped_inner = shell_escape_arg(&inner);
 
+    // Resumability cascade. Best to worst:
+    //   1. berth attach: PTY-multiplexing supervisor managed by berth itself.
+    //   2. mosh: UDP-resumable interactive transport.
+    //   3. tmux / screen: legacy multiplexers if installed.
+    //   4. plain shell: last resort, no reattach guarantee.
     format!(
-        "{base} && if command -v tmux >/dev/null 2>&1; then exec tmux new-session -A -s {escaped_session} {escaped_inner}; elif command -v screen >/dev/null 2>&1; then exec screen -D -RR -S {escaped_session} sh -lc {escaped_inner}; else {inner}; fi"
+        "{base} && \
+         if command -v berth >/dev/null 2>&1; then \
+           exec berth attach {escaped_workspace}; \
+         elif command -v mosh-server >/dev/null 2>&1; then \
+           exec mosh-server new -- sh -lc {escaped_inner}; \
+         elif command -v tmux >/dev/null 2>&1; then \
+           exec tmux new-session -A -s {escaped_session} {escaped_inner}; \
+         elif command -v screen >/dev/null 2>&1; then \
+           exec screen -D -RR -S {escaped_session} sh -lc {escaped_inner}; \
+         else \
+           {inner}; \
+         fi"
     )
 }
 
 fn shell_escape_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::Runtime;
-
-    #[test]
-    fn remote_entry_prefers_existing_multiplexers_before_direct_shell() {
-        let command = remote_enter_command(
-            "work",
-            "$HOME/.local/share/berth/projects/work",
-            &Runtime::Bare,
-            &[],
-        );
-
-        assert!(command.contains("command -v tmux"));
-        assert!(command.contains("tmux new-session -A -s 'berth-work'"));
-        assert!(command.contains("command -v screen"));
-        assert!(command.contains("screen -D -RR -S 'berth-work'"));
-        assert!(command.contains("else exec ${SHELL:-/bin/sh}; fi"));
-    }
-
-    #[test]
-    fn remote_entry_uses_safe_session_name_for_nested_workspace() {
-        let command = remote_enter_command(
-            "team/work",
-            "$HOME/.local/share/berth/projects/team-work",
-            &Runtime::Bare,
-            &[],
-        );
-
-        assert!(command.contains("'berth-team-work'"));
-    }
 }
 
 pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<bool> {
@@ -283,4 +266,53 @@ pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Runtime;
+
+    #[test]
+    fn remote_entry_cascades_from_berth_attach_through_legacy_to_plain_shell() {
+        let command = remote_enter_command(
+            "work",
+            "$HOME/.local/share/berth/projects/work",
+            &Runtime::Bare,
+            &[],
+        );
+
+        let attach_idx = command
+            .find("command -v berth")
+            .expect("berth attach probe must come first");
+        let mosh_idx = command
+            .find("command -v mosh-server")
+            .expect("mosh probe present");
+        let tmux_idx = command.find("command -v tmux").expect("tmux probe present");
+        let screen_idx = command
+            .find("command -v screen")
+            .expect("screen probe present");
+        assert!(
+            attach_idx < mosh_idx && mosh_idx < tmux_idx && tmux_idx < screen_idx,
+            "cascade order is berth > mosh > tmux > screen"
+        );
+
+        assert!(command.contains("exec berth attach 'work'"));
+        assert!(command.contains("mosh-server new --"));
+        assert!(command.contains("tmux new-session -A -s 'berth-work'"));
+        assert!(command.contains("screen -D -RR -S 'berth-work'"));
+        assert!(command.contains("else exec ${SHELL:-/bin/sh}; fi"));
+    }
+
+    #[test]
+    fn remote_entry_uses_safe_session_name_for_nested_workspace() {
+        let command = remote_enter_command(
+            "team/work",
+            "$HOME/.local/share/berth/projects/team-work",
+            &Runtime::Bare,
+            &[],
+        );
+
+        assert!(command.contains("'berth-team-work'"));
+    }
 }

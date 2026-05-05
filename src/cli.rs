@@ -96,6 +96,26 @@ enum Commands {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
     },
+    #[command(
+        about = "Attach to a resumable workspace session (creates one if absent)",
+        long_about = "Attach to a resumable workspace session managed by the local berth supervisor.\n\
+                      The supervisor is launched on first attach, holds a PTY across detach/reattach,\n\
+                      and is what `berth enter <remote>` invokes on the far side when berth is present."
+    )]
+    Attach {
+        #[arg(help = "Workspace name (org/project format allowed)")]
+        name: String,
+        #[arg(
+            long = "supervisor",
+            help = "Internal: run as the session supervisor in the foreground"
+        )]
+        supervisor: bool,
+        #[arg(
+            trailing_var_arg = true,
+            help = "Override session command (defaults to login shell)"
+        )]
+        command: Vec<String>,
+    },
     #[command(subcommand, name = "hosts")]
     Hosts(HostsCommands),
     #[command(external_subcommand)]
@@ -163,6 +183,18 @@ impl Cli {
                 }
                 Commands::InitShell => commands::init_shell::run(),
                 Commands::Agent { ports } => commands::agent::run(ports).await,
+                Commands::Attach {
+                    name,
+                    supervisor,
+                    command,
+                } => {
+                    berth::validate_workspace_name(&name)?;
+                    let code = commands::attach::run(name, supervisor, command).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Commands::Hosts(command) => match command {
                     HostsCommands::Update => commands::hosts::update().await,
                     HostsCommands::Clean => commands::hosts::clean().await,

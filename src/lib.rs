@@ -4,6 +4,7 @@ pub mod hosts;
 pub mod lifecycle;
 pub mod lifecycle_state;
 pub mod runtime;
+pub mod session;
 pub mod ssh;
 pub mod tunnel;
 

@@ -20,3 +20,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 which = "6"
 shell-words = "1"
+portable-pty = "0.9.0"
+nix = { version = "0.31.2", features = ["term", "fs", "process", "signal", "socket"] }
+libc = "0.2.186"

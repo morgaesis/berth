@@ -1,4 +1,5 @@
 pub mod agent;
+pub mod attach;
 pub mod daemon;
 pub mod delete;
 pub mod doctor;
