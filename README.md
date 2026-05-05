@@ -4,6 +4,8 @@ Berth opens consistent project workspaces on local or remote hosts.
 
 By default Berth auto-discovers local runtime support. If rootless Podman is available, local workspaces run in a Podman environment with the project mounted at `/workspace`, selected config files mounted into the container, and lifecycle state recorded for idle cleanup. If Podman is unavailable, Berth falls back to a bare shell in the project directory. Explicit config can opt out.
 
+![Berth Demo](./assets/demo.svg)
+
 ## Usage
 
 ```bash
