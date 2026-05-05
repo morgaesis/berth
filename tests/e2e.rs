@@ -371,11 +371,13 @@ fn test_init_shell() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("_berth_auto_enter"));
-    assert!(stdout.contains("_berth_chpwd"));
     assert!(stdout.contains("_berth_set_title"));
     assert!(stdout.contains("b()"));
     assert!(stdout.contains("_berth_enter_name"));
     assert!(stdout.contains("command berth enter"));
+    assert!(stdout.contains("ZSH_VERSION"));
+    assert!(stdout.contains("BASH_VERSION"));
+    assert!(stdout.contains("only supports bash and zsh"));
     assert!(!stdout.contains("berth \"$ws_name\""));
 }
 
