@@ -1,5 +1,9 @@
 pub mod config;
+pub mod discovery;
 pub mod hosts;
+pub mod lifecycle;
+pub mod lifecycle_state;
+pub mod runtime;
 pub mod ssh;
 pub mod tunnel;
 

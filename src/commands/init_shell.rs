@@ -4,6 +4,24 @@ pub fn run() -> Result<()> {
     let _shell = std::env::var("SHELL").unwrap_or_default();
 
     let script = r#"
+_berth_enter_name() {
+    if [[ $# -eq 0 ]]; then
+        command berth enter
+        return $?
+    fi
+
+    command berth enter "$@"
+    local exit_code=$?
+    if [[ $exit_code -eq 0 ]]; then
+        export BERTH_SKIP_AUTO=1
+    fi
+    return $exit_code
+}
+
+b() {
+    _berth_enter_name "$@"
+}
+
 _berth_auto_enter() {
     local cwd="${PWD}"
     local berth_config="$HOME/.config/berth"
@@ -23,8 +41,7 @@ _berth_auto_enter() {
             if [[ -n "$BERTH_SKIP_AUTO" ]]; then
                 return
             fi
-            export BERTH_SKIP_AUTO=1
-            berth enter "$ws_name"
+            _berth_enter_name "$ws_name"
             return
         fi
         cwd=$(dirname "$cwd")
@@ -50,11 +67,9 @@ _berth_set_prompt() {
 berth() {
     case "$1" in
         enter)
-            command berth "$@"
+            shift
+            _berth_enter_name "$@"
             local exit_code=$?
-            if [[ $exit_code -eq 0 ]]; then
-                export BERTH_SKIP_AUTO=1
-            fi
             return $exit_code
             ;;
         *)

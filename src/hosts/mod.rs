@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 
 const HOSTS_MARKER_START: &str = "# === BERTH START ===";
 const HOSTS_MARKER_END: &str = "# === BERTH END ===";
@@ -12,6 +13,16 @@ fn skip_hosts() -> bool {
 
 fn hosts_path() -> String {
     env::var("BERTH_HOSTS_PATH").unwrap_or_else(|_| "/etc/hosts".to_string())
+}
+
+fn temp_hosts_path() -> Result<PathBuf> {
+    let base = env::var("BERTH_DATA_DIR")
+        .or_else(|_| env::var("XDG_DATA_HOME"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".cache")));
+    let dir = base.join("berth");
+    fs::create_dir_all(&dir)?;
+    Ok(dir.join("hosts.tmp"))
 }
 
 pub fn add_entry(name: &str) -> Result<()> {
@@ -48,14 +59,16 @@ pub fn add_entry(name: &str) -> Result<()> {
         new_entries.insert(insert_pos, entry);
     }
 
-    let temp_path = "/tmp/berth_hosts_tmp";
+    let temp_path = temp_hosts_path()?;
     let mut file = fs::File::create(temp_path)?;
     for line in &new_entries {
         writeln!(file, "{}", line)?;
     }
 
     let status = std::process::Command::new("sudo")
-        .args(["cp", temp_path, &hosts_path])
+        .arg("cp")
+        .arg(temp_hosts_path()?)
+        .arg(&hosts_path)
         .status()?;
 
     if !status.success() {
@@ -79,14 +92,16 @@ pub fn remove_entry(name: &str) -> Result<()> {
         .map(|l| l.to_string())
         .collect();
 
-    let temp_path = "/tmp/berth_hosts_tmp";
+    let temp_path = temp_hosts_path()?;
     let mut file = fs::File::create(temp_path)?;
     for line in &entries {
         writeln!(file, "{}", line)?;
     }
 
     let status = std::process::Command::new("sudo")
-        .args(["cp", temp_path, &hosts_path])
+        .arg("cp")
+        .arg(temp_hosts_path()?)
+        .arg(&hosts_path)
         .status()?;
 
     if !status.success() {
@@ -121,14 +136,16 @@ pub fn clean() -> Result<()> {
         .map(|l| l.to_string())
         .collect();
 
-    let temp_path = "/tmp/berth_hosts_tmp";
+    let temp_path = temp_hosts_path()?;
     let mut file = fs::File::create(temp_path)?;
     for line in &entries {
         writeln!(file, "{}", line)?;
     }
 
     let status = std::process::Command::new("sudo")
-        .args(["cp", temp_path, &hosts_path])
+        .arg("cp")
+        .arg(temp_hosts_path()?)
+        .arg(&hosts_path)
         .status()?;
 
     if !status.success() {
@@ -195,7 +212,7 @@ pub fn install() -> Result<()> {
         new_entries.insert(insert_pos, entry);
     }
 
-    let temp_path = "/tmp/berth_hosts_tmp";
+    let temp_path = temp_hosts_path()?;
     let mut file = fs::File::create(temp_path)?;
     for line in &new_entries {
         writeln!(file, "{}", line)?;
@@ -203,7 +220,9 @@ pub fn install() -> Result<()> {
 
     println!("Adding wildcard entry for *.berth to {}...", hosts_path);
     let status = std::process::Command::new("sudo")
-        .args(["cp", temp_path, &hosts_path])
+        .arg("cp")
+        .arg(temp_hosts_path()?)
+        .arg(&hosts_path)
         .status()?;
 
     if !status.success() {

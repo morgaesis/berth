@@ -1,17 +1,20 @@
+use anyhow::Result;
 use berth::config::Config;
 use berth::hosts;
-use anyhow::Result;
 
 pub async fn update() -> Result<()> {
     let config = Config::load()?;
-    
+
     hosts::clean()?;
-    
+
     for name in config.workspaces.keys() {
         hosts::add_entry(name)?;
     }
 
-    println!("Updated /etc/hosts with {} workspace(s)", config.workspaces.len());
+    println!(
+        "Updated /etc/hosts with {} workspace(s)",
+        config.workspaces.len()
+    );
     Ok(())
 }
 
