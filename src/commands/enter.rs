@@ -5,7 +5,8 @@ use berth::runtime::{self, CommandSpec};
 use berth::ssh;
 use std::env;
 use std::fs;
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::fd::AsFd;
 use std::path::Path;
 
 /// User-controllable knobs for the resumability cascade on remote enter.
@@ -304,14 +305,43 @@ fn confirm_deploy(host: &str, target: &'static str, reason: &str) -> Result<bool
         eprintln!("berth: {host} {reason}; running non-interactively, skipping deploy");
         return Ok(false);
     }
-    eprint!("berth: deploy berth-{target} to {host}? [y/N] (will be added to trusted_hosts): ");
+    eprint!("berth: deploy berth-{target} to {host}? [Y/n] (will be added to trusted_hosts): ");
     io::stderr().flush().ok();
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+    let answer = read_yes_no_default_yes()?;
+    eprintln!("{}", if answer { "y" } else { "n" });
+    Ok(answer)
+}
+
+/// Single-keystroke Y/n prompt with Y as the default. Returns true on
+/// Y/y/Enter, false otherwise. Restores the original termios state on
+/// every exit path including panics, via a Drop guard.
+fn read_yes_no_default_yes() -> Result<bool> {
+    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg, Termios};
+
+    struct RawModeGuard {
+        original: Termios,
+    }
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            let stdin = io::stdin();
+            let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
+        }
+    }
+
+    let stdin = io::stdin();
+    let original = tcgetattr(stdin.as_fd())?;
+    let mut raw = original.clone();
+    raw.local_flags
+        .remove(LocalFlags::ICANON | LocalFlags::ECHO);
+    tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
+    let _guard = RawModeGuard { original };
+
+    let mut byte = [0u8; 1];
+    let n = stdin.lock().read(&mut byte)?;
+    if n == 0 {
+        return Ok(true); // EOF — fall to the default
+    }
+    Ok(matches!(byte[0], b'y' | b'Y' | b'\r' | b'\n'))
 }
 
 /// Extension trait that converts a deploy failure into a clear hard-fail
