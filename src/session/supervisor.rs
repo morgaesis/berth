@@ -25,7 +25,15 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         let _ = fs::remove_file(&config.socket_path);
     }
 
-    let listener = UnixListener::bind(&config.socket_path)
+    // Bind under a restrictive umask so the socket is created with mode 0600
+    // atomically; without this, the kernel applies the inherited umask (often
+    // 0022) and there's a TOCTOU window between bind and the explicit chmod.
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let listener_result = UnixListener::bind(&config.socket_path);
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    let listener = listener_result
         .with_context(|| format!("binding session socket {}", config.socket_path.display()))?;
     set_socket_perms(&config.socket_path)?;
 

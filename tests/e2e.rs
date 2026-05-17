@@ -359,7 +359,75 @@ fn test_new_with_ports() {
 }
 
 #[test]
-fn test_init_shell() {
+fn test_shell_init_bash() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell-init", "bash"])
+        .output()
+        .expect("Failed to run shell-init bash");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("_berth_auto_enter_on_start"));
+    assert!(stdout.contains("_berth_detect_project"));
+    assert!(stdout.contains("WEZTERM_USER_VAR_BERTH_PROJECT"));
+    assert!(stdout.contains("BASH_VERSION"));
+    assert!(stdout.contains("b()"));
+    assert!(stdout.contains("berth()"));
+    assert!(stdout.contains("command berth enter"));
+}
+
+#[test]
+fn test_shell_init_zsh() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell-init", "zsh"])
+        .output()
+        .expect("Failed to run shell-init zsh");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("_berth_auto_enter_on_start"));
+    assert!(stdout.contains("ZSH_VERSION"));
+}
+
+#[test]
+fn test_shell_completions_bash() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell-completions", "bash"])
+        .output()
+        .expect("Failed to run shell-completions bash");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("_berth()"));
+    assert!(stdout.contains("COMPREPLY"));
+}
+
+#[test]
+fn test_shell_completions_zsh() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell-completions", "zsh"])
+        .output()
+        .expect("Failed to run shell-completions zsh");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("#compdef berth"));
+}
+
+#[test]
+fn test_init_shell_deprecated_alias_still_works() {
     let ctx = TestContext::new();
 
     let output = ctx
@@ -369,20 +437,85 @@ fn test_init_shell() {
         .expect("Failed to run init-shell");
 
     assert!(output.status.success());
+    // Same script content as `shell-init` would emit.
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("_berth_auto_enter"));
-    assert!(stdout.contains("_berth_set_title"));
-    assert!(stdout.contains("b()"));
-    assert!(stdout.contains("_berth_enter_name"));
-    assert!(stdout.contains("command berth enter"));
-    assert!(stdout.contains("ZSH_VERSION"));
-    assert!(stdout.contains("BASH_VERSION"));
-    assert!(stdout.contains("only supports bash and zsh"));
-    assert!(!stdout.contains("berth \"$ws_name\""));
+    assert!(stdout.contains("_berth_auto_enter_on_start"));
+    // Deprecation notice on stderr.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("deprecated"),
+        "expected deprecation notice in stderr, got: {stderr}"
+    );
 }
 
 #[test]
-fn test_help_mentions_init_shell_eval() {
+fn test_attach_list_empty_workspace_succeeds() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["attach", "--list", "noproj"])
+        .output()
+        .expect("Failed to run attach --list");
+
+    assert!(output.status.success(), "attach --list should succeed on empty: {:?}", output);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("no sessions"));
+}
+
+#[test]
+fn test_attach_resume_with_no_sessions_errors_actionably() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["attach", "ghost"])
+        .output()
+        .expect("Failed to run attach");
+
+    assert!(!output.status.success(), "attach should fail with no sessions");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no resumable session") && stderr.contains("berth enter"),
+        "error should hint at how to start a session: {stderr}"
+    );
+}
+
+#[test]
+fn test_attach_rejects_invalid_session_id() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["attach", "--session", "../etc", "proj"])
+        .output()
+        .expect("Failed to run attach");
+
+    assert!(!output.status.success(), "should reject path-traversal session id");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("session id"), "stderr: {stderr}");
+}
+
+#[test]
+fn test_enter_rejects_hostile_workspace_name() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["enter", "foo;rm -rf /"])
+        .output()
+        .expect("Failed to run enter");
+
+    assert!(!output.status.success(), "validator must reject shell metas");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Invalid workspace name"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_help_mentions_shell_init_eval() {
     let ctx = TestContext::new();
 
     let output = ctx
@@ -393,7 +526,7 @@ fn test_help_mentions_init_shell_eval() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("eval \"$(berth init-shell)\""));
+    assert!(stdout.contains("eval \"$(berth shell-init)\""));
 }
 
 #[test]
@@ -409,7 +542,7 @@ fn test_workspace_shorthand_fails_with_enter_guidance() {
     assert!(!output.status.success(), "Shorthand should be invalid");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("berth enter newproj"));
-    assert!(stderr.contains("eval \"$(berth init-shell)\""));
+    assert!(stderr.contains("eval \"$(berth shell-init)\""));
 
     let project_path = ctx.project_path("newproj");
     assert!(
@@ -514,8 +647,12 @@ fn test_enter_remote_prints_resumable_session_command_in_skip_mode() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Would SSH to user@remotehost"));
-    assert!(stdout.contains("tmux new-session -A -s 'berth-remote-session'"));
-    assert!(stdout.contains("screen -D -RR -S 'berth-remote-session'"));
+    // Each invocation gets a unique tmux/screen session id so multiple
+    // local tabs don't pile into the same multiplexer session.
+    assert!(stdout.contains("tmux new-session -s 'berth-remote-session-$$-$RANDOM'"));
+    assert!(stdout.contains("screen -S 'berth-remote-session-$$-$RANDOM'"));
+    assert!(!stdout.contains("new-session -A"));
+    assert!(!stdout.contains("screen -D -RR"));
     assert!(stdout.contains("else exec ${SHELL:-/bin/sh}; fi"));
 }
 

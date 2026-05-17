@@ -92,7 +92,7 @@ fn enter_local(
 ) -> Result<()> {
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
-    println!("\x1b]2;berth: {}\x07", name);
+    berth::terminal::emit_enter_signals(name);
 
     match runtime_config {
         Runtime::Bare => {
@@ -121,6 +121,7 @@ fn enter_local(
         }
         Runtime::Auto => anyhow::bail!("Auto runtime was not resolved before local entry"),
     }
+    berth::terminal::emit_exit_signals(name);
     Ok(())
 }
 
@@ -136,10 +137,13 @@ async fn enter_remote(
         let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
     }
 
-    println!("\x1b]2;berth: {} [{}]\x07", name, host);
+    berth::terminal::emit_enter_signals(&name);
 
-    ssh::ssh_interactive_runtime(host, &name, runtime_config, mounts).await?;
+    let result = ssh::ssh_interactive_runtime(host, &name, runtime_config, mounts).await;
 
+    berth::terminal::emit_exit_signals(&name);
+
+    result?;
     Ok(())
 }
 

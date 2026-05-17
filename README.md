@@ -22,11 +22,12 @@ berth list
 The implicit `berth NAME` shorthand is intentionally disabled. Install shell niceties instead:
 
 ```bash
-eval "$(berth init-shell)"
+eval "$(berth shell-init)"
+eval "$(berth shell-completions)"
 b myproject
 ```
 
-The shell integration provides `b NAME`, prompt/title updates, and directory-change auto-enter behavior that calls `berth enter NAME`.
+The shell integration provides `b NAME`, a `berth enter` wrapper, completion, and an auto-entry hook for new terminal tabs. The hook reads a terminal user variable (WezTerm / iTerm2) or the explicit `BERTH_PROJECT_HINT` env var to know which workspace the new tab should join — it never hijacks `$PWD` or `$OSC 7` for signalling, so new tabs land in the parent shell's directory as usual.
 
 ## Configuration
 

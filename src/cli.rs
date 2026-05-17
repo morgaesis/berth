@@ -1,11 +1,13 @@
 use crate::commands;
+use crate::commands::shell::HookShell;
 use clap::{Parser, Subcommand};
+use clap_complete::Shell as CompletionShell;
 
 #[derive(Parser)]
 #[command(
     name = "berth",
     about = "Consistent development workspaces, local or remote, bare metal",
-    after_help = "Shell niceties and aliases: eval \"$(berth init-shell)\""
+    after_help = "Shell niceties: eval \"$(berth shell-init)\"   Completions: berth shell-completions"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -87,24 +89,66 @@ enum Commands {
         command: Vec<String>,
     },
     #[command(
-        about = "Print shell integration script",
-        after_help = "Install shell niceties and aliases with: eval \"$(berth init-shell)\""
+        about = "Print shell integration script (deprecated alias of shell-init)",
+        long_about = "Deprecated alias of `berth shell-init`. Will be removed in a future release; \
+                      switch invocations to `eval \"$(berth shell-init)\"`.",
+        after_help = "Install shell niceties and aliases with: eval \"$(berth shell-init)\""
     )]
     InitShell,
+    #[command(
+        name = "shell-init",
+        about = "Print shell hook for resumable session auto-entry",
+        long_about = "Print a shell init script that auto-enters a berth workspace in new tabs.\n\
+                      Cascades detection: WezTerm user var → OSC 7 inherited PWD marker → no hook.\n\
+                      Install: eval \"$(berth shell-init)\""
+    )]
+    ShellInit {
+        #[arg(value_enum, help = "Target shell (auto-detected from $SHELL when omitted)")]
+        shell: Option<HookShell>,
+    },
+    #[command(
+        name = "shell-completions",
+        about = "Print shell completion script",
+        long_about = "Emit completion script for the given shell. Auto-detects from $SHELL when omitted.\n\
+                      Install (zsh): berth shell-completions zsh > ~/.zsh/completions/_berth\n\
+                      Install (bash): berth shell-completions bash > ~/.local/share/bash-completion/completions/berth"
+    )]
+    ShellCompletions {
+        #[arg(value_enum, help = "Target shell (auto-detected from $SHELL when omitted)")]
+        shell: Option<CompletionShell>,
+    },
     #[command(about = "Run berth agent on remote machine")]
     Agent {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
     },
     #[command(
-        about = "Attach to a resumable workspace session (creates one if absent)",
-        long_about = "Attach to a resumable workspace session managed by the local berth supervisor.\n\
-                      The supervisor is launched on first attach, holds a PTY across detach/reattach,\n\
-                      and is what `berth enter <remote>` invokes on the far side when berth is present."
+        about = "Attach to or start a resumable workspace session",
+        long_about = "Resume a workspace session managed by the local berth supervisor.\n\n\
+                      By default, attaches to the single existing session for the workspace.\n\
+                      With --new, always starts a fresh independent session (used by the remote\n\
+                      bootstrap of `berth enter` so each terminal tab gets its own PTY).\n\
+                      With --session <id>, targets a specific session by id."
     )]
     Attach {
         #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
+        #[arg(
+            long = "new",
+            help = "Start a fresh independent session instead of resuming"
+        )]
+        new: bool,
+        #[arg(
+            long = "session",
+            value_name = "ID",
+            help = "Attach to a specific session id (see `berth attach --list`)"
+        )]
+        session: Option<String>,
+        #[arg(
+            long = "list",
+            help = "List active sessions for the workspace and exit"
+        )]
+        list: bool,
         #[arg(
             long = "supervisor",
             help = "Internal: run as the session supervisor in the foreground"
@@ -181,15 +225,33 @@ impl Cli {
                     berth::validate_workspace_name(&name)?;
                     commands::run::run(name, command, ports, remote).await
                 }
-                Commands::InitShell => commands::init_shell::run(),
+                Commands::InitShell => {
+                    eprintln!("berth: `init-shell` is deprecated; switch to `shell-init`.");
+                    commands::shell::run_init(None)
+                }
+                Commands::ShellInit { shell } => commands::shell::run_init(shell),
+                Commands::ShellCompletions { shell } => commands::shell::run_completions(shell),
                 Commands::Agent { ports } => commands::agent::run(ports).await,
                 Commands::Attach {
                     name,
+                    new,
+                    session,
+                    list,
                     supervisor,
                     command,
                 } => {
                     berth::validate_workspace_name(&name)?;
-                    let code = commands::attach::run(name, supervisor, command).await?;
+                    let code = commands::attach::run(
+                        name,
+                        commands::attach::AttachOptions {
+                            supervisor,
+                            new,
+                            session,
+                            list,
+                            command,
+                        },
+                    )
+                    .await?;
                     if code != 0 {
                         std::process::exit(code);
                     }
@@ -203,7 +265,7 @@ impl Cli {
                 Commands::External(args) => {
                     let name = args.first().map(String::as_str).unwrap_or("NAME");
                     anyhow::bail!(
-                        "implicit workspace shorthand was removed; use `berth enter {name}` instead, or install shell helpers with `eval \"$(berth init-shell)\"` and use `b {name}`"
+                        "implicit workspace shorthand was removed; use `berth enter {name}` instead, or install shell helpers with `eval \"$(berth shell-init)\"` and use `b {name}`"
                     )
                 }
             }

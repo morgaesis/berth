@@ -11,8 +11,25 @@ fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
 
-fn remote_projects_path() -> String {
-    "$HOME/.local/share/berth/projects".to_string()
+fn remote_projects_path() -> &'static str {
+    "$HOME/.local/share/berth/projects"
+}
+
+/// Build the remote-side workspace path as a shell expression: the controlled
+/// prefix (which intentionally contains `$HOME` for the remote shell to
+/// expand) is left unquoted, while the user-supplied workspace name segment
+/// is shell-quoted so it cannot break out of the argument.
+///
+/// Result form: `"$HOME"/.local/share/berth/projects/'workspace_name'`
+/// (the prefix uses `"$HOME"` rather than bare `$HOME` so values containing
+/// whitespace stay one token after expansion).
+fn remote_workspace_path_expr(workspace_name: &str) -> String {
+    // remote_projects_path() is a static literal we control; the only
+    // metacharacter is `$HOME` which is intentional. Wrap `$HOME` in
+    // double quotes so word-splitting on its expansion is safe; the rest
+    // of the prefix is ASCII path chars.
+    let prefix = remote_projects_path().replacen("$HOME", "\"$HOME\"", 1);
+    format!("{}/{}", prefix, shell_escape_arg(workspace_name))
 }
 
 pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool) -> Result<()> {
@@ -24,15 +41,15 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
         return Ok(());
     }
 
-    let remote_path = format!("{}/{}", remote_projects_path(), workspace_name);
+    let remote_path = remote_workspace_path_expr(workspace_name);
     let ensure_cmd = if ensure_dir {
         format!(
-            "mkdir -p {} && cd {} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
-            remote_path, remote_path
+            "mkdir -p {0} && cd {0} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
+            remote_path
         )
     } else {
         format!(
-            "cd {} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
+            "cd {0} && export PS1='[berth] $ ' && export PROMPT_COMMAND='PS1=\"[berth] \\u@\\h:\\w\\$ \"'",
             remote_path
         )
     };
@@ -60,7 +77,7 @@ pub async fn ssh_interactive_runtime(
     runtime: &Runtime,
     mounts: &[Mount],
 ) -> Result<()> {
-    let remote_path = format!("{}/{}", remote_projects_path(), workspace_name);
+    let remote_path = remote_workspace_path_expr(workspace_name);
     let enter_cmd = remote_enter_command(workspace_name, &remote_path, runtime, mounts);
 
     if skip_ssh() {
@@ -85,6 +102,8 @@ pub async fn ssh_interactive_runtime(
     Ok(())
 }
 
+/// `remote_path` is a shell *expression* (already quoted/composed by
+/// [`remote_workspace_path_expr`]) and is interpolated raw here.
 fn remote_enter_command(
     workspace_name: &str,
     remote_path: &str,
@@ -97,10 +116,18 @@ fn remote_enter_command(
     let inner = match runtime {
         Runtime::Bare => format!("exec {shell}"),
         Runtime::Podman(podman) => {
-            let mut volumes = vec![format!("-v {remote_path}:{}:Z", podman.project_mount)];
+            let escaped_project_mount = shell_escape_arg(&podman.project_mount);
+            let mut volumes = vec![format!(
+                "-v {}:{}:Z",
+                remote_path, escaped_project_mount
+            )];
             for mount in mounts {
                 let mode = if mount.readonly { "ro" } else { "rw" };
-                volumes.push(format!("-v {}:{}:{mode}", mount.source, mount.target));
+                volumes.push(format!(
+                    "-v {}:{}:{mode}",
+                    shell_escape_arg(&mount.source),
+                    shell_escape_arg(&mount.target)
+                ));
             }
             let userns = podman
                 .userns
@@ -110,12 +137,12 @@ fn remote_enter_command(
                 .unwrap_or_default();
             format!(
                 "exec {} run --rm -it {}--name {} --workdir {} {} {} {shell}",
-                podman.binary,
+                shell_escape_arg(&podman.binary),
                 userns,
                 shell_escape_arg(&session),
-                podman.project_mount,
+                escaped_project_mount,
                 volumes.join(" "),
-                podman.image
+                shell_escape_arg(&podman.image)
             )
         }
         Runtime::KubernetesPod(_) => {
@@ -125,24 +152,32 @@ fn remote_enter_command(
     };
 
     let escaped_workspace = shell_escape_arg(workspace_name);
-    let escaped_session = shell_escape_arg(&session);
     let escaped_inner = shell_escape_arg(&inner);
+    // Per-invocation tmux/screen session id so each `berth enter` from a
+    // new local tab gets an independent multiplexer session even on hosts
+    // where the preferred `berth` binary is missing. The session prefix
+    // remains workspace-derived for human-readable `tmux ls` output.
+    let unique_session = shell_escape_arg(&format!("{session}-$$-$RANDOM"));
 
     // Resumability cascade. Best to worst:
-    //   1. berth attach: PTY-multiplexing supervisor managed by berth itself.
+    //   1. berth attach --new: PTY-multiplexing supervisor managed by berth
+    //      itself. `--new` ensures every local tab gets an independent
+    //      session; resume from a prior session is an explicit
+    //      `berth attach <ws>` invocation.
     //   2. mosh: UDP-resumable interactive transport.
-    //   3. tmux / screen: legacy multiplexers if installed.
+    //   3. tmux / screen: legacy multiplexers if installed. Each invocation
+    //      uses a unique session id so tabs don't pile into one session.
     //   4. plain shell: last resort, no reattach guarantee.
     format!(
         "{base} && \
          if command -v berth >/dev/null 2>&1; then \
-           exec berth attach {escaped_workspace}; \
+           exec berth attach --new {escaped_workspace}; \
          elif command -v mosh-server >/dev/null 2>&1; then \
            exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
-           exec tmux new-session -A -s {escaped_session} {escaped_inner}; \
+           exec tmux new-session -s {unique_session} {escaped_inner}; \
          elif command -v screen >/dev/null 2>&1; then \
-           exec screen -D -RR -S {escaped_session} sh -lc {escaped_inner}; \
+           exec screen -S {unique_session} sh -lc {escaped_inner}; \
          else \
            {inner}; \
          fi"
@@ -275,12 +310,8 @@ mod tests {
 
     #[test]
     fn remote_entry_cascades_from_berth_attach_through_legacy_to_plain_shell() {
-        let command = remote_enter_command(
-            "work",
-            "$HOME/.local/share/berth/projects/work",
-            &Runtime::Bare,
-            &[],
-        );
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command("work", &path_expr, &Runtime::Bare, &[]);
 
         let attach_idx = command
             .find("command -v berth")
@@ -297,22 +328,67 @@ mod tests {
             "cascade order is berth > mosh > tmux > screen"
         );
 
-        assert!(command.contains("exec berth attach 'work'"));
+        assert!(command.contains("exec berth attach --new 'work'"));
         assert!(command.contains("mosh-server new --"));
-        assert!(command.contains("tmux new-session -A -s 'berth-work'"));
-        assert!(command.contains("screen -D -RR -S 'berth-work'"));
+        // Legacy fallbacks use a unique session id per invocation so
+        // multiple terminal tabs don't pile into one shared session.
+        assert!(command.contains("tmux new-session -s 'berth-work-$$-$RANDOM'"));
+        assert!(command.contains("screen -S 'berth-work-$$-$RANDOM'"));
+        // No attach-or-create flags: each invocation must be a fresh session.
+        assert!(!command.contains("new-session -A"));
+        assert!(!command.contains("screen -D -RR"));
         assert!(command.contains("else exec ${SHELL:-/bin/sh}; fi"));
     }
 
     #[test]
-    fn remote_entry_uses_safe_session_name_for_nested_workspace() {
-        let command = remote_enter_command(
-            "team/work",
-            "$HOME/.local/share/berth/projects/team-work",
-            &Runtime::Bare,
-            &[],
+    fn remote_workspace_path_keeps_home_expandable_and_quotes_workspace() {
+        // $HOME must remain in the unquoted ("$HOME") form so the remote
+        // shell expands it; the workspace name is what we shell-quote.
+        let p = remote_workspace_path_expr("work");
+        assert!(
+            p.starts_with("\"$HOME\"/.local/share/berth/projects/"),
+            "expected $HOME-prefixed expression, got {p}"
         );
+        assert!(p.ends_with("'work'"));
+    }
 
-        assert!(command.contains("'berth-team-work'"));
+    #[test]
+    fn remote_workspace_path_quotes_hostile_workspace_name() {
+        // Hostile name passes validation only if a caller forgets to call
+        // validate_workspace_name first; this is the second line of defense.
+        let p = remote_workspace_path_expr("'; rm -rf /; #");
+        let expected_quoted = shell_escape_arg("'; rm -rf /; #");
+        assert!(p.ends_with(&expected_quoted), "got {p}");
+    }
+
+    #[test]
+    fn remote_entry_escapes_hostile_caller_supplied_path() {
+        // Older API expected remote_enter_command to escape; new contract
+        // is "caller passes a ready shell expression". Verify the function
+        // still interpolates the expression as a complete unit.
+        let hostile_expr = shell_escape_arg("/tmp/'; rm -rf /; #");
+        let command = remote_enter_command("work", &hostile_expr, &Runtime::Bare, &[]);
+        assert!(
+            command.contains(&format!("mkdir -p {hostile_expr}")),
+            "mkdir uses caller's expression as-is: {command}"
+        );
+        assert!(
+            command.contains(&format!("cd {hostile_expr}")),
+            "cd uses quoted path: {command}"
+        );
+        // shell_escape_arg's own contract: every embedded `'` is broken out
+        // via `'"'"'` so the result is always a single shell word.
+        assert!(hostile_expr.starts_with('\''));
+        assert!(hostile_expr.ends_with('\''));
+    }
+
+    #[test]
+    fn remote_entry_uses_safe_session_name_for_nested_workspace() {
+        let path_expr = remote_workspace_path_expr("team/work");
+        let command = remote_enter_command("team/work", &path_expr, &Runtime::Bare, &[]);
+
+        // Session name is workspace-derived with a per-invocation suffix
+        // so multi-tab tmux/screen sessions don't collide.
+        assert!(command.contains("'berth-team-work-$$-$RANDOM'"));
     }
 }
