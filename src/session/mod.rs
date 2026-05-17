@@ -74,6 +74,12 @@ fn sanitize(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // BERTH_RUNTIME_DIR is process-global; tests that mutate it must
+    // serialize via this mutex to avoid clobbering each other under the
+    // default parallel test runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn sanitize_replaces_unsafe_chars() {
@@ -83,7 +89,9 @@ mod tests {
 
     #[test]
     fn session_socket_partitions_by_workspace_and_id() {
-        std::env::set_var("BERTH_RUNTIME_DIR", "/tmp/berth-test-sess");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempdir();
+        std::env::set_var("BERTH_RUNTIME_DIR", &tmp);
         let path = session_socket("team/proj", "abc123").expect("socket path");
         assert!(
             path.ends_with("sessions/team-proj/abc123.sock"),
@@ -104,6 +112,7 @@ mod tests {
 
     #[test]
     fn list_sessions_empty_when_no_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempdir();
         std::env::set_var("BERTH_RUNTIME_DIR", &tmp);
         let ids = list_sessions("ghost").expect("list");
@@ -113,6 +122,7 @@ mod tests {
 
     #[test]
     fn list_sessions_enumerates_sock_files_sorted() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempdir();
         std::env::set_var("BERTH_RUNTIME_DIR", &tmp);
         let dir = sessions_dir("ws").expect("sessions dir");

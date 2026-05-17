@@ -153,8 +153,11 @@ fn remote_enter_command(
     // Per-invocation tmux/screen session id so each `berth enter` from a
     // new local tab gets an independent multiplexer session even on hosts
     // where the preferred `berth` binary is missing. The session prefix
-    // remains workspace-derived for human-readable `tmux ls` output.
-    let unique_session = shell_escape_arg(&format!("{session}-$$-$RANDOM"));
+    // is workspace-derived (and shell-quoted), the suffix is the remote
+    // shell's `$$` and `$RANDOM` left UNquoted so they expand on the far
+    // side. Concatenation of a quoted and unquoted segment yields a
+    // single shell word.
+    let unique_session = format!("{}-$$-$RANDOM", shell_escape_arg(&session));
 
     // Resumability cascade. Best to worst:
     //   1. berth attach --new: PTY-multiplexing supervisor managed by berth
@@ -329,8 +332,10 @@ mod tests {
         assert!(command.contains("mosh-server new --"));
         // Legacy fallbacks use a unique session id per invocation so
         // multiple terminal tabs don't pile into one shared session.
-        assert!(command.contains("tmux new-session -s 'berth-work-$$-$RANDOM'"));
-        assert!(command.contains("screen -S 'berth-work-$$-$RANDOM'"));
+        // The prefix is shell-quoted; $$ and $RANDOM are deliberately
+        // left unquoted so the remote shell expands them at runtime.
+        assert!(command.contains("tmux new-session -s 'berth-work'-$$-$RANDOM"));
+        assert!(command.contains("screen -S 'berth-work'-$$-$RANDOM"));
         // No attach-or-create flags: each invocation must be a fresh session.
         assert!(!command.contains("new-session -A"));
         assert!(!command.contains("screen -D -RR"));
@@ -385,7 +390,8 @@ mod tests {
         let command = remote_enter_command("team/work", &path_expr, &Runtime::Bare, &[]);
 
         // Session name is workspace-derived with a per-invocation suffix
-        // so multi-tab tmux/screen sessions don't collide.
-        assert!(command.contains("'berth-team-work-$$-$RANDOM'"));
+        // so multi-tab tmux/screen sessions don't collide. The prefix is
+        // quoted; $$ and $RANDOM are not, so the remote shell expands them.
+        assert!(command.contains("'berth-team-work'-$$-$RANDOM"));
     }
 }

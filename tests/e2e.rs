@@ -661,9 +661,11 @@ fn test_enter_remote_prints_resumable_session_command_in_skip_mode() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("Would SSH to user@remotehost"));
     // Each invocation gets a unique tmux/screen session id so multiple
-    // local tabs don't pile into the same multiplexer session.
-    assert!(stdout.contains("tmux new-session -s 'berth-remote-session-$$-$RANDOM'"));
-    assert!(stdout.contains("screen -S 'berth-remote-session-$$-$RANDOM'"));
+    // local tabs don't pile into the same multiplexer session. The prefix
+    // is shell-quoted; $$ and $RANDOM are unquoted so the remote shell
+    // expands them at runtime.
+    assert!(stdout.contains("tmux new-session -s 'berth-remote-session'-$$-$RANDOM"));
+    assert!(stdout.contains("screen -S 'berth-remote-session'-$$-$RANDOM"));
     assert!(!stdout.contains("new-session -A"));
     assert!(!stdout.contains("screen -D -RR"));
     assert!(stdout.contains("else exec ${SHELL:-/bin/sh}; fi"));
