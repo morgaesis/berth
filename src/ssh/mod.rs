@@ -117,10 +117,7 @@ fn remote_enter_command(
         Runtime::Bare => format!("exec {shell}"),
         Runtime::Podman(podman) => {
             let escaped_project_mount = shell_escape_arg(&podman.project_mount);
-            let mut volumes = vec![format!(
-                "-v {}:{}:Z",
-                remote_path, escaped_project_mount
-            )];
+            let mut volumes = vec![format!("-v {}:{}:Z", remote_path, escaped_project_mount)];
             for mount in mounts {
                 let mode = if mount.readonly { "ro" } else { "rw" };
                 volumes.push(format!(

@@ -25,9 +25,7 @@ pub fn runtime_dir() -> Result<PathBuf> {
 /// Directory holding all supervisor sockets for a workspace. Each
 /// supervisor owns one `<session_id>.sock` file inside this directory.
 pub fn sessions_dir(workspace: &str) -> Result<PathBuf> {
-    Ok(runtime_dir()?
-        .join("sessions")
-        .join(sanitize(workspace)))
+    Ok(runtime_dir()?.join("sessions").join(sanitize(workspace)))
 }
 
 /// Socket path for a specific session within a workspace.
@@ -44,8 +42,8 @@ pub fn list_sessions(workspace: &str) -> Result<Vec<String>> {
         return Ok(vec![]);
     }
     let mut out = Vec::new();
-    for entry in fs::read_dir(&dir)
-        .with_context(|| format!("reading sessions dir {}", dir.display()))?
+    for entry in
+        fs::read_dir(&dir).with_context(|| format!("reading sessions dir {}", dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();

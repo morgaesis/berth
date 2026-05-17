@@ -26,9 +26,7 @@ impl HookShell {
 pub fn run_init(shell: Option<HookShell>) -> Result<()> {
     let shell = match shell.or_else(HookShell::from_env) {
         Some(s) => s,
-        None => bail!(
-            "could not detect shell; pass one explicitly: `berth shell-init bash|zsh`"
-        ),
+        None => bail!("could not detect shell; pass one explicitly: `berth shell-init bash|zsh`"),
     };
     print!("{}", init_script(shell));
     Ok(())

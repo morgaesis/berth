@@ -458,7 +458,11 @@ fn test_attach_list_empty_workspace_succeeds() {
         .output()
         .expect("Failed to run attach --list");
 
-    assert!(output.status.success(), "attach --list should succeed on empty: {:?}", output);
+    assert!(
+        output.status.success(),
+        "attach --list should succeed on empty: {:?}",
+        output
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("no sessions"));
 }
@@ -473,7 +477,10 @@ fn test_attach_resume_with_no_sessions_errors_actionably() {
         .output()
         .expect("Failed to run attach");
 
-    assert!(!output.status.success(), "attach should fail with no sessions");
+    assert!(
+        !output.status.success(),
+        "attach should fail with no sessions"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("no resumable session") && stderr.contains("berth enter"),
@@ -491,7 +498,10 @@ fn test_attach_rejects_invalid_session_id() {
         .output()
         .expect("Failed to run attach");
 
-    assert!(!output.status.success(), "should reject path-traversal session id");
+    assert!(
+        !output.status.success(),
+        "should reject path-traversal session id"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("session id"), "stderr: {stderr}");
 }
@@ -506,7 +516,10 @@ fn test_enter_rejects_hostile_workspace_name() {
         .output()
         .expect("Failed to run enter");
 
-    assert!(!output.status.success(), "validator must reject shell metas");
+    assert!(
+        !output.status.success(),
+        "validator must reject shell metas"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("Invalid workspace name"),

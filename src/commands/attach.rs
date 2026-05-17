@@ -41,7 +41,11 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
     resume(workspace, opts.session).await
 }
 
-async fn run_supervisor(workspace: String, session_id: String, command: Vec<String>) -> Result<i32> {
+async fn run_supervisor(
+    workspace: String,
+    session_id: String,
+    command: Vec<String>,
+) -> Result<i32> {
     supervisor::detach_from_terminal().ok();
     let socket_path = session::session_socket(&workspace, &session_id)?;
     let workdir = workspace_path(&workspace);

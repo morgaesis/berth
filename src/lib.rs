@@ -83,7 +83,10 @@ mod tests {
     #[test]
     fn validate_workspace_name_accepts_typical_forms() {
         for name in ["proj", "Proj-1", "org/proj", "a_b.c-d", "a/b-c.d_e"] {
-            assert!(validate_workspace_name(name).is_ok(), "should accept {name}");
+            assert!(
+                validate_workspace_name(name).is_ok(),
+                "should accept {name}"
+            );
         }
     }
 

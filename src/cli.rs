@@ -103,7 +103,10 @@ enum Commands {
                       Install: eval \"$(berth shell-init)\""
     )]
     ShellInit {
-        #[arg(value_enum, help = "Target shell (auto-detected from $SHELL when omitted)")]
+        #[arg(
+            value_enum,
+            help = "Target shell (auto-detected from $SHELL when omitted)"
+        )]
         shell: Option<HookShell>,
     },
     #[command(
@@ -114,7 +117,10 @@ enum Commands {
                       Install (bash): berth shell-completions bash > ~/.local/share/bash-completion/completions/berth"
     )]
     ShellCompletions {
-        #[arg(value_enum, help = "Target shell (auto-detected from $SHELL when omitted)")]
+        #[arg(
+            value_enum,
+            help = "Target shell (auto-detected from $SHELL when omitted)"
+        )]
         shell: Option<CompletionShell>,
     },
     #[command(about = "Run berth agent on remote machine")]
