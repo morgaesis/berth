@@ -18,23 +18,42 @@ pub struct RemoteEnv {
     pub path_env: String,
 }
 
+// `command -v berth` alone is insufficient: `~/.local/bin` is on most
+// users' interactive-shell PATH (Ubuntu's `.profile` adds it) but NOT on
+// the PATH a non-interactive `ssh host cmd` session sees. We deployed to
+// `~/.local/bin/berth`, so we explicitly probe that path as a fallback.
 const PROBE_SCRIPT: &str = "\
 printf 'OS=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\"; \
 printf 'ARCH=%s\\n' \"$(uname -m 2>/dev/null || echo unknown)\"; \
 printf 'HOME=%s\\n' \"$HOME\"; \
 printf 'PATH=%s\\n' \"$PATH\"; \
+berth_bin=; \
 if command -v berth >/dev/null 2>&1; then \
-  printf 'BERTH_PATH=%s\\n' \"$(command -v berth)\"; \
-  v=$(berth --version 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {print $i; exit}}'); \
+  berth_bin=$(command -v berth); \
+elif [ -x \"$HOME/.local/bin/berth\" ]; then \
+  berth_bin=\"$HOME/.local/bin/berth\"; \
+fi; \
+if [ -n \"$berth_bin\" ]; then \
+  printf 'BERTH_PATH=%s\\n' \"$berth_bin\"; \
+  v=$(\"$berth_bin\" --version 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {print $i; exit}}'); \
   [ -n \"$v\" ] && printf 'BERTH_VERSION=%s\\n' \"$v\"; \
 fi";
 
 /// Run the probe over SSH and parse the result.
+#[tracing::instrument(level = "debug", skip(host), fields(host = %host))]
 pub async fn probe(host: &str) -> Result<RemoteEnv> {
+    tracing::debug!(script_len = PROBE_SCRIPT.len(), "running probe over ssh");
     let raw = crate::ssh::run_remote_command(host, PROBE_SCRIPT)
         .await
         .with_context(|| format!("probing {host} over SSH"))?;
-    parse(&raw)
+    tracing::debug!(raw_lines = raw.lines().count(), "probe ssh returned");
+    let env = parse(&raw)?;
+    tracing::info!(
+        os = %env.os, arch = %env.arch,
+        existing_berth = ?env.berth_version,
+        "probe complete"
+    );
+    Ok(env)
 }
 
 fn parse(raw: &str) -> Result<RemoteEnv> {

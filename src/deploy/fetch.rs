@@ -11,12 +11,14 @@
 
 use anyhow::{bail, Context, Result};
 use futures_util::StreamExt;
+use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use tokio::fs;
 
-const REPO_OWNER: &str = "morgaesis";
-const REPO_NAME: &str = "berth";
+pub(super) const REPO_OWNER: &str = "morgaesis";
+pub(super) const REPO_NAME: &str = "berth";
 
 /// Override for tests / mirrors: when set, used as the base URL instead of
 /// `https://github.com/<owner>/<repo>/releases/download`.
@@ -59,16 +61,20 @@ pub fn asset_name(target: &str) -> String {
 
 /// Fetch the binary for `tag` + `target`. Returns the local path of the
 /// extracted `berth` binary, ready to be `scp`'d.
+#[tracing::instrument(level = "debug", fields(tag = %tag, target = %target))]
 pub async fn fetch_binary(tag: &str, target: &str) -> Result<PathBuf> {
     let cache = cache_dir()?;
     fs::create_dir_all(&cache)
         .await
         .with_context(|| format!("creating cache dir {}", cache.display()))?;
+    tracing::debug!(cache = %cache.display(), "cache dir ready");
 
     let final_path = cache.join(format!("berth-{}-{target}", tag.trim_start_matches('v')));
     if final_path.exists() {
+        tracing::info!(path = %final_path.display(), "cache hit; skipping download");
         return Ok(final_path);
     }
+    tracing::debug!(path = %final_path.display(), "cache miss; will download");
 
     let asset = asset_name(target);
     let tag_path = tag.trim_start_matches('v');
@@ -81,22 +87,34 @@ pub async fn fetch_binary(tag: &str, target: &str) -> Result<PathBuf> {
     let bin_url = format!("{base}/v{tag_path}/{asset}");
     let sha_url = format!("{bin_url}.sha256");
 
-    let archive_bytes = http_get_bytes(&bin_url)
-        .await
-        .with_context(|| format!("fetching {bin_url}"))?;
+    tracing::info!(bin_url = %bin_url, sha_url = %sha_url, "fetching release assets");
     let sha_text = http_get_text(&sha_url)
         .await
         .with_context(|| format!("fetching {sha_url}"))?;
+    tracing::debug!(
+        sha_lines = sha_text.lines().count(),
+        "fetched sha256 sidecar"
+    );
+    let archive_bytes = http_get_bytes_with_progress(&bin_url, Some("downloading"))
+        .await
+        .with_context(|| format!("fetching {bin_url}"))?;
+    tracing::debug!(bytes = archive_bytes.len(), "fetched archive");
 
     let expected = parse_sha256_sidecar(&sha_text, &asset)
         .with_context(|| format!("parsing sha256 sidecar for {asset}"))?;
     let actual = sha256_hex(&archive_bytes);
+    tracing::debug!(expected = %expected, actual = %actual, "sha256 comparison");
     if actual != expected {
         bail!("sha256 mismatch for {asset}: expected {expected}, got {actual}");
     }
+    tracing::debug!("sha256 verified");
 
     let extracted = extract_berth_from_targz(&archive_bytes)
         .with_context(|| format!("extracting berth binary from {asset}"))?;
+    tracing::debug!(
+        bytes = extracted.len(),
+        "extracted berth binary from archive"
+    );
 
     // Atomic place via a sibling tempfile to avoid half-written caches.
     let tmp = final_path.with_extension("partial");
@@ -111,23 +129,64 @@ pub async fn fetch_binary(tag: &str, target: &str) -> Result<PathBuf> {
 }
 
 async fn http_get_bytes(url: &str) -> Result<Vec<u8>> {
+    http_get_bytes_with_progress(url, None).await
+}
+
+async fn http_get_bytes_with_progress(url: &str, label: Option<&str>) -> Result<Vec<u8>> {
     let resp = http_client()?
         .get(url)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?
         .error_for_status()?;
+    let total = resp.content_length();
+    let bar = label.map(|name| {
+        let pb = match total {
+            Some(len) => {
+                let pb = ProgressBar::new(len);
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "  {msg:>20.cyan} [{bar:32.green/white}] {bytes:>10}/{total_bytes:<10} {bytes_per_sec}",
+                    )
+                    .unwrap()
+                    .progress_chars("=> "),
+                );
+                pb
+            }
+            None => {
+                let pb = ProgressBar::new_spinner();
+                pb.enable_steady_tick(Duration::from_millis(80));
+                pb.set_style(
+                    ProgressStyle::with_template("  {msg:>20.cyan} {spinner} {bytes}")
+                        .unwrap()
+                        .tick_chars("⠁⠂⠄⡀⢀⠠⠐⠈ "),
+                );
+                pb
+            }
+        };
+        pb.set_message(name.to_string());
+        pb
+    });
     let mut stream = resp.bytes_stream();
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         if out.len().saturating_add(chunk.len()) > MAX_DOWNLOAD_BYTES {
+            if let Some(b) = &bar {
+                b.abandon_with_message(format!("ABORT >{}MiB", MAX_DOWNLOAD_BYTES / (1024 * 1024)));
+            }
             bail!(
                 "download from {url} exceeded {} MiB cap; aborting",
                 MAX_DOWNLOAD_BYTES / (1024 * 1024)
             );
         }
         out.extend_from_slice(&chunk);
+        if let Some(b) = &bar {
+            b.set_position(out.len() as u64);
+        }
+    }
+    if let Some(b) = bar {
+        b.finish_and_clear();
     }
     Ok(out)
 }
@@ -179,6 +238,7 @@ fn extract_berth_from_targz(archive: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    tracing::debug!(archive_bytes = archive.len(), "spawning tar -xzOf -");
     let mut child = Command::new("tar")
         .arg("-xzOf")
         .arg("-")
@@ -188,14 +248,25 @@ fn extract_berth_from_targz(archive: &[u8]) -> Result<Vec<u8>> {
         .stderr(Stdio::piped())
         .spawn()
         .context("spawning system `tar` for archive extraction")?;
-    if let Some(mut stdin) = child.stdin.take() {
+
+    // Write the archive to tar's stdin on a separate thread so that we
+    // can concurrently drain stdout/stderr via `wait_with_output`. The
+    // previous serial write-then-wait pattern deadlocks on archives
+    // larger than the OS pipe buffer (typically 64 KiB) when tar starts
+    // emitting `berth` to stdout faster than this side can drain it.
+    let archive = archive.to_vec();
+    let mut stdin = child.stdin.take().context("tar stdin missing")?;
+    let writer = std::thread::spawn(move || {
         stdin
-            .write_all(archive)
-            .context("piping archive bytes to tar")?;
-    }
+            .write_all(&archive)
+            .context("piping archive bytes to tar")
+    });
+
     let out = child
         .wait_with_output()
         .context("waiting for tar to finish")?;
+    writer.join().expect("tar writer thread panicked")?;
+    tracing::debug!(stdout_bytes = out.stdout.len(), "tar finished");
     if !out.status.success() {
         bail!(
             "tar -xzOf failed: {}",

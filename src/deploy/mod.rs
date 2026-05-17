@@ -23,6 +23,9 @@ pub use fetch::fetch_binary;
 pub use probe::{probe, RemoteEnv};
 pub use push::push_binary;
 
+pub mod freshness;
+pub mod local;
+
 /// Options that control whether `ensure_deployed` is allowed to actually
 /// write to the remote. Maps to the user-facing `--auto-deploy` /
 /// `--no-deploy` flags plus the per-host trust persisted in config.
@@ -108,16 +111,44 @@ pub fn decide(env: &RemoteEnv, local_version: &str) -> DeployDecision {
 }
 
 /// Run the full deploy: fetch + push + smoke-test. Caller is responsible
-/// for consent gating before invoking this.
+/// for consent gating before invoking this. Status output goes to stderr
+/// via indicatif so a quiet network doesn't look like a hung process.
+#[tracing::instrument(level = "info", skip(host), fields(host = %host, tag = %tag, target = %target))]
 pub async fn ensure_deployed(host: &str, tag: &str, target: &'static str) -> Result<DeployedInfo> {
+    tracing::info!("starting deploy");
+    // fetch_binary already renders its own bytes/Content-Length bar.
     let local = fetch_binary(tag, target).await?;
+    tracing::info!(local_path = %local.display(), "fetched binary");
+
+    let scp_bar = phase_spinner(&format!("scp to {host}"));
     let remote_path = push_binary(host, &local).await?;
+    scp_bar.finish_and_clear();
+    tracing::info!(remote_path = %remote_path.display(), "pushed binary");
+
+    let smoke_bar = phase_spinner("smoke-test");
     smoke_test(host, &remote_path).await?;
+    smoke_bar.finish_and_clear();
+    tracing::info!("smoke-test ok");
+
     Ok(DeployedInfo {
         remote_path,
         target: target.to_string(),
         version: tag.trim_start_matches('v').to_string(),
     })
+}
+
+fn phase_spinner(message: &str) -> indicatif::ProgressBar {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::time::Duration;
+    let pb = ProgressBar::new_spinner();
+    pb.enable_steady_tick(Duration::from_millis(80));
+    pb.set_style(
+        ProgressStyle::with_template("  {msg:<28.cyan} {spinner}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ "),
+    );
+    pb.set_message(message.to_string());
+    pb
 }
 
 /// Result of a successful deploy. Returned by `ensure_deployed` and
@@ -152,12 +183,15 @@ pub fn record_trust(
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip(host, remote_path), fields(host = %host, remote_path = %remote_path.display()))]
 async fn smoke_test(host: &str, remote_path: &std::path::Path) -> Result<()> {
     let path_str = remote_path.to_string_lossy().to_string();
     let cmd = format!("'{}' --version", path_str.replace('\'', "'\"'\"'"));
+    tracing::debug!(cmd = %cmd, "running --version over ssh");
     let out = crate::ssh::run_remote_command(host, &cmd)
         .await
         .with_context(|| format!("running `{path_str} --version` on {host}"))?;
+    tracing::debug!(output = %out.trim(), "smoke-test output");
     if !out.contains("berth") {
         bail!(
             "deployed binary at {} did not respond to --version; output: {}",

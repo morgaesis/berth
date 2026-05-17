@@ -19,10 +19,12 @@ pub fn remote_install_path() -> &'static str {
 
 /// Copy `local_bin` to the remote, chmod +x it, and return the *expanded*
 /// remote path (i.e. with `~` resolved to the remote `$HOME` on disk).
+#[tracing::instrument(level = "debug", skip(host, local_bin), fields(host = %host, local_bin = %local_bin.display()))]
 pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
     // Step 1: ensure the destination directory exists on the remote.
     //         Done via ssh (mkdir -p ~/.local/bin) so we don't rely on
     //         scp's mkdir-on-write extension.
+    tracing::debug!("ensuring remote ~/.local/bin exists");
     let mkdir_status = Command::new("ssh")
         .arg(host)
         .arg("mkdir -p ~/.local/bin")
@@ -36,6 +38,7 @@ pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
     // Step 2: scp the binary across. scp accepts `~/...` on the remote
     //         side and resolves it via the user's login shell.
     let dest = format!("{host}:{}", remote_install_path());
+    tracing::debug!(dest = %dest, "running scp");
     let scp_status = Command::new("scp")
         .arg("-q")
         .arg(local_bin)
@@ -46,6 +49,7 @@ pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
     if !scp_status.success() {
         bail!("scp to {dest} exited {scp_status}");
     }
+    tracing::debug!("scp completed");
 
     // Step 3: chmod +x — scp preserves source mode but be defensive in
     //         case a future caller passes a non-executable cache file.
@@ -58,6 +62,7 @@ pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
     if !chmod_status.success() {
         bail!("ssh {host} chmod +x exited {chmod_status}");
     }
+    tracing::debug!("chmod +x done");
 
     // Step 4: resolve `~/.local/bin/berth` to an absolute path so the
     //         caller can use it as a stable reference in subsequent
@@ -65,5 +70,7 @@ pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
     let resolved = crate::ssh::run_remote_command(host, "printf %s \"$HOME/.local/bin/berth\"")
         .await
         .context("resolving remote ~/.local/bin/berth")?;
-    Ok(PathBuf::from(resolved.trim()))
+    let path = PathBuf::from(resolved.trim());
+    tracing::info!(remote_path = %path.display(), "binary in place on remote");
+    Ok(path)
 }

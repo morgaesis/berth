@@ -168,10 +168,20 @@ fn remote_enter_command(
     //   3. tmux / screen: legacy multiplexers if installed. Each invocation
     //      uses a unique session id so tabs don't pile into one session.
     //   4. plain shell: last resort, no reattach guarantee.
+    // `command -v berth` alone misses our deployed-to-`~/.local/bin/berth`
+    // path on hosts where that dir is only on the *interactive* shell's
+    // PATH (e.g. Ubuntu sources it from `.profile`, which `ssh host cmd`
+    // does not see). Probe both, with the explicit path as the fallback.
     format!(
         "{base} && \
+         berth_bin=; \
          if command -v berth >/dev/null 2>&1; then \
-           exec berth attach --new {escaped_workspace}; \
+           berth_bin=$(command -v berth); \
+         elif [ -x \"$HOME/.local/bin/berth\" ]; then \
+           berth_bin=\"$HOME/.local/bin/berth\"; \
+         fi; \
+         if [ -n \"$berth_bin\" ]; then \
+           exec \"$berth_bin\" attach --new {escaped_workspace}; \
          elif command -v mosh-server >/dev/null 2>&1; then \
            exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
@@ -291,7 +301,15 @@ pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {
         return Ok(format!("[TEST MODE] Would run on {}: {}", host, command));
     }
 
+    tracing::debug!(host = %host, cmd_len = command.len(), "ssh exec");
     let output = Command::new("ssh").arg(host).arg(command).output().await?;
+    tracing::debug!(
+        host = %host,
+        status = ?output.status,
+        stdout_len = output.stdout.len(),
+        stderr_len = output.stderr.len(),
+        "ssh exec returned"
+    );
 
     if !output.status.success() {
         anyhow::bail!(
@@ -314,8 +332,8 @@ mod tests {
         let command = remote_enter_command("work", &path_expr, &Runtime::Bare, &[]);
 
         let attach_idx = command
-            .find("command -v berth")
-            .expect("berth attach probe must come first");
+            .find("berth_bin=")
+            .expect("berth bin discovery must come first");
         let mosh_idx = command
             .find("command -v mosh-server")
             .expect("mosh probe present");
@@ -328,7 +346,9 @@ mod tests {
             "cascade order is berth > mosh > tmux > screen"
         );
 
-        assert!(command.contains("exec berth attach --new 'work'"));
+        // The exec is now via the resolved `$berth_bin` (either `command -v`
+        // result or the explicit `~/.local/bin/berth` fallback path).
+        assert!(command.contains("exec \"$berth_bin\" attach --new 'work'"));
         assert!(command.contains("mosh-server new --"));
         // Legacy fallbacks use a unique session id per invocation so
         // multiple terminal tabs don't pile into one shared session.

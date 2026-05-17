@@ -245,6 +245,10 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
         return Ok(());
     }
 
+    // Best-effort nag if the local binary is behind the latest GitHub
+    // release; never blocks real work.
+    deploy::freshness::warn_if_stale().await;
+
     let local_version = env!("CARGO_PKG_VERSION").to_string();
     let env = match deploy::probe(host).await {
         Ok(env) => env,
@@ -275,7 +279,9 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             );
         }
         DeployDecision::Deploy { target, reason } => {
-            if consent == ConsentMode::Ask && !confirm_deploy(host, target, &reason)? {
+            if consent == ConsentMode::Ask
+                && !confirm_deploy(host, target, &env, &local_version, &reason)?
+            {
                 eprintln!(
                     "berth: deploy declined; falling through to the SSH cascade. \
                      Use `--plain` to skip session-mux entirely, or \
@@ -289,7 +295,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                 .with_context_hard_fail(host)?;
             deploy::record_trust(config, host, &info)?;
             eprintln!(
-                "berth: deployed {} to {} ({})",
+                "berth: deployed v{} to {}:{}  (host added to trusted_hosts)",
                 info.version,
                 host,
                 info.remote_path.display()
@@ -299,13 +305,38 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     }
 }
 
-fn confirm_deploy(host: &str, target: &'static str, reason: &str) -> Result<bool> {
+fn confirm_deploy(
+    host: &str,
+    target: &'static str,
+    env: &berth::deploy::RemoteEnv,
+    local_version: &str,
+    reason: &str,
+) -> Result<bool> {
     if !io::stdin().is_terminal() {
         // Non-interactive: don't prompt; behave like --no-deploy.
         eprintln!("berth: {host} {reason}; running non-interactively, skipping deploy");
         return Ok(false);
     }
-    eprint!("berth: deploy berth-{target} to {host}? [Y/n] (will be added to trusted_hosts): ");
+    // Make the arch decision auditable BEFORE the prompt so the user can
+    // sanity-check that we're not about to push an x86 binary at an ARM
+    // box (or vice versa).
+    eprintln!("berth: deploy plan for {host}");
+    eprintln!(
+        "  local:  {} / {}  (v{local_version})",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+    eprintln!(
+        "  remote: {} / {}  ({})",
+        env.os,
+        env.arch,
+        env.berth_version
+            .as_deref()
+            .map(|v| format!("berth v{v}"))
+            .unwrap_or_else(|| "no existing berth".to_string())
+    );
+    eprintln!("  target: {target}");
+    eprint!("berth: deploy? [Y/n]: ");
     io::stderr().flush().ok();
     let answer = read_yes_no_default_yes()?;
     eprintln!("{}", if answer { "y" } else { "n" });
