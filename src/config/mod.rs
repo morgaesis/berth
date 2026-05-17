@@ -13,6 +13,18 @@ pub struct Config {
     pub workspaces: HashMap<String, Workspace>,
     #[serde(default)]
     pub defaults: Defaults,
+    /// Hosts the user has authorized berth to deploy its own binary to.
+    /// Persisted on first successful deploy; consulted by `berth enter`
+    /// to decide whether to silently redeploy a stale remote.
+    #[serde(default)]
+    pub trusted_hosts: HashMap<String, TrustedHost>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedHost {
+    pub target: String,
+    pub version: String,
+    pub remote_path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +291,7 @@ impl Config {
             Ok(Config {
                 workspaces: HashMap::new(),
                 defaults: Defaults::default(),
+                trusted_hosts: HashMap::new(),
             })
         }
     }

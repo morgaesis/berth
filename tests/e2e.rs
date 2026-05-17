@@ -672,6 +672,90 @@ fn test_enter_remote_prints_resumable_session_command_in_skip_mode() {
 }
 
 #[test]
+fn test_enter_remote_plain_flag_prints_note() {
+    let ctx = TestContext::new();
+    let output = ctx
+        .berth()
+        .args(["enter", "plainws", "--remote", "user@remotehost", "--plain"])
+        .output()
+        .expect("Failed to run berth enter --plain");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--plain set"),
+        "expected --plain note on stderr: {stderr}"
+    );
+}
+
+#[test]
+fn test_enter_remote_no_deploy_flag_skips_probe_silently() {
+    let ctx = TestContext::new();
+    let output = ctx
+        .berth()
+        .args([
+            "enter",
+            "nodeployws",
+            "--remote",
+            "user@remotehost",
+            "--no-deploy",
+        ])
+        .output()
+        .expect("Failed to run berth enter --no-deploy");
+
+    assert!(output.status.success());
+    // SSH cascade still runs (skip mode prints "Would SSH ..." to stdout).
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would SSH to user@remotehost"));
+}
+
+#[test]
+fn test_enter_flags_are_mutually_exclusive() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["enter", "ws", "--remote", "h", "--plain", "--auto-deploy"])
+        .output()
+        .expect("Failed to run berth enter with conflicting flags");
+
+    assert!(!output.status.success(), "conflicting flags should fail");
+}
+
+#[test]
+fn test_deploy_subcommand_help_describes_consent_and_install_path() {
+    let ctx = TestContext::new();
+    let output = ctx
+        .berth()
+        .args(["deploy", "--help"])
+        .output()
+        .expect("Failed to run berth deploy --help");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("trusted_hosts"));
+    assert!(stdout.contains("~/.local/bin/berth"));
+}
+
+#[test]
+fn test_version_flag_works() {
+    let ctx = TestContext::new();
+    let output = ctx
+        .berth()
+        .args(["--version"])
+        .output()
+        .expect("Failed to run berth --version");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("berth "));
+}
+
+#[test]
 fn test_enter_command_with_ports() {
     let ctx = TestContext::new();
 

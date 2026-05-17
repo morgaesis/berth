@@ -2,6 +2,7 @@ pub mod agent;
 pub mod attach;
 pub mod daemon;
 pub mod delete;
+pub mod deploy;
 pub mod doctor;
 pub mod enter;
 pub mod hosts;

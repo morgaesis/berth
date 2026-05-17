@@ -89,7 +89,28 @@ Kubernetes pod runtime builds `kubectl run` for `enter` and `run`, and `kubectl 
 
 `berth daemon` runs in the foreground and periodically invokes the same idle reaper used by `berth reap`. It does not install services, create timers, read secret-bearing environment values, or modify remote hosts. Use `--interval-seconds N` to configure the cadence and `--once` for one deterministic iteration under an external supervisor.
 
-Remote entry uses SSH and does not install packages on the host. If `tmux` is already available remotely, Berth attaches to a named session for resumable shell behavior. If `tmux` is unavailable but `screen` exists, Berth uses a named `screen` session. Otherwise it falls back to a direct SSH shell. Plain SSH cannot reattach to a lost interactive process unless that process was launched under a remote multiplexer or supervisor.
+Remote entry uses SSH and offers full per-tab independent sessions plus
+resumability on whichever host you point it at. On first `berth enter --remote <host>`,
+Berth probes the host's OS/architecture, and — if no compatible `berth` binary
+is installed there — prompts to deploy one. On accept, the matching musl-static
+binary is fetched from this project's GitHub releases (SHA256-verified), copied to
+`~/.local/bin/berth` on the remote, and the host is added to `trusted_hosts` in
+your config so future enters silently redeploy when the version drifts.
+
+```bash
+berth enter --remote prod-box myws            # prompts on first deploy
+berth enter --remote prod-box myws --auto-deploy   # skip the prompt
+berth enter --remote prod-box myws --no-deploy     # use legacy mux only
+berth enter --remote prod-box myws --plain         # plain SSH, no resume
+berth deploy prod-box                          # explicit one-shot deploy
+```
+
+When deploy is declined or impossible (architecture outside the build matrix),
+Berth falls through to a legacy cascade — `mosh-server` → `tmux` → `screen` →
+plain shell — each tmux/screen invocation using a unique `$$-$RANDOM` session
+suffix so multi-tab usage doesn't pile into one shared session. Plain SSH
+cannot reattach to a lost interactive process unless that process was launched
+under a remote multiplexer or supervisor.
 
 ## Testing
 

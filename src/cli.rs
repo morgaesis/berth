@@ -6,6 +6,7 @@ use clap_complete::Shell as CompletionShell;
 #[derive(Parser)]
 #[command(
     name = "berth",
+    version,
     about = "Consistent development workspaces, local or remote, bare metal",
     after_help = "Shell niceties: eval \"$(berth shell-init)\"   Completions: berth shell-completions"
 )]
@@ -26,7 +27,19 @@ enum Commands {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
     },
-    #[command(about = "Enter a workspace (creates if needed)")]
+    #[command(
+        about = "Enter a workspace (creates if needed)",
+        long_about = "Enter a workspace, creating it if absent.\n\n\
+                      For remote workspaces, berth probes the host and selects the best\n\
+                      session-mux available. If none, you'll be prompted to deploy the\n\
+                      berth binary to the remote (one-time consent, persisted in config).\n\
+                      \n\
+                      Flags:\n  \
+                      --plain         skip session-mux entirely; plain SSH login shell\n  \
+                      --auto-deploy   deploy without prompting (overrides per-host trust)\n  \
+                      --no-deploy     never deploy; fall through to legacy multiplexers\n  \
+                                      or fail with a `--plain` suggestion"
+    )]
     Enter {
         #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
@@ -34,6 +47,24 @@ enum Commands {
         remote: Option<String>,
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
+        #[arg(
+            long = "plain",
+            alias = "no-resume",
+            help = "Skip session-mux; just open a plain SSH login shell"
+        )]
+        plain: bool,
+        #[arg(
+            long = "auto-deploy",
+            conflicts_with_all = ["plain", "no_deploy"],
+            help = "Deploy berth binary to the remote without prompting"
+        )]
+        auto_deploy: bool,
+        #[arg(
+            long = "no-deploy",
+            conflicts_with_all = ["plain", "auto_deploy"],
+            help = "Never deploy; use legacy multiplexers or fail"
+        )]
+        no_deploy: bool,
     },
     #[command(about = "List all configured workspaces")]
     List,
@@ -166,6 +197,31 @@ enum Commands {
         )]
         command: Vec<String>,
     },
+    #[command(
+        about = "Deploy the berth binary to a remote host over SSH",
+        long_about = "Probe the remote host for OS+architecture, fetch the matching\n\
+                      pre-built berth binary from this project's GitHub releases (verifying\n\
+                      SHA256), and scp it to ~/.local/bin/berth on the remote.\n\
+                      \n\
+                      Subsequent `berth enter --remote <host>` invocations will then run\n\
+                      `berth attach --new <ws>` on the far side for full per-tab independent\n\
+                      sessions and resume support.\n\
+                      \n\
+                      Adds the host to `trusted_hosts` in the config on success so future\n\
+                      enters auto-deploy without prompting when the remote binary is stale\n\
+                      or missing."
+    )]
+    Deploy {
+        #[arg(help = "SSH host (anything `ssh <host>` would accept)")]
+        host: String,
+        #[arg(
+            long = "tag",
+            help = "GitHub release tag to fetch (defaults to v<this-binary-version>)"
+        )]
+        tag: Option<String>,
+        #[arg(long = "force", help = "Redeploy even if the remote binary matches")]
+        force: bool,
+    },
     #[command(subcommand, name = "hosts")]
     Hosts(HostsCommands),
     #[command(external_subcommand)]
@@ -193,15 +249,29 @@ impl Cli {
                     ports,
                 } => {
                     berth::validate_workspace_name(&name)?;
+                    if let Some(host) = &remote {
+                        berth::validate_ssh_host(host)?;
+                    }
                     commands::new::run(name, path, remote, ports).await
                 }
                 Commands::Enter {
                     name,
                     remote,
                     ports,
+                    plain,
+                    auto_deploy,
+                    no_deploy,
                 } => {
                     berth::validate_workspace_name(&name)?;
-                    commands::enter::run(name, remote, ports).await
+                    if let Some(host) = &remote {
+                        berth::validate_ssh_host(host)?;
+                    }
+                    let opts = commands::enter::EnterOptions {
+                        plain,
+                        auto_deploy,
+                        no_deploy,
+                    };
+                    commands::enter::run(name, remote, ports, opts).await
                 }
                 Commands::List => commands::list::run().await,
                 Commands::Tunnel { name, ports } => {
@@ -229,6 +299,9 @@ impl Cli {
                     remote,
                 } => {
                     berth::validate_workspace_name(&name)?;
+                    if let Some(host) = &remote {
+                        berth::validate_ssh_host(host)?;
+                    }
                     commands::run::run(name, command, ports, remote).await
                 }
                 Commands::InitShell => {
@@ -262,6 +335,13 @@ impl Cli {
                         std::process::exit(code);
                     }
                     Ok(())
+                }
+                Commands::Deploy { host, tag, force } => {
+                    berth::validate_ssh_host(&host)?;
+                    if let Some(t) = &tag {
+                        berth::validate_release_tag(t)?;
+                    }
+                    commands::deploy::run(host, tag, force).await
                 }
                 Commands::Hosts(command) => match command {
                     HostsCommands::Update => commands::hosts::update().await,

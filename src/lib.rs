@@ -1,4 +1,5 @@
 pub mod config;
+pub mod deploy;
 pub mod discovery;
 pub mod hosts;
 pub mod lifecycle;
@@ -56,6 +57,59 @@ pub fn validate_workspace_name(name: &str) -> anyhow::Result<()> {
                 seg
             );
         }
+    }
+    Ok(())
+}
+
+/// Reject SSH host arguments that would be parsed by `ssh`/`scp` as
+/// options. OpenSSH treats any arg starting with `-` as a flag (e.g.
+/// `-oProxyCommand=…`), so a host like `-oProxyCommand=cat /etc/passwd`
+/// becomes arbitrary local-command execution under our user. Argv-style
+/// invocation does *not* defend against this — only validation does.
+pub fn validate_ssh_host(host: &str) -> anyhow::Result<()> {
+    if host.is_empty() {
+        anyhow::bail!("Invalid SSH host: cannot be empty");
+    }
+    if host.starts_with('-') {
+        anyhow::bail!(
+            "Invalid SSH host '{}': hosts may not start with '-' (would be parsed by ssh/scp as an option)",
+            host
+        );
+    }
+    // ssh allows `[user@][addr][:port]`. Reject ASCII control chars and
+    // whitespace defensively; `ssh foo bar` would split into two args
+    // under the hood already, so this is just belt+suspenders.
+    if host
+        .chars()
+        .any(|c| c.is_ascii_control() || c == ' ' || c == '\t')
+    {
+        anyhow::bail!(
+            "Invalid SSH host '{}': must not contain whitespace or control characters",
+            host
+        );
+    }
+    Ok(())
+}
+
+/// Validate a GitHub-release tag (used by `berth deploy --tag <tag>`).
+/// Tags flow into a `PathBuf::join` for the binary cache, so we must
+/// reject path-separator and traversal characters even though the tag
+/// originates from the user's own CLI.
+pub fn validate_release_tag(tag: &str) -> anyhow::Result<()> {
+    if tag.is_empty() || tag.len() > 64 {
+        anyhow::bail!("Invalid release tag: must be 1..=64 chars");
+    }
+    if !tag
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' || c == '+')
+    {
+        anyhow::bail!(
+            "Invalid release tag '{}': only ASCII letters, digits, '.', '-', '_', '+' allowed",
+            tag
+        );
+    }
+    if tag == "." || tag == ".." {
+        anyhow::bail!("Invalid release tag '{}': '.' / '..' are reserved", tag);
     }
     Ok(())
 }
@@ -128,6 +182,52 @@ mod tests {
                 validate_workspace_name(name).is_err(),
                 "should reject {name}"
             );
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_accepts_typical_forms() {
+        for h in ["host", "user@host", "user@host.example.com", "192.0.2.1"] {
+            assert!(validate_ssh_host(h).is_ok(), "should accept {h}");
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_option_like_args() {
+        for h in ["-oProxyCommand=cat /etc/passwd", "-l", "--config=/dev/null"] {
+            assert!(validate_ssh_host(h).is_err(), "should reject {h}");
+        }
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_whitespace_and_controls() {
+        assert!(validate_ssh_host("").is_err());
+        assert!(validate_ssh_host("a b").is_err());
+        assert!(validate_ssh_host("a\tb").is_err());
+        assert!(validate_ssh_host("a\nb").is_err());
+    }
+
+    #[test]
+    fn validate_release_tag_accepts_semver_like_inputs() {
+        for t in ["v0.1.0", "0.1.0", "1.2.3-rc.1", "v2024.05", "1.0.0+build.7"] {
+            assert!(validate_release_tag(t).is_ok(), "should accept {t}");
+        }
+    }
+
+    #[test]
+    fn validate_release_tag_rejects_traversal_and_path_separators() {
+        for t in [
+            "../../tmp/foo",
+            "v../bad",
+            "v/foo",
+            "v\\foo",
+            "..",
+            ".",
+            "",
+            "v$RANDOM",
+            "v;rm -rf /",
+        ] {
+            assert!(validate_release_tag(t).is_err(), "should reject {t}");
         }
     }
 

@@ -42,19 +42,38 @@ jobs:
     strategy:
       matrix:
         include:
+          # Dynamic-libc Linux builds (for distros, mirrors, etc.).
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: berth
-            asset_name: berth-${{ github.ref_name }}-x86_64-unknown-linux-gnu.tar.gz
+            asset_name: berth-x86_64-unknown-linux-gnu.tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             artifact_name: berth
-            asset_name: berth-${{ github.ref_name }}-aarch64-unknown-linux-gnu.tar.gz
+            asset_name: berth-aarch64-unknown-linux-gnu.tar.gz
             use_cross: true
+          # Static-musl builds — these are what `berth deploy` fetches.
+          # No glibc dependency, runs on busybox/openwrt/alpine/scratch.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: berth
+            asset_name: berth-x86_64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: berth
+            asset_name: berth-aarch64-unknown-linux-musl.tar.gz
+            use_cross: true
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            artifact_name: berth
+            asset_name: berth-armv7-unknown-linux-musleabihf.tar.gz
+            use_cross: true
+          # macOS native.
           - target: aarch64-apple-darwin
             os: macos-latest
             artifact_name: berth
-            asset_name: berth-${{ github.ref_name }}-aarch64-apple-darwin.tar.gz
+            asset_name: berth-aarch64-apple-darwin.tar.gz
     steps:
       - uses: actions/checkout@v4
 
@@ -91,12 +110,17 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.artifact_name }} dist/
           cd dist
           tar -czf ${{ matrix.asset_name }} ${{ matrix.artifact_name }}
+          # SHA256 sidecar — same format `sha256sum` produces, which our
+          # `deploy::fetch` parses.
+          sha256sum ${{ matrix.asset_name }} > ${{ matrix.asset_name }}.sha256
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: dist/${{ matrix.asset_name }}
+          path: |
+            dist/${{ matrix.asset_name }}
+            dist/${{ matrix.asset_name }}.sha256
 
   release:
     name: GitHub Release
@@ -115,7 +139,7 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find dist -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec mv {} release/ \;
+          find dist -type f \( -name '*.tar.gz' -o -name '*.tar.gz.sha256' -o -name '*.zip' \) -exec mv {} release/ \;
           ls -l release
 
       - name: Create release
