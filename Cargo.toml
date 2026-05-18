@@ -1,6 +1,6 @@
 [package]
 name = "berth"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "Consistent development workspaces, local or remote, bare metal"
 license = "MIT"
@@ -30,3 +30,4 @@ semver = "1.0.28"
 hex = "0.4.3"
 futures-util = "0.3.32"
 indicatif = "0.18.4"
+tracing-appender = "0.2.5"

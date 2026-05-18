@@ -8,7 +8,7 @@ use clap_complete::Shell as CompletionShell;
     name = "berth",
     version,
     about = "Consistent development workspaces, local or remote, bare metal",
-    after_help = "Shell niceties: eval \"$(berth shell-init)\"   Completions: berth shell-completions"
+    after_help = "Shell niceties: eval \"$(berth shell init)\"   Completions: berth shell completions"
 )]
 pub struct Cli {
     /// Increase log verbosity (-v info, -vv debug, -vvv trace). Overrides
@@ -95,15 +95,46 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "Create a new workspace configuration")]
+    #[command(
+        about = "Create a new workspace configuration",
+        long_about = "Create a new workspace configuration.\n\n\
+                      Workspaces can be plain (`postil`) or org-scoped (`morgaesis/postil`).\n\
+                      Org-scoped workspaces inherit a remote host and remote-root directory\n\
+                      from `orgs.<org>` in config (see `berth org set`).\n\n\
+                      Examples:\n  \
+                      berth new postil\n  \
+                      berth new morgaesis/postil -r morgaesis-dev\n  \
+                      berth new morgaesis/postil --dir '~/Projects/morgaesis/postil.dev'\n  \
+                      berth new morgaesis/postil -- claude --dangerously-skip-permissions"
+    )]
     New {
-        #[arg(help = "Workspace name (org/project format allowed)")]
+        #[arg(help = "Workspace name (org/project, or bare project paired with --org)")]
         name: String,
+        #[arg(
+            help = "Local path for the workspace (defaults to $XDG_DATA_HOME/berth/projects/<name>)"
+        )]
         path: Option<String>,
-        #[arg(short = 'r', long = "remote")]
+        #[arg(
+            short = 'o',
+            long = "org",
+            help = "Prepend this org to a bare workspace name (e.g. --org morgaesis postil → morgaesis/postil)"
+        )]
+        org: Option<String>,
+        #[arg(short = 'r', long = "remote", help = "SSH host for remote entry")]
         remote: Option<String>,
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
+        #[arg(
+            short = 'd',
+            long = "dir",
+            help = "Remote working directory (overrides the auto-managed or org-derived path)"
+        )]
+        dir: Option<String>,
+        #[arg(
+            trailing_var_arg = true,
+            help = "Default command for `berth enter` (everything after `--`)"
+        )]
+        command: Vec<String>,
     },
     #[command(
         about = "Enter a workspace (creates if needed)",
@@ -174,6 +205,25 @@ enum Commands {
     },
     #[command(about = "List all configured workspaces")]
     List,
+    #[command(
+        about = "Dump recent berth activity from local + supervisor logs",
+        long_about = "Print the tail of the global berth log plus any per-session \
+                      supervisor logs (which capture the PTY child's stdout+stderr — \
+                      this is where a failed shell command's error text ends up).\n\n\
+                      Useful for sharing state back to an AI agent or coworker when \
+                      something hangs or errors unexpectedly."
+    )]
+    Logs {
+        #[arg(short = 'n', long = "lines", help = "Tail length (default 200)")]
+        lines: Option<usize>,
+        #[arg(long = "follow", help = "Follow new log lines (not yet implemented)")]
+        follow: bool,
+        #[arg(
+            long = "sessions",
+            help = "Always include per-session supervisor logs even with -n"
+        )]
+        sessions: bool,
+    },
     #[command(about = "Tunnel remote ports locally")]
     Tunnel {
         #[arg(help = "Workspace name (org/project format allowed)")]
@@ -226,40 +276,17 @@ enum Commands {
         command: Vec<String>,
     },
     #[command(
-        about = "Print shell integration script (deprecated alias of shell-init)",
-        long_about = "Deprecated alias of `berth shell-init`. Will be removed in a future release; \
-                      switch invocations to `eval \"$(berth shell-init)\"`.",
-        after_help = "Install shell niceties and aliases with: eval \"$(berth shell-init)\""
+        subcommand,
+        name = "shell",
+        about = "Shell integration helpers (init script + completions)",
+        long_about = "Generate the shell init script and tab-completion scripts.\n\n\
+                      Examples:\n  \
+                      eval \"$(berth shell init)\"             # source the hook in your shell rc\n  \
+                      eval \"$(berth shell completions)\"      # source completions in your shell rc\n  \
+                      berth shell init bash > ~/.config/berth/init.sh\n  \
+                      berth shell completions zsh > ~/.zsh/completions/_berth"
     )]
-    InitShell,
-    #[command(
-        name = "shell-init",
-        about = "Print shell hook for resumable session auto-entry",
-        long_about = "Print a shell init script that auto-enters a berth workspace in new tabs.\n\
-                      Cascades detection: WezTerm user var → OSC 7 inherited PWD marker → no hook.\n\
-                      Install: eval \"$(berth shell-init)\""
-    )]
-    ShellInit {
-        #[arg(
-            value_enum,
-            help = "Target shell (auto-detected from $SHELL when omitted)"
-        )]
-        shell: Option<HookShell>,
-    },
-    #[command(
-        name = "shell-completions",
-        about = "Print shell completion script",
-        long_about = "Emit completion script for the given shell. Auto-detects from $SHELL when omitted.\n\
-                      Install (zsh): berth shell-completions zsh > ~/.zsh/completions/_berth\n\
-                      Install (bash): berth shell-completions bash > ~/.local/share/bash-completion/completions/berth"
-    )]
-    ShellCompletions {
-        #[arg(
-            value_enum,
-            help = "Target shell (auto-detected from $SHELL when omitted)"
-        )]
-        shell: Option<CompletionShell>,
-    },
+    Shell(ShellSubcommands),
     #[command(about = "Run berth agent on remote machine")]
     Agent {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
@@ -349,6 +376,38 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
+enum ShellSubcommands {
+    #[command(
+        about = "Print the shell hook for new-tab auto-entry + `b` shortcut",
+        long_about = "Print a shell init script. Source via `eval \"$(berth shell init)\"` \
+                      in your bashrc/zshrc. The script defines a `b <ws>` shortcut and \
+                      hooks new shells so that, when opened from inside a berth workspace, \
+                      they auto-re-enter the same workspace."
+    )]
+    Init {
+        #[arg(
+            value_enum,
+            help = "Target shell (auto-detected from $SHELL when omitted)"
+        )]
+        shell: Option<HookShell>,
+    },
+    #[command(
+        about = "Print the completion script for the given shell",
+        long_about = "Emit completion script for the given shell. Auto-detects from $SHELL \
+                      when omitted.\n\n\
+                      Install (zsh):  berth shell completions zsh  > ~/.zsh/completions/_berth\n\
+                      Install (bash): berth shell completions bash > ~/.local/share/bash-completion/completions/berth"
+    )]
+    Completions {
+        #[arg(
+            value_enum,
+            help = "Target shell (auto-detected from $SHELL when omitted)"
+        )]
+        shell: Option<CompletionShell>,
+    },
+}
+
+#[derive(Subcommand)]
 enum OrgCommands {
     #[command(about = "Set or update an org's defaults")]
     Set {
@@ -398,14 +457,26 @@ impl Cli {
                 Commands::New {
                     name,
                     path,
+                    org,
                     remote,
                     ports,
+                    dir,
+                    command,
                 } => {
+                    let name = compose_workspace_name(&name, org.as_deref())?;
                     berth::validate_workspace_name(&name)?;
                     if let Some(host) = &remote {
                         berth::validate_ssh_host(host)?;
                     }
-                    commands::new::run(name, path, remote, ports).await
+                    commands::new::run(commands::new::NewArgs {
+                        name,
+                        path,
+                        remote,
+                        ports,
+                        remote_dir: dir,
+                        command,
+                    })
+                    .await
                 }
                 Commands::Enter {
                     name,
@@ -433,6 +504,11 @@ impl Cli {
                     commands::enter::run(name, remote, ports, opts).await
                 }
                 Commands::List => commands::list::run().await,
+                Commands::Logs {
+                    lines,
+                    follow,
+                    sessions,
+                } => commands::logs::run(lines, follow, sessions).await,
                 Commands::Tunnel { name, ports } => {
                     berth::validate_workspace_name(&name)?;
                     commands::tunnel::run(name, ports).await
@@ -463,12 +539,12 @@ impl Cli {
                     }
                     commands::run::run(name, command, ports, remote).await
                 }
-                Commands::InitShell => {
-                    eprintln!("berth: `init-shell` is deprecated; switch to `shell-init`.");
-                    commands::shell::run_init(None)
-                }
-                Commands::ShellInit { shell } => commands::shell::run_init(shell),
-                Commands::ShellCompletions { shell } => commands::shell::run_completions(shell),
+                Commands::Shell(sub) => match sub {
+                    ShellSubcommands::Init { shell } => commands::shell::run_init(shell),
+                    ShellSubcommands::Completions { shell } => {
+                        commands::shell::run_completions(shell)
+                    }
+                },
                 Commands::Agent { ports } => commands::agent::run(ports).await,
                 Commands::Attach {
                     name,
@@ -521,7 +597,7 @@ impl Cli {
                 Commands::External(args) => {
                     let name = args.first().map(String::as_str).unwrap_or("NAME");
                     anyhow::bail!(
-                        "implicit workspace shorthand was removed; use `berth enter {name}` instead, or install shell helpers with `eval \"$(berth shell-init)\"` and use `b {name}`"
+                        "implicit workspace shorthand was removed; use `berth enter {name}` instead, or install shell helpers with `eval \"$(berth shell init)\"` and use `b {name}`"
                     )
                 }
             }

@@ -364,9 +364,9 @@ fn test_shell_init_bash() {
 
     let output = ctx
         .berth()
-        .args(["shell-init", "bash"])
+        .args(["shell", "init", "bash"])
         .output()
-        .expect("Failed to run shell-init bash");
+        .expect("Failed to run shell init bash");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -385,9 +385,9 @@ fn test_shell_init_zsh() {
 
     let output = ctx
         .berth()
-        .args(["shell-init", "zsh"])
+        .args(["shell", "init", "zsh"])
         .output()
-        .expect("Failed to run shell-init zsh");
+        .expect("Failed to run shell init zsh");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -401,9 +401,9 @@ fn test_shell_completions_bash() {
 
     let output = ctx
         .berth()
-        .args(["shell-completions", "bash"])
+        .args(["shell", "completions", "bash"])
         .output()
-        .expect("Failed to run shell-completions bash");
+        .expect("Failed to run shell completions bash");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -417,9 +417,9 @@ fn test_shell_completions_zsh() {
 
     let output = ctx
         .berth()
-        .args(["shell-completions", "zsh"])
+        .args(["shell", "completions", "zsh"])
         .output()
-        .expect("Failed to run shell-completions zsh");
+        .expect("Failed to run shell completions zsh");
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -427,25 +427,26 @@ fn test_shell_completions_zsh() {
 }
 
 #[test]
-fn test_init_shell_deprecated_alias_still_works() {
+fn test_init_shell_alias_is_gone() {
+    // `init-shell` and the top-level `shell-init` / `shell-completions`
+    // were consolidated under `berth shell {init,completions}`. Verify
+    // the deprecated forms are gone (clap parse should fail).
     let ctx = TestContext::new();
-
-    let output = ctx
-        .berth()
-        .args(["init-shell"])
-        .output()
-        .expect("Failed to run init-shell");
-
-    assert!(output.status.success());
-    // Same script content as `shell-init` would emit.
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("_berth_auto_enter_on_start"));
-    // Deprecation notice on stderr.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("deprecated"),
-        "expected deprecation notice in stderr, got: {stderr}"
-    );
+    for args in [
+        vec!["init-shell"],
+        vec!["shell-init"],
+        vec!["shell-completions"],
+    ] {
+        let output = ctx
+            .berth()
+            .args(&args)
+            .output()
+            .expect("Failed to run berth");
+        assert!(
+            !output.status.success(),
+            "expected {args:?} to fail as an unknown subcommand"
+        );
+    }
 }
 
 #[test]
@@ -539,7 +540,7 @@ fn test_help_mentions_shell_init_eval() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("eval \"$(berth shell-init)\""));
+    assert!(stdout.contains("eval \"$(berth shell init)\""));
 }
 
 #[test]
@@ -555,7 +556,7 @@ fn test_workspace_shorthand_fails_with_enter_guidance() {
     assert!(!output.status.success(), "Shorthand should be invalid");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("berth enter newproj"));
-    assert!(stderr.contains("eval \"$(berth shell-init)\""));
+    assert!(stderr.contains("eval \"$(berth shell init)\""));
 
     let project_path = ctx.project_path("newproj");
     assert!(

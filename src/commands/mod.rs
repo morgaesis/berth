@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod enter;
 pub mod hosts;
 pub mod list;
+pub mod logs;
 pub mod new;
 pub mod org;
 pub mod reap;

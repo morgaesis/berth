@@ -47,6 +47,7 @@ pub async fn show(name: String) -> Result<()> {
     match config.orgs.get(&name) {
         Some(org) => {
             print_org(&name, org);
+            print_workspaces_for_org(&config, &name);
         }
         None => {
             anyhow::bail!("org '{name}' not configured; try `berth org set {name} …`");
@@ -65,4 +66,44 @@ fn print_org(name: &str, org: &Org) {
         "    remote_root = {}",
         org.remote_root.as_deref().unwrap_or("(none)")
     );
+}
+
+fn print_workspaces_for_org(config: &Config, org: &str) {
+    let prefix = format!("{org}/");
+    let mut names: Vec<&String> = config
+        .workspaces
+        .keys()
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    names.sort();
+    if names.is_empty() {
+        println!("    workspaces  = (none)");
+        return;
+    }
+    println!("    workspaces:");
+    for ws_name in names {
+        let ws = &config.workspaces[ws_name];
+        let dir = config
+            .resolved_remote_dir(ws_name, ws)
+            .unwrap_or_else(|| "(auto-managed)".to_string());
+        let host = config
+            .resolved_remote(ws_name, ws)
+            .unwrap_or_else(|| "(local)".to_string());
+        let cmd_summary = ws
+            .command
+            .as_ref()
+            .map(|argv| {
+                let joined: String = argv.join(" ");
+                if joined.chars().count() > 60 {
+                    let truncated: String = joined.chars().take(57).collect();
+                    format!(" cmd=`{truncated}…`")
+                } else {
+                    format!(" cmd=`{joined}`")
+                }
+            })
+            .unwrap_or_default();
+        println!("      - {ws_name}");
+        println!("          host = {host}");
+        println!("          dir  = {dir}{cmd_summary}");
+    }
 }

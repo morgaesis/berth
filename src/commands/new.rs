@@ -17,12 +17,24 @@ fn default_projects_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("~/.local/share/berth/projects"))
 }
 
-pub async fn run(
-    name: String,
-    path: Option<String>,
-    remote: Option<String>,
-    ports: Vec<u16>,
-) -> Result<()> {
+pub struct NewArgs {
+    pub name: String,
+    pub path: Option<String>,
+    pub remote: Option<String>,
+    pub ports: Vec<u16>,
+    pub remote_dir: Option<String>,
+    pub command: Vec<String>,
+}
+
+pub async fn run(args: NewArgs) -> Result<()> {
+    let NewArgs {
+        name,
+        path,
+        remote,
+        ports,
+        remote_dir,
+        command,
+    } = args;
     let mut config = Config::load()?;
 
     if config.workspaces.contains_key(&name) {
@@ -41,6 +53,12 @@ pub async fn run(
     let mut workspace = Workspace::new(workspace_path.to_string_lossy().to_string());
     workspace.remote = remote;
     workspace.ports = if ports.is_empty() { None } else { Some(ports) };
+    workspace.remote_dir = remote_dir;
+    workspace.command = if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    };
 
     config.workspaces.insert(name.clone(), workspace);
     config.save()?;
