@@ -74,7 +74,9 @@ async fn main() {
     let code = match cli.run().await {
         Ok(()) => 0,
         Err(err) => {
-            eprintln!("Error: {err:#}");
+            // Errors already self-describe; no "Error:" prefix needed.
+            // Multi-line anyhow chains print as-is.
+            eprintln!("{err:#}");
             1
         }
     };

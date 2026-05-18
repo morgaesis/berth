@@ -56,6 +56,8 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
 
     let status = Command::new("ssh")
         .arg("-tt")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(host)
         .arg(&ensure_cmd)
         .arg("&&")
@@ -65,7 +67,7 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
         .await?;
 
     if !status.success() {
-        anyhow::bail!("SSH session exited with error");
+        anyhow::bail!("remote exited with status {}", status);
     }
 
     Ok(())
@@ -129,6 +131,10 @@ pub async fn ssh_interactive_runtime_with(
     tracing::info!(host = %host, "spawning ssh -tt");
     let status = Command::new("ssh")
         .arg("-tt")
+        // Suppress ssh's own status lines ("Shared connection ... closed",
+        // motd banners). Errors still print.
+        .arg("-o")
+        .arg("LogLevel=ERROR")
         .arg(host)
         .arg(enter_cmd)
         .status()
@@ -136,7 +142,9 @@ pub async fn ssh_interactive_runtime_with(
     tracing::info!(?status, "ssh exited");
 
     if !status.success() {
-        anyhow::bail!("SSH session exited with error");
+        // Remote berth-attach already printed the actionable error to
+        // the user's TTY. Just propagate a non-zero so the caller knows.
+        anyhow::bail!("remote exited with status {}", status);
     }
 
     Ok(())

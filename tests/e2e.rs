@@ -427,35 +427,19 @@ fn test_shell_completions_zsh() {
 }
 
 #[test]
-fn test_deprecated_shell_aliases_still_work() {
-    // The pre-v0.1.5 top-level forms (`init-shell`, `shell-init`,
-    // `shell-completions`) are kept as hidden deprecated forwarders so
-    // existing shell rc snippets keep working. They print a deprecation
-    // notice on stderr and produce the same output as the new form.
+fn test_old_shell_aliases_are_gone() {
+    // No backwards-compat aliases; the canonical form is `berth shell init`
+    // / `berth shell completions`. clap should reject the old forms.
     let ctx = TestContext::new();
-    for (args, want_in_stdout) in [
-        (vec!["init-shell"], "_berth_auto_enter_on_start"),
-        (vec!["shell-init", "bash"], "_berth_auto_enter_on_start"),
-        (vec!["shell-completions", "bash"], "_berth()"),
+    for args in [
+        vec!["init-shell"],
+        vec!["shell-init"],
+        vec!["shell-completions"],
     ] {
-        let output = ctx
-            .berth()
-            .args(&args)
-            .output()
-            .expect("Failed to run deprecated alias");
+        let output = ctx.berth().args(&args).output().expect("Failed to run");
         assert!(
-            output.status.success(),
-            "alias {args:?} should still succeed"
-        );
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stdout.contains(want_in_stdout),
-            "expected stdout to contain {want_in_stdout:?}, got:\n{stdout}"
-        );
-        assert!(
-            stderr.contains("deprecated"),
-            "expected deprecation note on stderr, got:\n{stderr}"
+            !output.status.success(),
+            "expected {args:?} to fail as an unknown subcommand"
         );
     }
 }

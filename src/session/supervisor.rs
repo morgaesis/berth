@@ -72,7 +72,17 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(16);
     let (shutdown_tx, _) = broadcast::channel::<i32>(4);
 
+    // Rolling replay buffer of the last 64 KiB of PTY output. Late
+    // clients (anyone who connects after the child has already emitted
+    // bytes — including the entire output of fast-exit commands like
+    // `bash --help`) get this dumped at attach time before live
+    // streaming starts.
+    const REPLAY_CAP: usize = 64 * 1024;
+    let replay_buf: Arc<std::sync::Mutex<Vec<u8>>> =
+        Arc::new(std::sync::Mutex::new(Vec::with_capacity(REPLAY_CAP)));
+
     let stdout_for_pump = stdout_tx.clone();
+    let replay_for_reader = replay_buf.clone();
     let pty_for_reader = pty_master.clone();
     let shutdown_for_reader = shutdown_tx.clone();
     let pty_reader_handle = tokio::task::spawn_blocking(move || {
@@ -88,7 +98,18 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
             match std::io::Read::read(&mut reader, &mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let _ = stdout_for_pump.send(buf[..n].to_vec());
+                    let chunk = buf[..n].to_vec();
+                    // Append to replay buffer, dropping from the front
+                    // when we exceed the cap. Cheap because mostly the
+                    // buffer won't grow past cap.
+                    if let Ok(mut b) = replay_for_reader.lock() {
+                        b.extend_from_slice(&chunk);
+                        if b.len() > REPLAY_CAP {
+                            let overflow = b.len() - REPLAY_CAP;
+                            b.drain(..overflow);
+                        }
+                    }
+                    let _ = stdout_for_pump.send(chunk);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
@@ -151,6 +172,7 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                         let resize_for_client = resize_tx.clone();
                         let shutdown_rx_for_client = shutdown_tx.subscribe();
                         let active = active_client.clone();
+                        let replay = replay_buf.clone();
                         tokio::spawn(handle_client(
                             stream_id,
                             stream,
@@ -159,6 +181,7 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                             resize_for_client,
                             shutdown_rx_for_client,
                             active,
+                            replay,
                         ));
                     }
                     Err(e) => {
@@ -174,6 +197,40 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         }
     }
 
+    // Grace window: after the child has exited, keep the socket open
+    // for ~2s so a client that was racing to connect can still attach,
+    // receive the replay buffer (the child's full output if it was
+    // short-lived), and a clean Exit frame. Without this, fast-exit
+    // commands like `bash --help` produce no visible output.
+    let grace_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        tokio::select! {
+            res = listener.accept() => {
+                if let Ok((stream, _addr)) = res {
+                    let stream_id = next_client_id;
+                    next_client_id += 1;
+                    let stdout_rx = stdout_tx.subscribe();
+                    let stdin_for_client = stdin_tx.clone();
+                    let resize_for_client = resize_tx.clone();
+                    let shutdown_rx_for_client = shutdown_tx.subscribe();
+                    let active = active_client.clone();
+                    let replay = replay_buf.clone();
+                    tokio::spawn(handle_client(
+                        stream_id,
+                        stream,
+                        stdout_rx,
+                        stdin_for_client,
+                        resize_for_client,
+                        shutdown_rx_for_client,
+                        active,
+                        replay,
+                    ));
+                }
+            }
+            _ = tokio::time::sleep_until(grace_deadline) => break,
+        }
+    }
+
     let _ = pty_reader_handle.await;
     drop(stdin_tx);
     let _ = writer_handle.await;
@@ -184,6 +241,7 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
     Ok(final_code)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client(
     _client_id: u64,
     stream: UnixStream,
@@ -192,8 +250,18 @@ async fn handle_client(
     resize_tx: mpsc::Sender<(u16, u16)>,
     mut shutdown_rx: broadcast::Receiver<i32>,
     _active: Arc<Mutex<u64>>,
+    replay: Arc<std::sync::Mutex<Vec<u8>>>,
 ) {
     let (mut read_half, mut write_half) = stream.into_split();
+
+    // Replay any output the child has already produced. This is what
+    // makes `bash --help` (and any fast-exit command) actually deliver
+    // its output: the supervisor buffered it before any client could
+    // subscribe to the broadcast channel.
+    let replay_snapshot: Vec<u8> = replay.lock().map(|b| b.clone()).unwrap_or_default();
+    if !replay_snapshot.is_empty() {
+        let _ = write_frame(&mut write_half, &Frame::Stdout(replay_snapshot)).await;
+    }
 
     let writer_task = tokio::spawn(async move {
         loop {
@@ -351,9 +419,15 @@ mod tests {
     }
 
     fn tempdir() -> PathBuf {
-        let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join(".cache")
-            .join("session-tests");
+        // Unix sockets cap at 108 chars total; the project's
+        // .cache/session-tests path exceeds that when run from a
+        // worktree (e.g. `.claude/worktrees/<name>/.cache/...`). Use
+        // the short XDG runtime dir which is also where production
+        // session sockets live.
+        let base = std::env::var("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
+            .join("berth-tests");
         std::fs::create_dir_all(&base).expect("base dir");
         let unique = format!(
             "{}-{}",

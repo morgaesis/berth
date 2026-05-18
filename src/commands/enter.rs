@@ -218,23 +218,9 @@ async fn enter_remote(
     berth::terminal::emit_exit_signals(&name);
     tracing::info!("emitted exit signals");
 
-    // Exit-banner: best-effort restate of which version was running
-    // remote during the session. Useful in case the user redeploys the
-    // remote out-of-band between sessions.
-    if !opts.plain {
-        let local_version = env!("CARGO_PKG_VERSION");
-        // Cheap re-read from trusted_hosts (no network round-trip).
-        if let Ok(cfg) = berth::config::Config::load() {
-            if let Some(t) = cfg.trusted_hosts.get(host) {
-                eprintln!(
-                    "{} session ended on {host}  (local v{local_version} / remote v{})",
-                    "·".dimmed(),
-                    t.version
-                );
-            }
-        }
-    }
-
+    // No "session ended" line — the user just typed `exit`, they know.
+    // Errors propagate via Result; on success, stay silent. Anything
+    // worth keeping (versions, paths, timings) is in `berth logs`.
     result?;
     Ok(())
 }
@@ -330,20 +316,23 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     let decision = deploy::decide(&env, &local_version);
     let already_trusted = config.trusted_hosts.contains_key(host);
 
-    // Always surface the version diff. The deploy header below only
-    // fires when we're actually deploying; for an UpToDate remote, the
-    // user wouldn't otherwise know what's running there.
+    // Only surface the version when there's something noteworthy: a
+    // drift between local and remote, or a remote we're about to touch.
+    // Quiet runs (matching versions, no deploy decision) say nothing.
     let remote_ver_str = env
         .berth_version
         .as_deref()
         .map(|v| format!("berth {v}"))
         .unwrap_or_else(|| "no remote berth".to_string());
-    eprintln!(
-        "{} local v{}  |  {host}: {}",
-        "·".dimmed(),
-        local_version.cyan(),
-        remote_ver_str.cyan()
-    );
+    let version_drift = env.berth_version.as_deref() != Some(local_version.as_str());
+    if version_drift {
+        eprintln!(
+            "{} local v{}  |  {host}: {}",
+            "·".dimmed(),
+            local_version.cyan(),
+            remote_ver_str.cyan()
+        );
+    }
 
     let consent = match (opts.auto_deploy, already_trusted) {
         (true, _) => ConsentMode::AutoApproved,

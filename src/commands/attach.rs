@@ -70,24 +70,22 @@ async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("creating sessions dir {}", sessions_dir.display()))?;
     let socket_path = session::session_socket(&workspace, &id)?;
-    let log_path = supervisor_log_path(&workspace, &id)?;
+    let _log_path = supervisor_log_path(&workspace, &id)?;
     spawn_supervisor(&workspace, &id, &command)?;
-    if let Err(_e) = wait_for_socket(&socket_path, Duration::from_secs(5)) {
-        // Supervisor failed to start or exited before the socket was
-        // ready. Keep the visible error short and direct; the full
-        // detail (tracing + child stdout/stderr) is in `berth logs`.
+    if wait_for_socket(&socket_path, Duration::from_secs(5)).is_err() {
+        // Keep the visible error to one line. The full detail (child
+        // stderr + tracing) is in `berth logs`.
         use colored::Colorize;
-        let mut hint = command_failure_hint(&command);
-        if !hint.is_empty() {
-            hint = format!("  tip: {}\n", hint.yellow());
-        }
+        let hint = command_failure_hint(&command);
+        let hint_suffix = if hint.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", hint.dimmed())
+        };
         anyhow::bail!(
-            "{}: supervisor for '{}' exited before connecting (likely the command failed or finished immediately)\n\
-             {hint}  details: `{}` (or read {})",
-            "✗ berth".red().bold(),
-            workspace,
+            "{} command exited before berth could attach{hint_suffix}  (`{}` for details)",
+            "✗".red().bold(),
             "berth logs".cyan(),
-            log_path.display().to_string().dimmed(),
         );
     }
     session::client::attach(&socket_path).await
