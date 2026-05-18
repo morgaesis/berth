@@ -1,11 +1,87 @@
 use super::protocol::{read_frame, write_frame, Frame};
 use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
+/// Error returned by `attach` when another client already holds the
+/// session lock. Callers in the `--resume-or-new` path treat this as a
+/// signal to try the next session or spawn a new one; explicit `attach`
+/// surfaces it to the user.
+#[derive(Debug)]
+pub struct SessionBusy;
+
+impl std::fmt::Display for SessionBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "session is already attached by another client; pass --new to start a fresh one"
+        )
+    }
+}
+
+impl std::error::Error for SessionBusy {}
+
+/// Companion lock-file path for a session socket.
+fn lock_path_for(socket_path: &Path) -> PathBuf {
+    let mut p = socket_path.to_path_buf();
+    let new_ext = match p.extension() {
+        Some(ext) => format!("{}.client-lock", ext.to_string_lossy()),
+        None => "client-lock".to_string(),
+    };
+    p.set_extension(new_ext);
+    p
+}
+
+/// Probe whether a session is currently attached, without disturbing
+/// it. Returns true if no client holds the flock; false if held.
+/// Used by `attach --resume-or-new` to skip busy sessions.
+pub fn is_session_free(socket_path: &Path) -> bool {
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_path = lock_path_for(socket_path);
+    let f = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return true, // can't even open the lock file; assume free
+    };
+    // `Flock::lock` consumes the file and returns an RAII handle; when
+    // it drops at the end of this scope, the lock is released. So just
+    // attempting the lock is the probe.
+    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+        Ok(_lock) => true,
+        Err(_) => false,
+    }
+}
+
 pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
+    // Take an exclusive flock on a sibling lock file. The lock handle
+    // is leaked so it stays alive for the lifetime of this process;
+    // the kernel releases the lock automatically when the process dies
+    // (including via SSH-drop / hibernation), so any subsequent
+    // `resume-or-new` will find this session free again.
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_path = lock_path_for(socket_path.as_ref());
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening session lock {}", lock_path.display()))?;
+    match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => {
+            // Leak into a heap allocation so it stays alive (and the
+            // kernel keeps holding the flock) until process exit.
+            Box::leak(Box::new(lock));
+        }
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => return Err(SessionBusy.into()),
+        Err((_, e)) => return Err(anyhow::Error::new(e).context("acquiring session lock")),
+    }
+
     let stream = UnixStream::connect(&socket_path).await.with_context(|| {
         format!(
             "connecting to session socket {}",

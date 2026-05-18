@@ -136,7 +136,12 @@ _berth_auto_enter_on_start() {
         "$state_dir"/*) cd "$HOME" 2>/dev/null || cd / ;;
     esac
     export BERTH_SKIP_AUTO=1
-    command berth enter "$proj"
+    # New tabs always get a fresh session — different from the default
+    # `berth enter` which resumes if a session exists. Without `--new`
+    # here, opening a second tab from inside an active workspace would
+    # attach the same supervisor in both tabs (shared PTY, exiting one
+    # closes both).
+    command berth enter --new "$proj"
 }
 
 # Defensive: if $PWD has vanished out from under us (older berth versions

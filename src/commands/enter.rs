@@ -19,6 +19,11 @@ pub struct EnterOptions {
     pub auto_deploy: bool,
     /// `--no-deploy`: never push; fall through to legacy mux or fail.
     pub no_deploy: bool,
+    /// `--new`: force a fresh session even if one is already alive.
+    /// Default is to resume the existing supervisor (so hibernation
+    /// and ssh-drop reconnect cleanly). The shell-init new-tab hook
+    /// sets this so each tab gets its own independent supervisor.
+    pub force_new: bool,
     /// `--dir`: override the remote working directory for this run.
     pub dir: Option<String>,
     /// Trailing `-- <argv>`: override the workspace default command.
@@ -210,6 +215,7 @@ async fn enter_remote(
         let overrides = ssh::RemoteEnterOverrides {
             remote_dir,
             command,
+            force_new: opts.force_new,
         };
         ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
     };

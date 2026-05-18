@@ -80,9 +80,13 @@ pub struct RemoteEnterOverrides<'a> {
     /// `~`, etc.). When None, the auto-managed path is used.
     pub remote_dir: Option<&'a str>,
     /// Workspace-supplied default command argv. Forwarded to the remote
-    /// `berth attach --new <ws> -- <argv...>` when the remote berth
-    /// cascade is taken.
+    /// `berth attach` cascade arm as trailing `-- <argv...>`.
     pub command: Option<&'a [String]>,
+    /// When true, force a fresh independent session (`berth attach --new`).
+    /// When false (default), prefer to attach to an existing session so
+    /// SSH-drop / hibernation reconnects cleanly
+    /// (`berth attach --resume-or-new`).
+    pub force_new: bool,
 }
 
 pub async fn ssh_interactive_runtime(
@@ -118,6 +122,7 @@ pub async fn ssh_interactive_runtime_with(
         runtime,
         mounts,
         overrides.command,
+        overrides.force_new,
     );
 
     if skip_ssh() {
@@ -159,17 +164,23 @@ fn remote_enter_command(
     runtime: &Runtime,
     mounts: &[Mount],
 ) -> String {
-    remote_enter_command_with(workspace_name, remote_path, runtime, mounts, None)
+    remote_enter_command_with(workspace_name, remote_path, runtime, mounts, None, false)
 }
 
 /// `remote_path` is a shell *expression* (already quoted/composed by
 /// [`remote_workspace_path_expr`]) and is interpolated raw here.
+///
+/// `force_new` selects the attach verb passed to the remote berth:
+/// false (default) → `attach --resume-or-new` (smart resume), true →
+/// `attach --new` (always fresh). The new-tab auto-entry hook passes
+/// true; `berth enter` passes false.
 fn remote_enter_command_with(
     workspace_name: &str,
     remote_path: &str,
     runtime: &Runtime,
     mounts: &[Mount],
     workspace_command: Option<&[String]>,
+    force_new: bool,
 ) -> String {
     let base = format!("mkdir -p {remote_path} && cd {remote_path}");
     let shell = "${SHELL:-/bin/sh}";
@@ -225,6 +236,11 @@ fn remote_enter_command_with(
     // PID 1 instead of `$SHELL -l`. Each argv element is shell-quoted
     // independently. Empty / None means "no override; supervisor runs
     // $SHELL -l".
+    let attach_verb = if force_new {
+        "--new"
+    } else {
+        "--resume-or-new"
+    };
     let attach_cmd_suffix = match workspace_command {
         Some(argv) if !argv.is_empty() => {
             let mut s = String::from(" --");
@@ -259,7 +275,7 @@ fn remote_enter_command_with(
            berth_bin=\"$HOME/.local/bin/berth\"; \
          fi; \
          if [ -n \"$berth_bin\" ]; then \
-           exec \"$berth_bin\" attach --new {escaped_workspace}{attach_cmd_suffix}; \
+           exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
          elif command -v mosh-server >/dev/null 2>&1; then \
            exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
@@ -463,7 +479,9 @@ mod tests {
 
         // The exec is now via the resolved `$berth_bin` (either `command -v`
         // result or the explicit `~/.local/bin/berth` fallback path).
-        assert!(command.contains("exec \"$berth_bin\" attach --new 'work'"));
+        // Default verb is --resume-or-new so SSH-drop reattaches cleanly;
+        // tabs that want isolation pass `berth enter --new`.
+        assert!(command.contains("exec \"$berth_bin\" attach --resume-or-new 'work'"));
         assert!(command.contains("mosh-server new --"));
         // Legacy fallbacks use a unique session id per invocation so
         // multiple terminal tabs don't pile into one shared session.

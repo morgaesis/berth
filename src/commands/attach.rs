@@ -8,6 +8,12 @@ use std::time::{Duration, Instant};
 pub struct AttachOptions {
     pub supervisor: bool,
     pub new: bool,
+    /// If true and no session exists, create a fresh one; if exactly
+    /// one session exists, attach to it; if multiple, attach to the
+    /// newest. Used as the default verb invoked by `berth enter` so
+    /// SSH-drop / hibernation produces a clean reconnect rather than
+    /// orphaning the prior supervisor.
+    pub resume_or_new: bool,
     pub session: Option<String>,
     pub list: bool,
     pub command: Vec<String>,
@@ -33,12 +39,43 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
     if opts.new {
         return start_fresh(workspace, opts.command).await;
     }
+    if opts.resume_or_new {
+        return resume_or_new(workspace, opts.command).await;
+    }
     if !opts.command.is_empty() {
         bail!(
             "command override is only valid with --new (resuming an existing session inherits its original command)"
         );
     }
     resume(workspace, opts.session).await
+}
+
+/// Smart attach: try each live session in turn; the first one whose
+/// client-flock is free (i.e. no other client is currently connected
+/// — the prior client exited cleanly OR died via SSH-drop /
+/// hibernation, releasing the kernel-held lock) is attached. If every
+/// live session is busy (another tab is connected), spawn a fresh
+/// supervisor instead. If none exist at all, also spawn fresh.
+async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
+    let sessions = session::list_sessions(&workspace)?;
+    let live: Vec<String> = sessions
+        .into_iter()
+        .filter(|id| {
+            session::session_socket(&workspace, id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+        })
+        .collect();
+    for id in &live {
+        let socket = session::session_socket(&workspace, id)?;
+        if session::client::is_session_free(&socket) {
+            return session::client::attach(&socket).await;
+        }
+    }
+    // No free session — every existing one has a connected client (a
+    // sibling tab is attached). Honor the user's intent to be in this
+    // workspace by spawning a new supervisor for them.
+    start_fresh(workspace, command).await
 }
 
 async fn run_supervisor(

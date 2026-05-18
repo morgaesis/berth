@@ -198,6 +198,11 @@ enum Commands {
         )]
         no_deploy: bool,
         #[arg(
+            long = "new",
+            help = "Force a fresh session even if one is already alive (default: resume if a session exists)"
+        )]
+        new: bool,
+        #[arg(
             trailing_var_arg = true,
             help = "Override workspace default command (everything after `--`)"
         )]
@@ -308,6 +313,12 @@ enum Commands {
             help = "Start a fresh independent session instead of resuming"
         )]
         new: bool,
+        #[arg(
+            long = "resume-or-new",
+            conflicts_with = "new",
+            help = "Attach to an existing session if one exists, else create new (the verb `berth enter` invokes on the remote)"
+        )]
+        resume_or_new: bool,
         #[arg(
             long = "session",
             value_name = "ID",
@@ -545,6 +556,7 @@ impl Cli {
                     plain,
                     auto_deploy,
                     no_deploy,
+                    new,
                     command,
                 } => {
                     let name = compose_workspace_name(&name, org.as_deref())?;
@@ -556,6 +568,7 @@ impl Cli {
                         plain,
                         auto_deploy,
                         no_deploy,
+                        force_new: new,
                         dir,
                         command,
                     };
@@ -607,6 +620,7 @@ impl Cli {
                 Commands::Attach {
                     name,
                     new,
+                    resume_or_new,
                     session,
                     list,
                     supervisor,
@@ -618,6 +632,7 @@ impl Cli {
                         commands::attach::AttachOptions {
                             supervisor,
                             new,
+                            resume_or_new,
                             session,
                             list,
                             command,
