@@ -287,6 +287,34 @@ enum Commands {
                       berth shell completions zsh > ~/.zsh/completions/_berth"
     )]
     Shell(ShellSubcommands),
+    // Deprecated forwarders for the pre-v0.1.5 top-level forms. Hidden
+    // from help but still recognized so older shell rc snippets keep
+    // working until users migrate. Each emits a one-line deprecation
+    // notice on stderr.
+    #[command(
+        name = "shell-init",
+        hide = true,
+        about = "[deprecated] alias for `berth shell init`"
+    )]
+    ShellInitDeprecated {
+        #[arg(value_enum)]
+        shell: Option<HookShell>,
+    },
+    #[command(
+        name = "shell-completions",
+        hide = true,
+        about = "[deprecated] alias for `berth shell completions`"
+    )]
+    ShellCompletionsDeprecated {
+        #[arg(value_enum)]
+        shell: Option<CompletionShell>,
+    },
+    #[command(
+        name = "init-shell",
+        hide = true,
+        about = "[deprecated] alias for `berth shell init`"
+    )]
+    InitShellDeprecated,
     #[command(about = "Run berth agent on remote machine")]
     Agent {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
@@ -545,6 +573,22 @@ impl Cli {
                         commands::shell::run_completions(shell)
                     }
                 },
+                Commands::ShellInitDeprecated { shell } => {
+                    eprintln!(
+                        "berth: `shell-init` is deprecated; use `berth shell init` (this alias will be removed)"
+                    );
+                    commands::shell::run_init(shell)
+                }
+                Commands::ShellCompletionsDeprecated { shell } => {
+                    eprintln!(
+                        "berth: `shell-completions` is deprecated; use `berth shell completions`"
+                    );
+                    commands::shell::run_completions(shell)
+                }
+                Commands::InitShellDeprecated => {
+                    eprintln!("berth: `init-shell` is deprecated; use `berth shell init`");
+                    commands::shell::run_init(None)
+                }
                 Commands::Agent { ports } => commands::agent::run(ports).await,
                 Commands::Attach {
                     name,

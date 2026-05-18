@@ -72,67 +72,49 @@ async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
     let socket_path = session::session_socket(&workspace, &id)?;
     let log_path = supervisor_log_path(&workspace, &id)?;
     spawn_supervisor(&workspace, &id, &command)?;
-    if let Err(e) = wait_for_socket(&socket_path, Duration::from_secs(5)) {
-        // The supervisor either failed to start or exited before the
-        // socket was ready. Slurp its log so the user sees the actual
-        // cause (exec ENOENT, command exited fast, …) instead of just
-        // "timed out".
-        let snippet = tail_log(&log_path, 4096);
+    if let Err(_e) = wait_for_socket(&socket_path, Duration::from_secs(5)) {
+        // Supervisor failed to start or exited before the socket was
+        // ready. Keep the visible error short and direct; the full
+        // detail (tracing + child stdout/stderr) is in `berth logs`.
+        use colored::Colorize;
+        let mut hint = command_failure_hint(&command);
+        if !hint.is_empty() {
+            hint = format!("  tip: {}\n", hint.yellow());
+        }
         anyhow::bail!(
-            "supervisor for '{workspace}' did not become ready ({e}).\n\
-             This usually means the configured command failed to exec, exited \
-             immediately, or printed an error to stderr.\n\
-             {hint}\n\
-             Supervisor log: {log}\n\
-             --- tail ---\n{snippet}",
-            log = log_path.display(),
-            hint = command_failure_hint(&command),
-            snippet = if snippet.trim().is_empty() {
-                "(log empty — the child likely failed to even start; check the binary path)"
-                    .to_string()
-            } else {
-                snippet
-            },
+            "{}: supervisor for '{}' exited before connecting (likely the command failed or finished immediately)\n\
+             {hint}  details: `{}` (or read {})",
+            "✗ berth".red().bold(),
+            workspace,
+            "berth logs".cyan(),
+            log_path.display().to_string().dimmed(),
         );
     }
     session::client::attach(&socket_path).await
 }
 
-fn tail_log(path: &Path, max_bytes: usize) -> String {
-    use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return String::new();
-    };
-    let len = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
-    let offset = std::cmp::max(0, len - max_bytes as i64);
-    if f.seek(SeekFrom::Start(offset as u64)).is_err() {
-        return String::new();
-    }
-    let mut buf = String::new();
-    let _ = f.read_to_string(&mut buf);
-    buf
-}
-
+/// Short, single-line hint based on the command shape. Empty when we
+/// have nothing useful to say.
 fn command_failure_hint(command: &[String]) -> String {
     if command.is_empty() {
-        return "(no command override; default $SHELL -l is unusual to fail)".to_string();
+        return String::new();
     }
-    let first = &command[0];
+    let first = command[0].as_str();
+    // Single-token shell wrappers (bash/sh/zsh/dash) — the user already
+    // wrapped, so don't recursively suggest wrapping again.
+    let is_shell_wrapper = matches!(first, "bash" | "sh" | "zsh" | "dash" | "ash");
+    if is_shell_wrapper {
+        return String::new();
+    }
     if command.len() == 1 && first.contains(char::is_whitespace) {
-        // Looks like the whole thing was passed as one quoted arg.
+        // Whole thing was passed as one quoted arg.
         return format!(
-            "Heads up: `{first}` is being treated as a single binary path \
-             because it was quoted as one arg. Pass `-- bash -lc '<cmd>'` \
-             to evaluate it through a shell."
+            "`{first}` was treated as one binary path; for shell parsing use `-- bash -lc '<cmd>'`"
         );
     }
-    // Aliases / shell builtins / functions exist only inside an
-    // interactive shell. If the command looks shell-y or is a known
-    // alias-only token, hint at the wrapper.
     format!(
-        "If `{first}` is a shell alias or relies on your remote ~/.profile, \
-         wrap it: `-- bash -lc '{joined}'`",
-        joined = command.join(" ")
+        "for shell aliases or login profile, wrap: `-- bash -lc '{}'`",
+        command.join(" ")
     )
 }
 

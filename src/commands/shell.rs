@@ -148,12 +148,47 @@ _berth_cwd_heal() {
     cd "$HOME" 2>/dev/null || cd /
 }
 
+_berth_workspace_names() {
+    command berth list 2>/dev/null \
+        | awk 'NR>2 && $1!="" && $1!~/^-+$/ {print $1}'
+}
+
+# `b` is the canonical shortcut for `berth enter`. Behavior:
+#   b                  — interactive fzf picker over configured workspaces
+#   b <query>          — exact-match a workspace name; on miss, fuzzy/substring match
+#   b <query> <args…>  — pass extra args through (e.g. -- <cmd>)
+# When fzf is available it powers both the no-arg picker and fuzzy filtering;
+# otherwise we fall back to `grep -F` substring matching.
 b() {
+    local picked query
     if [ "$#" -eq 0 ]; then
-        command berth list
+        if command -v fzf >/dev/null 2>&1; then
+            picked=$(_berth_workspace_names | fzf --prompt='berth> ' --height=40% --reverse) || return 0
+            [ -z "$picked" ] && return 0
+            BERTH_SKIP_AUTO=1 command berth enter "$picked"
+            return $?
+        fi
+        printf 'usage: b <workspace>  (install fzf for an interactive picker)\n' >&2
+        _berth_workspace_names
+        return 1
+    fi
+    query="$1"; shift
+    # Exact match wins.
+    if _berth_workspace_names | grep -qFx -- "$query"; then
+        BERTH_SKIP_AUTO=1 command berth enter "$query" "$@"
         return $?
     fi
-    BERTH_SKIP_AUTO=1 command berth enter "$@"
+    # Fuzzy / substring match → single canonical winner.
+    if command -v fzf >/dev/null 2>&1; then
+        picked=$(_berth_workspace_names | fzf --filter "$query" | head -n1)
+    else
+        picked=$(_berth_workspace_names | grep -F -- "$query" | head -n1)
+    fi
+    if [ -z "$picked" ]; then
+        printf 'berth: no workspace matching %q\n' "$query" >&2
+        return 1
+    fi
+    BERTH_SKIP_AUTO=1 command berth enter "$picked" "$@"
 }
 
 berth() {

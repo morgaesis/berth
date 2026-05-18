@@ -3,6 +3,7 @@ use berth::config::{Config, Runtime, Workspace};
 use berth::deploy::{self, ConsentMode, DeployDecision};
 use berth::runtime::{self, CommandSpec};
 use berth::ssh;
+use colored::Colorize;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -226,7 +227,8 @@ async fn enter_remote(
         if let Ok(cfg) = berth::config::Config::load() {
             if let Some(t) = cfg.trusted_hosts.get(host) {
                 eprintln!(
-                    "berth: session ended on {host}  (local v{local_version} / remote v{})",
+                    "{} session ended on {host}  (local v{local_version} / remote v{})",
+                    "·".dimmed(),
                     t.version
                 );
             }
@@ -336,7 +338,12 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
         .as_deref()
         .map(|v| format!("berth {v}"))
         .unwrap_or_else(|| "no remote berth".to_string());
-    eprintln!("berth: local v{local_version}  |  {host}: {remote_ver_str}");
+    eprintln!(
+        "{} local v{}  |  {host}: {}",
+        "·".dimmed(),
+        local_version.cyan(),
+        remote_ver_str.cyan()
+    );
 
     let consent = match (opts.auto_deploy, already_trusted) {
         (true, _) => ConsentMode::AutoApproved,
@@ -382,7 +389,8 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                 .with_context_hard_fail(host)?;
             deploy::record_trust(config, host, &info)?;
             eprintln!(
-                "berth: deployed v{} to {}:{}  (host added to trusted_hosts)",
+                "{} deployed v{} → {}:{}",
+                "✓".green().bold(),
                 info.version,
                 host,
                 info.remote_path.display()
