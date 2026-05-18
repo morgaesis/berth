@@ -24,6 +24,59 @@ pub struct Cli {
     command: Option<Commands>,
 }
 
+/// Combine a workspace `name` with an optional `--org` flag.
+///
+/// - If `name` is already `org/project` and `--org` is also supplied, error
+///   when they disagree (both forms specifying different orgs is ambiguous).
+/// - If `name` has no slash and `--org` is supplied, return `<org>/<name>`.
+/// - Otherwise return `name` unchanged.
+fn compose_workspace_name(name: &str, org: Option<&str>) -> anyhow::Result<String> {
+    match (org, name.split_once('/')) {
+        (None, _) => Ok(name.to_string()),
+        (Some(o), None) => Ok(format!("{o}/{name}")),
+        (Some(o), Some((existing_org, _))) if existing_org == o => Ok(name.to_string()),
+        (Some(o), Some((existing_org, _))) => anyhow::bail!(
+            "conflicting org: --org={o} but workspace name says {existing_org}/…; \
+             pass one or the other, not both with different values"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_workspace_no_org_passes_through() {
+        assert_eq!(compose_workspace_name("postil", None).unwrap(), "postil");
+        assert_eq!(
+            compose_workspace_name("morgaesis/postil", None).unwrap(),
+            "morgaesis/postil"
+        );
+    }
+
+    #[test]
+    fn compose_workspace_prepends_org_to_bare_name() {
+        assert_eq!(
+            compose_workspace_name("postil", Some("morgaesis")).unwrap(),
+            "morgaesis/postil"
+        );
+    }
+
+    #[test]
+    fn compose_workspace_org_matches_existing_prefix() {
+        assert_eq!(
+            compose_workspace_name("morgaesis/postil", Some("morgaesis")).unwrap(),
+            "morgaesis/postil"
+        );
+    }
+
+    #[test]
+    fn compose_workspace_conflicting_org_errors() {
+        assert!(compose_workspace_name("morgaesis/postil", Some("other")).is_err());
+    }
+}
+
 impl Cli {
     /// Translate the verbosity flags into a tracing filter directive.
     /// Returns None to mean "honor whatever the environment sets".
@@ -55,23 +108,46 @@ enum Commands {
     #[command(
         about = "Enter a workspace (creates if needed)",
         long_about = "Enter a workspace, creating it if absent.\n\n\
+                      Workspaces can be plain (`postil`) or org-scoped (`morgaesis/postil`).\n\
+                      Use --org to compose an org with a bare project name. Org-scoped\n\
+                      workspaces inherit a remote host and a remote-root directory from\n\
+                      `orgs.<org>` in config (see `berth org set`).\n\n\
+                      Examples:\n  \
+                      berth enter postil --org morgaesis\n  \
+                      berth enter morgaesis/postil --remote dev-box\n  \
+                      berth enter morgaesis/postil --dir '~/Projects/morgaesis/postil'\n  \
+                      berth enter morgaesis/postil -- claude --dangerously-skip-permissions\n\n\
                       For remote workspaces, berth probes the host and selects the best\n\
                       session-mux available. If none, you'll be prompted to deploy the\n\
-                      berth binary to the remote (one-time consent, persisted in config).\n\
-                      \n\
-                      Flags:\n  \
+                      berth binary to the remote (one-time consent, persisted in config).\n\n\
+                      Resumability flags:\n  \
                       --plain         skip session-mux entirely; plain SSH login shell\n  \
                       --auto-deploy   deploy without prompting (overrides per-host trust)\n  \
-                      --no-deploy     never deploy; fall through to legacy multiplexers\n  \
-                                      or fail with a `--plain` suggestion"
+                      --no-deploy     never deploy; fall through to legacy multiplexers"
     )]
     Enter {
-        #[arg(help = "Workspace name (org/project format allowed)")]
+        #[arg(help = "Workspace name (org/project, or bare project paired with --org)")]
         name: String,
-        #[arg(short = 'r', long = "remote")]
+        #[arg(
+            short = 'o',
+            long = "org",
+            help = "Prepend this org to the workspace name (e.g. --org morgaesis postil → morgaesis/postil)"
+        )]
+        org: Option<String>,
+        #[arg(
+            short = 'r',
+            long = "remote",
+            help = "SSH host (overrides workspace/org default)"
+        )]
         remote: Option<String>,
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
+        #[arg(
+            short = 'd',
+            long = "dir",
+            help = "Override the remote working directory (e.g. ~/code/postil)"
+        )]
+        dir: Option<String>,
         #[arg(
             long = "plain",
             alias = "no-resume",
@@ -90,6 +166,11 @@ enum Commands {
             help = "Never deploy; use legacy multiplexers or fail"
         )]
         no_deploy: bool,
+        #[arg(
+            trailing_var_arg = true,
+            help = "Override workspace default command (everything after `--`)"
+        )]
+        command: Vec<String>,
     },
     #[command(about = "List all configured workspaces")]
     List,
@@ -249,8 +330,55 @@ enum Commands {
     },
     #[command(subcommand, name = "hosts")]
     Hosts(HostsCommands),
+    #[command(
+        subcommand,
+        name = "org",
+        about = "Manage per-org defaults (remote host + remote-root path)",
+        long_about = "Configure defaults for workspace names of the form `<org>/<project>`. \
+                      A workspace can inherit its remote host and remote working-directory \
+                      root from its org, so individual workspaces don't have to repeat the \
+                      prefix.\n\n\
+                      Examples:\n  \
+                      berth org set morgaesis --remote morgaesis-dev --root '~/Projects/morgaesis'\n  \
+                      berth org list\n  \
+                      berth org show morgaesis"
+    )]
+    Org(OrgCommands),
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Subcommand)]
+enum OrgCommands {
+    #[command(about = "Set or update an org's defaults")]
+    Set {
+        #[arg(help = "Org name (e.g. morgaesis)")]
+        name: String,
+        #[arg(
+            short = 'r',
+            long = "remote",
+            help = "Default SSH host for workspaces in this org"
+        )]
+        remote: Option<String>,
+        #[arg(
+            short = 'R',
+            long = "root",
+            help = "Default remote-root directory (final workspace dir = <root>/<project>)"
+        )]
+        root: Option<String>,
+    },
+    #[command(about = "Remove an org from config (doesn't touch any workspace)")]
+    Remove {
+        #[arg(help = "Org name")]
+        name: String,
+    },
+    #[command(about = "List all configured orgs")]
+    List,
+    #[command(about = "Show one org's defaults")]
+    Show {
+        #[arg(help = "Org name")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -281,12 +409,16 @@ impl Cli {
                 }
                 Commands::Enter {
                     name,
+                    org,
                     remote,
                     ports,
+                    dir,
                     plain,
                     auto_deploy,
                     no_deploy,
+                    command,
                 } => {
+                    let name = compose_workspace_name(&name, org.as_deref())?;
                     berth::validate_workspace_name(&name)?;
                     if let Some(host) = &remote {
                         berth::validate_ssh_host(host)?;
@@ -295,6 +427,8 @@ impl Cli {
                         plain,
                         auto_deploy,
                         no_deploy,
+                        dir,
+                        command,
                     };
                     commands::enter::run(name, remote, ports, opts).await
                 }
@@ -368,6 +502,17 @@ impl Cli {
                     }
                     commands::deploy::run(host, tag, force).await
                 }
+                Commands::Org(command) => match command {
+                    OrgCommands::Set { name, remote, root } => {
+                        if let Some(host) = &remote {
+                            berth::validate_ssh_host(host)?;
+                        }
+                        commands::org::set(name, remote, root).await
+                    }
+                    OrgCommands::Remove { name } => commands::org::remove(name).await,
+                    OrgCommands::List => commands::org::list().await,
+                    OrgCommands::Show { name } => commands::org::show(name).await,
+                },
                 Commands::Hosts(command) => match command {
                     HostsCommands::Update => commands::hosts::update().await,
                     HostsCommands::Clean => commands::hosts::clean().await,

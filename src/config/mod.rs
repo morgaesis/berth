@@ -18,6 +18,25 @@ pub struct Config {
     /// to decide whether to silently redeploy a stale remote.
     #[serde(default)]
     pub trusted_hosts: HashMap<String, TrustedHost>,
+    /// Per-org defaults. Workspace names of the form `<org>/<project>`
+    /// look up their org here. `remote_root` lets you say "everything
+    /// under `morgaesis/*` lives under `~/Projects/morgaesis/` on the
+    /// remote", so individual workspaces don't have to repeat the path
+    /// prefix. `remote` provides a default host for the org.
+    #[serde(default)]
+    pub orgs: HashMap<String, Org>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct Org {
+    /// Filesystem root on the remote. Final workspace dir is
+    /// `<remote_root>/<project>` unless the workspace overrides it.
+    /// Plain string; `$HOME`, `~`, etc. are expanded by the remote shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_root: Option<String>,
+    /// Default host for any workspace in this org that doesn't set its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -42,6 +61,25 @@ pub struct Workspace {
     pub idle: Idle,
     #[serde(default)]
     pub remote_options: RemoteOptions,
+    /// Override the remote working directory.
+    ///
+    /// When unset, the entry uses the auto-managed
+    /// `$HOME/.local/share/berth/projects/<name>` path. When set, both
+    /// kinds of paths are passed to `mkdir -p` + `cd` so a fresh workspace
+    /// dir is created on first use; missing directories are not treated
+    /// as an error.
+    ///
+    /// Allows `$HOME`, `~`, and other remote-shell expansions verbatim
+    /// because the string is wrapped in double quotes when interpolated,
+    /// not single-quoted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_dir: Option<String>,
+    /// Default command for `berth attach --new`. When unset, the
+    /// supervisor spawns `$SHELL -l`. When set, this argv replaces it
+    /// — e.g. `["claude", "--dangerously-skip-permissions"]` to land
+    /// straight in claude inside the workspace dir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
 }
 
 impl Workspace {
@@ -54,6 +92,8 @@ impl Workspace {
             mounts: Vec::new(),
             idle: Idle::default(),
             remote_options: RemoteOptions::default(),
+            remote_dir: None,
+            command: None,
         }
     }
 }
@@ -292,6 +332,7 @@ impl Config {
                 workspaces: HashMap::new(),
                 defaults: Defaults::default(),
                 trusted_hosts: HashMap::new(),
+                orgs: HashMap::new(),
             })
         }
     }
@@ -338,6 +379,40 @@ impl Config {
         }
     }
 
+    /// Resolve the effective remote directory for a workspace, in order:
+    ///   1. workspace.remote_dir (explicit override on the workspace)
+    ///   2. `<orgs[<org>].remote_root>/<project>` if the workspace name
+    ///      is `<org>/<project>` and that org has a `remote_root`
+    ///   3. None — the caller should fall back to the auto-managed path
+    ///      under `$HOME/.local/share/berth/projects/<name>`.
+    pub fn resolved_remote_dir(
+        &self,
+        workspace_name: &str,
+        workspace: &Workspace,
+    ) -> Option<String> {
+        if let Some(dir) = &workspace.remote_dir {
+            return Some(dir.clone());
+        }
+        let (org, project) = workspace_name.split_once('/')?;
+        let org_cfg = self.orgs.get(org)?;
+        let root = org_cfg.remote_root.as_deref()?;
+        let root = root.trim_end_matches('/');
+        Some(format!("{root}/{project}"))
+    }
+
+    /// Resolve the effective remote host for a workspace, in order:
+    ///   1. CLI `--remote` (handled by the caller)
+    ///   2. workspace.remote
+    ///   3. orgs[<org>].remote if the workspace name is `<org>/<project>`
+    pub fn resolved_remote(&self, workspace_name: &str, workspace: &Workspace) -> Option<String> {
+        if let Some(host) = &workspace.remote {
+            return Some(host.clone());
+        }
+        let (org, _project) = workspace_name.split_once('/')?;
+        let org_cfg = self.orgs.get(org)?;
+        org_cfg.remote.clone()
+    }
+
     pub fn config_dir() -> Result<PathBuf> {
         if let Ok(dir) = env::var("BERTH_CONFIG_DIR") {
             return Ok(PathBuf::from(dir));
@@ -349,5 +424,87 @@ impl Config {
         dirs::config_dir()
             .map(|p| p.join(super::BERTH_DIR))
             .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg_with_org(name: &str, remote_root: Option<&str>, remote: Option<&str>) -> Config {
+        let mut c = Config {
+            workspaces: HashMap::new(),
+            defaults: Defaults::default(),
+            trusted_hosts: HashMap::new(),
+            orgs: HashMap::new(),
+        };
+        c.orgs.insert(
+            name.into(),
+            Org {
+                remote_root: remote_root.map(Into::into),
+                remote: remote.map(Into::into),
+            },
+        );
+        c
+    }
+
+    #[test]
+    fn resolved_remote_dir_workspace_override_wins() {
+        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis"), None);
+        let mut ws = Workspace::new("/tmp/x");
+        ws.remote_dir = Some("~/elsewhere/postil".into());
+        assert_eq!(
+            cfg.resolved_remote_dir("morgaesis/postil", &ws),
+            Some("~/elsewhere/postil".into())
+        );
+    }
+
+    #[test]
+    fn resolved_remote_dir_uses_org_root() {
+        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis"), None);
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(
+            cfg.resolved_remote_dir("morgaesis/postil", &ws),
+            Some("~/Projects/morgaesis/postil".into())
+        );
+    }
+
+    #[test]
+    fn resolved_remote_dir_trims_trailing_slash_on_root() {
+        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis/"), None);
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(
+            cfg.resolved_remote_dir("morgaesis/postil", &ws),
+            Some("~/Projects/morgaesis/postil".into())
+        );
+    }
+
+    #[test]
+    fn resolved_remote_dir_returns_none_for_unscoped_name() {
+        let cfg = cfg_with_org("morgaesis", Some("~/p"), None);
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(cfg.resolved_remote_dir("postil", &ws), None);
+    }
+
+    #[test]
+    fn resolved_remote_dir_returns_none_when_org_unknown() {
+        let cfg = cfg_with_org("morgaesis", Some("~/p"), None);
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(cfg.resolved_remote_dir("other/postil", &ws), None);
+    }
+
+    #[test]
+    fn resolved_remote_uses_workspace_first_then_org() {
+        let cfg = cfg_with_org("morgaesis", None, Some("morgaesis-dev"));
+        let mut ws = Workspace::new("/tmp/x");
+        assert_eq!(
+            cfg.resolved_remote("morgaesis/postil", &ws),
+            Some("morgaesis-dev".into())
+        );
+        ws.remote = Some("personal-box".into());
+        assert_eq!(
+            cfg.resolved_remote("morgaesis/postil", &ws),
+            Some("personal-box".into())
+        );
     }
 }

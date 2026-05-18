@@ -71,14 +71,52 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
     Ok(())
 }
 
+/// Optional per-workspace overrides plumbed in from the enter command.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteEnterOverrides<'a> {
+    /// Workspace-supplied remote directory expression (may use `$HOME`,
+    /// `~`, etc.). When None, the auto-managed path is used.
+    pub remote_dir: Option<&'a str>,
+    /// Workspace-supplied default command argv. Forwarded to the remote
+    /// `berth attach --new <ws> -- <argv...>` when the remote berth
+    /// cascade is taken.
+    pub command: Option<&'a [String]>,
+}
+
 pub async fn ssh_interactive_runtime(
     host: &str,
     workspace_name: &str,
     runtime: &Runtime,
     mounts: &[Mount],
 ) -> Result<()> {
-    let remote_path = remote_workspace_path_expr(workspace_name);
-    let enter_cmd = remote_enter_command(workspace_name, &remote_path, runtime, mounts);
+    ssh_interactive_runtime_with(
+        host,
+        workspace_name,
+        runtime,
+        mounts,
+        RemoteEnterOverrides::default(),
+    )
+    .await
+}
+
+pub async fn ssh_interactive_runtime_with(
+    host: &str,
+    workspace_name: &str,
+    runtime: &Runtime,
+    mounts: &[Mount],
+    overrides: RemoteEnterOverrides<'_>,
+) -> Result<()> {
+    let remote_path = match overrides.remote_dir {
+        Some(dir) => normalize_remote_path(dir),
+        None => remote_workspace_path_expr(workspace_name),
+    };
+    let enter_cmd = remote_enter_command_with(
+        workspace_name,
+        &remote_path,
+        runtime,
+        mounts,
+        overrides.command,
+    );
 
     if skip_ssh() {
         println!(
@@ -104,13 +142,26 @@ pub async fn ssh_interactive_runtime(
     Ok(())
 }
 
-/// `remote_path` is a shell *expression* (already quoted/composed by
-/// [`remote_workspace_path_expr`]) and is interpolated raw here.
+/// Convenience wrapper retained for tests; the override-aware variant
+/// is the one production code uses.
+#[cfg(test)]
 fn remote_enter_command(
     workspace_name: &str,
     remote_path: &str,
     runtime: &Runtime,
     mounts: &[Mount],
+) -> String {
+    remote_enter_command_with(workspace_name, remote_path, runtime, mounts, None)
+}
+
+/// `remote_path` is a shell *expression* (already quoted/composed by
+/// [`remote_workspace_path_expr`]) and is interpolated raw here.
+fn remote_enter_command_with(
+    workspace_name: &str,
+    remote_path: &str,
+    runtime: &Runtime,
+    mounts: &[Mount],
+    workspace_command: Option<&[String]>,
 ) -> String {
     let base = format!("mkdir -p {remote_path} && cd {remote_path}");
     let shell = "${SHELL:-/bin/sh}";
@@ -161,6 +212,23 @@ fn remote_enter_command(
     // single shell word.
     let unique_session = format!("{}-$$-$RANDOM", shell_escape_arg(&session));
 
+    // Trailing `-- <argv...>` for the `berth attach --new` cascade arm,
+    // so a per-workspace command (set in config) lands as the session's
+    // PID 1 instead of `$SHELL -l`. Each argv element is shell-quoted
+    // independently. Empty / None means "no override; supervisor runs
+    // $SHELL -l".
+    let attach_cmd_suffix = match workspace_command {
+        Some(argv) if !argv.is_empty() => {
+            let mut s = String::from(" --");
+            for a in argv {
+                s.push(' ');
+                s.push_str(&shell_escape_arg(a));
+            }
+            s
+        }
+        _ => String::new(),
+    };
+
     // Resumability cascade. Best to worst:
     //   1. berth attach --new: PTY-multiplexing supervisor managed by berth
     //      itself. `--new` ensures every local tab gets an independent
@@ -183,7 +251,7 @@ fn remote_enter_command(
            berth_bin=\"$HOME/.local/bin/berth\"; \
          fi; \
          if [ -n \"$berth_bin\" ]; then \
-           exec \"$berth_bin\" attach --new {escaped_workspace}; \
+           exec \"$berth_bin\" attach --new {escaped_workspace}{attach_cmd_suffix}; \
          elif command -v mosh-server >/dev/null 2>&1; then \
            exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
@@ -198,6 +266,43 @@ fn remote_enter_command(
 
 fn shell_escape_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
+}
+
+/// Turn a user-supplied remote path into a single shell expression that
+/// expands `$HOME` / `~` correctly on the remote and quotes everything
+/// else. POSIX `~` expansion only happens *outside* quotes and only at
+/// the very start of a word, so we treat a leading `~/` (or bare `~`) as
+/// a special token and emit `"$HOME"/...rest...`. Everything else is
+/// double-quoted so values like `$HOME/foo/bar` still expand `$HOME`
+/// while characters like spaces or semicolons are kept literal.
+fn normalize_remote_path(path: &str) -> String {
+    if path == "~" {
+        return "\"$HOME\"".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let rest_escaped = rest.replace('"', "\\\"");
+        return format!("\"$HOME\"/\"{rest_escaped}\"");
+    }
+    let escaped = path.replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(test)]
+#[test]
+fn normalize_remote_path_handles_tilde_and_dollar_home() {
+    assert_eq!(normalize_remote_path("~"), "\"$HOME\"");
+    assert_eq!(
+        normalize_remote_path("~/Projects/morgaesis/postil"),
+        "\"$HOME\"/\"Projects/morgaesis/postil\""
+    );
+    assert_eq!(
+        normalize_remote_path("$HOME/code/postil"),
+        "\"$HOME/code/postil\""
+    );
+    assert_eq!(
+        normalize_remote_path("/var/work/postil"),
+        "\"/var/work/postil\""
+    );
 }
 
 pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<bool> {

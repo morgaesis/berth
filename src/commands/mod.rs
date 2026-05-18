@@ -8,6 +8,7 @@ pub mod enter;
 pub mod hosts;
 pub mod list;
 pub mod new;
+pub mod org;
 pub mod reap;
 pub mod run;
 pub mod shell;

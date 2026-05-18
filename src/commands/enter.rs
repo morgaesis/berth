@@ -9,8 +9,8 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
 
-/// User-controllable knobs for the resumability cascade on remote enter.
-#[derive(Debug, Clone, Copy, Default)]
+/// User-controllable knobs for `berth enter`.
+#[derive(Debug, Clone, Default)]
 pub struct EnterOptions {
     /// `--plain` / `--no-resume`: skip all session-mux machinery.
     pub plain: bool,
@@ -18,6 +18,10 @@ pub struct EnterOptions {
     pub auto_deploy: bool,
     /// `--no-deploy`: never push; fall through to legacy mux or fail.
     pub no_deploy: bool,
+    /// `--dir`: override the remote working directory for this run.
+    pub dir: Option<String>,
+    /// Trailing `-- <argv>`: override the workspace default command.
+    pub command: Vec<String>,
 }
 
 fn default_projects_path() -> std::path::PathBuf {
@@ -73,7 +77,14 @@ pub async fn run(
         fs::create_dir_all(path)?;
     }
 
-    let remote = remote_override.as_ref().or(workspace.remote.as_ref());
+    // Resolve effective host: CLI override > workspace.remote >
+    // orgs[<org>].remote. Allocate a string only when we fall back to
+    // the org-default path so the common case stays cheap.
+    let org_host: Option<String> = config.resolved_remote(&name, &workspace);
+    let remote = remote_override
+        .as_ref()
+        .or(workspace.remote.as_ref())
+        .or(org_host.as_ref());
     let ports = if !ports_override.is_empty() {
         Some(ports_override.as_slice())
     } else {
@@ -86,8 +97,29 @@ pub async fn run(
 
     if let Some(host) = remote {
         let host = host.clone();
+        // Resolve effective remote dir + command (CLI > workspace > org).
+        let remote_dir = opts
+            .dir
+            .clone()
+            .or_else(|| config.resolved_remote_dir(&name, &workspace));
+        let command: Option<Vec<String>> = if !opts.command.is_empty() {
+            Some(opts.command.clone())
+        } else {
+            workspace.command.clone()
+        };
         ensure_remote_ready(&mut config, &host, &opts).await?;
-        enter_remote(name, &host, path, ports, &runtime_config, &mounts, &opts).await
+        enter_remote(
+            name,
+            &host,
+            path,
+            ports,
+            &runtime_config,
+            &mounts,
+            &opts,
+            remote_dir.as_deref(),
+            command.as_deref(),
+        )
+        .await
     } else {
         let _ = berth::lifecycle_state::touch(
             &name,
@@ -142,6 +174,7 @@ fn enter_local(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enter_remote(
     name: String,
     host: &str,
@@ -150,6 +183,8 @@ async fn enter_remote(
     runtime_config: &Runtime,
     mounts: &[berth::config::Mount],
     opts: &EnterOptions,
+    remote_dir: Option<&str>,
+    command: Option<&[String]>,
 ) -> Result<()> {
     if let Some(ports) = ports {
         let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
@@ -158,13 +193,24 @@ async fn enter_remote(
     berth::terminal::emit_enter_signals(&name);
 
     // `--plain` skips the resumability cascade and opens a plain SSH
-    // login shell that just `cd`s into the workspace dir. No tmux,
-    // screen, mosh, or berth-attach.
-    tracing::info!(plain = opts.plain, "starting remote ssh session");
+    // login shell. The remote-dir override is still honored: the plain
+    // path uses `ssh_interactive` which itself `cd`s into the auto path,
+    // so for now `--dir` + `--plain` is a no-op-on-dir. (Plumbing the
+    // override through `ssh_interactive` is a follow-up.)
+    tracing::info!(
+        plain = opts.plain,
+        has_dir = remote_dir.is_some(),
+        has_cmd = command.is_some(),
+        "starting remote ssh session"
+    );
     let result = if opts.plain {
         ssh::ssh_interactive(host, &name, true).await
     } else {
-        ssh::ssh_interactive_runtime(host, &name, runtime_config, mounts).await
+        let overrides = ssh::RemoteEnterOverrides {
+            remote_dir,
+            command,
+        };
+        ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
     };
     tracing::info!(ok = result.is_ok(), "remote ssh session returned");
 
