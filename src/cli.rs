@@ -11,8 +11,33 @@ use clap_complete::Shell as CompletionShell;
     after_help = "Shell niceties: eval \"$(berth shell-init)\"   Completions: berth shell-completions"
 )]
 pub struct Cli {
+    /// Increase log verbosity (-v info, -vv debug, -vvv trace). Overrides
+    /// RUST_LOG when set; otherwise RUST_LOG is honored unchanged.
+    #[arg(short = 'v', long = "verbose", global = true, action = clap::ArgAction::Count)]
+    pub verbose: u8,
+
+    /// Silence stderr log output entirely (overrides -v and RUST_LOG).
+    #[arg(short = 'q', long = "quiet", global = true)]
+    pub quiet: bool,
+
     #[command(subcommand)]
     command: Option<Commands>,
+}
+
+impl Cli {
+    /// Translate the verbosity flags into a tracing filter directive.
+    /// Returns None to mean "honor whatever the environment sets".
+    pub fn log_filter(&self) -> Option<&'static str> {
+        if self.quiet {
+            return Some("off");
+        }
+        match self.verbose {
+            0 => None,
+            1 => Some("berth=info"),
+            2 => Some("berth=debug"),
+            _ => Some("berth=trace"),
+        }
+    }
 }
 
 #[derive(Subcommand)]

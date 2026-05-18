@@ -64,7 +64,19 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     }
     drop(raw_guard);
     stdin_task.abort();
-    Ok(exit_code)
+    // Drain stdout so the last bytes (commonly a shell prompt or exit
+    // banner) actually reach the user's terminal before we exit.
+    let _ = stdout.flush().await;
+
+    // `tokio::io::stdin()` reads via a dedicated blocking thread; aborting
+    // the future cancels the await but the read syscall on the underlying
+    // FD is still pending. On Linux that keeps fd 0 open in this process,
+    // which keeps the SSH PTY open, which keeps the user's shell hanging
+    // until they hit a key to satisfy the read. Force-terminate the
+    // process so the kernel cleans up our descriptors and SSH disconnects
+    // immediately. raw_guard was dropped above so the user's tty is back
+    // in cooked mode by the time the process actually goes away.
+    std::process::exit(exit_code)
 }
 
 fn current_size(fd: i32) -> (u16, u16) {
