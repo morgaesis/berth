@@ -10,6 +10,7 @@ pub mod list;
 pub mod logs;
 pub mod new;
 pub mod org;
+pub mod project;
 pub mod reap;
 pub mod run;
 pub mod shell;

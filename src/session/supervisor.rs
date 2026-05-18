@@ -54,7 +54,17 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         }
         c
     };
-    if let Some(dir) = &config.workdir {
+    // portable-pty's CommandBuilder does NOT inherit the parent process's
+    // cwd when no `cwd()` is set — it defaults to `$HOME`. The SSH cascade
+    // does `cd $remote_dir` before exec'ing us, which sets the supervisor
+    // process's cwd; we have to copy that onto the CommandBuilder
+    // explicitly or the supervised command (claude, bash, …) lands in
+    // /home/<user> instead of the workspace dir.
+    let effective_cwd = config
+        .workdir
+        .clone()
+        .or_else(|| std::env::current_dir().ok());
+    if let Some(dir) = &effective_cwd {
         cmd.cwd(dir);
     }
     cmd.env("BERTH_WORKSPACE", &config.workspace);

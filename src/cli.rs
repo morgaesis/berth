@@ -371,6 +371,19 @@ enum Commands {
                       berth org show morgaesis"
     )]
     Org(OrgCommands),
+    #[command(
+        subcommand,
+        name = "project",
+        about = "Show and edit per-workspace config without hand-editing yaml",
+        long_about = "Inspect or update fields on an existing workspace.\n\n\
+                      Examples:\n  \
+                      berth project show morgaesis/postil\n  \
+                      berth project set morgaesis/postil --dir '~/Projects/morgaesis/postil.dev'\n  \
+                      berth project set morgaesis/postil -- claude --dangerously-skip-permissions\n  \
+                      berth project set morgaesis/postil --remote morgaesis-dev --ports 3000,8080\n  \
+                      berth project set morgaesis/postil --clear-command --clear-dir"
+    )]
+    Project(ProjectCommands),
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -404,6 +417,51 @@ enum ShellSubcommands {
             help = "Target shell (auto-detected from $SHELL when omitted)"
         )]
         shell: Option<CompletionShell>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    #[command(about = "Show one workspace's resolved config")]
+    Show {
+        #[arg(help = "Workspace name (org/project format allowed)")]
+        name: String,
+    },
+    #[command(about = "List every configured workspace with its resolved config")]
+    List,
+    #[command(
+        about = "Set or update fields on a workspace",
+        long_about = "Update one or more fields on an existing workspace. \
+                      Pair a `--<field>` flag with a value to set it, or \
+                      `--clear-<field>` to unset and fall back to defaults. \
+                      The trailing `-- <argv>` sets the command run on enter; \
+                      `--clear-command` unsets it (returning to the default \
+                      $SHELL -l)."
+    )]
+    Set {
+        #[arg(help = "Workspace name")]
+        name: String,
+        #[arg(short = 'r', long = "remote", conflicts_with = "clear_remote")]
+        remote: Option<String>,
+        #[arg(long = "clear-remote", conflicts_with = "remote")]
+        clear_remote: bool,
+        #[arg(short = 'd', long = "dir", conflicts_with = "clear_dir")]
+        dir: Option<String>,
+        #[arg(long = "clear-dir", conflicts_with = "dir")]
+        clear_dir: bool,
+        #[arg(
+            short = 'p',
+            long = "ports",
+            value_delimiter = ',',
+            conflicts_with = "clear_ports"
+        )]
+        ports: Option<Vec<u16>>,
+        #[arg(long = "clear-ports", conflicts_with = "ports")]
+        clear_ports: bool,
+        #[arg(long = "clear-command")]
+        clear_command: bool,
+        #[arg(trailing_var_arg = true)]
+        command: Vec<String>,
     },
 }
 
@@ -578,6 +636,38 @@ impl Cli {
                     }
                     commands::deploy::run(host, tag, force).await
                 }
+                Commands::Project(sub) => match sub {
+                    ProjectCommands::Show { name } => {
+                        berth::validate_workspace_name(&name)?;
+                        commands::project::show(name).await
+                    }
+                    ProjectCommands::List => commands::project::list_all().await,
+                    ProjectCommands::Set {
+                        name,
+                        remote,
+                        clear_remote,
+                        dir,
+                        clear_dir,
+                        ports,
+                        clear_ports,
+                        clear_command,
+                        command,
+                    } => {
+                        berth::validate_workspace_name(&name)?;
+                        commands::project::set(commands::project::SetArgs {
+                            name,
+                            remote,
+                            clear_remote,
+                            dir,
+                            clear_dir,
+                            ports,
+                            clear_ports,
+                            command,
+                            clear_command,
+                        })
+                        .await
+                    }
+                },
                 Commands::Org(command) => match command {
                     OrgCommands::Set { name, remote, root } => {
                         if let Some(host) = &remote {
