@@ -89,6 +89,11 @@ fn title_safe(s: &str) -> String {
 pub fn emit_enter_signals(workspace: &str) {
     let dir = marker_dir(workspace);
     let _ = fs::create_dir_all(&dir);
+    // Record the canonical workspace name (with slashes intact) so the
+    // shell-init detector doesn't have to reverse the slash->underscore
+    // encoding in the path. The basename fallback is only correct for
+    // single-segment names.
+    let _ = fs::write(dir.join(".workspace"), workspace);
 
     let mut out = io::stdout().lock();
     let safe = title_safe(workspace);

@@ -25,6 +25,18 @@ pub struct Config {
     /// prefix. `remote` provides a default host for the org.
     #[serde(default)]
     pub orgs: HashMap<String, Org>,
+    /// When the local berth is strictly newer than what's on a *trusted*
+    /// remote, redeploy silently before entering. Defaults to true so
+    /// trusted hosts stay in lockstep with the local install. Set to
+    /// false to be told about the diff (via the version banner) but
+    /// never have berth touch the remote without an explicit
+    /// `berth deploy --force`.
+    #[serde(default = "default_auto_update_remote")]
+    pub auto_update_remote: bool,
+}
+
+fn default_auto_update_remote() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -333,6 +345,7 @@ impl Config {
                 defaults: Defaults::default(),
                 trusted_hosts: HashMap::new(),
                 orgs: HashMap::new(),
+                auto_update_remote: true,
             })
         }
     }
@@ -437,6 +450,7 @@ mod tests {
             defaults: Defaults::default(),
             trusted_hosts: HashMap::new(),
             orgs: HashMap::new(),
+            auto_update_remote: true,
         };
         c.orgs.insert(
             name.into(),

@@ -1,6 +1,6 @@
 [package]
 name = "berth"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Consistent development workspaces, local or remote, bare metal"
 license = "MIT"

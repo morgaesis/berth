@@ -217,6 +217,22 @@ async fn enter_remote(
     berth::terminal::emit_exit_signals(&name);
     tracing::info!("emitted exit signals");
 
+    // Exit-banner: best-effort restate of which version was running
+    // remote during the session. Useful in case the user redeploys the
+    // remote out-of-band between sessions.
+    if !opts.plain {
+        let local_version = env!("CARGO_PKG_VERSION");
+        // Cheap re-read from trusted_hosts (no network round-trip).
+        if let Ok(cfg) = berth::config::Config::load() {
+            if let Some(t) = cfg.trusted_hosts.get(host) {
+                eprintln!(
+                    "berth: session ended on {host}  (local v{local_version} / remote v{})",
+                    t.version
+                );
+            }
+        }
+    }
+
     result?;
     Ok(())
 }
@@ -312,9 +328,31 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     let decision = deploy::decide(&env, &local_version);
     let already_trusted = config.trusted_hosts.contains_key(host);
 
+    // Always surface the version diff. The deploy header below only
+    // fires when we're actually deploying; for an UpToDate remote, the
+    // user wouldn't otherwise know what's running there.
+    let remote_ver_str = env
+        .berth_version
+        .as_deref()
+        .map(|v| format!("berth {v}"))
+        .unwrap_or_else(|| "no remote berth".to_string());
+    eprintln!("berth: local v{local_version}  |  {host}: {remote_ver_str}");
+
     let consent = match (opts.auto_deploy, already_trusted) {
         (true, _) => ConsentMode::AutoApproved,
-        (_, true) => ConsentMode::AutoApproved,
+        (_, true) if config.auto_update_remote => ConsentMode::AutoApproved,
+        (_, true) => {
+            // Trusted but auto-update disabled. Print a clear hint and
+            // treat this run as no-deploy so the legacy mux cascade
+            // takes over with whatever's on the remote.
+            if matches!(decision, DeployDecision::Deploy { .. }) {
+                eprintln!(
+                    "berth: auto_update_remote is false; remote stays at {remote_ver_str}. \
+                     Run `berth deploy --force {host}` to refresh."
+                );
+            }
+            return Ok(());
+        }
         _ => ConsentMode::Ask,
     };
 

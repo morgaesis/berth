@@ -93,21 +93,29 @@ _berth_detect_project() {
         printf '%s' "$BERTH_PROJECT_HINT"
         return 0
     fi
-    local state_dir
+    local state_dir dir_name canonical
     state_dir="$(_berth_state_dir)"
     case "$PWD/" in
         "$state_dir"/*/*)
             local rest="${PWD#$state_dir/}"
-            printf '%s' "${rest%%/*}"
-            return 0
+            dir_name="${rest%%/*}"
             ;;
         "$state_dir"/*)
-            local rest="${PWD#$state_dir/}"
-            printf '%s' "$rest"
-            return 0
+            dir_name="${PWD#$state_dir/}"
+            ;;
+        *)
+            return 1
             ;;
     esac
-    return 1
+    # Prefer the canonical name written by `berth enter` (preserves
+    # slashes); fall back to the directory basename only if the marker
+    # file is missing (legacy / external state).
+    if [ -r "$state_dir/$dir_name/.workspace" ]; then
+        canonical="$(cat "$state_dir/$dir_name/.workspace" 2>/dev/null)"
+        [ -n "$canonical" ] && { printf '%s' "$canonical"; return 0; }
+    fi
+    printf '%s' "$dir_name"
+    return 0
 }
 
 _berth_auto_enter_on_start() {
