@@ -160,13 +160,16 @@ async fn enter_remote(
     // `--plain` skips the resumability cascade and opens a plain SSH
     // login shell that just `cd`s into the workspace dir. No tmux,
     // screen, mosh, or berth-attach.
+    tracing::info!(plain = opts.plain, "starting remote ssh session");
     let result = if opts.plain {
         ssh::ssh_interactive(host, &name, true).await
     } else {
         ssh::ssh_interactive_runtime(host, &name, runtime_config, mounts).await
     };
+    tracing::info!(ok = result.is_ok(), "remote ssh session returned");
 
     berth::terminal::emit_exit_signals(&name);
+    tracing::info!("emitted exit signals");
 
     result?;
     Ok(())

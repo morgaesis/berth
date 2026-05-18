@@ -88,12 +88,14 @@ pub async fn ssh_interactive_runtime(
         return Ok(());
     }
 
+    tracing::info!(host = %host, "spawning ssh -tt");
     let status = Command::new("ssh")
         .arg("-tt")
         .arg(host)
         .arg(enter_cmd)
         .status()
         .await?;
+    tracing::info!(?status, "ssh exited");
 
     if !status.success() {
         anyhow::bail!("SSH session exited with error");

@@ -21,18 +21,22 @@ pub fn remote_install_path() -> &'static str {
 /// remote path (i.e. with `~` resolved to the remote `$HOME` on disk).
 #[tracing::instrument(level = "debug", skip(host, local_bin), fields(host = %host, local_bin = %local_bin.display()))]
 pub async fn push_binary(host: &str, local_bin: &Path) -> Result<PathBuf> {
-    // Step 1: ensure the destination directory exists on the remote.
-    //         Done via ssh (mkdir -p ~/.local/bin) so we don't rely on
-    //         scp's mkdir-on-write extension.
-    tracing::debug!("ensuring remote ~/.local/bin exists");
-    let mkdir_status = Command::new("ssh")
+    // Step 1: ensure the destination directory exists on the remote, and
+    //         pre-emptively remove the target file. Some sshfs/sftp
+    //         implementations refuse to overwrite a currently-running ELF
+    //         executable (ETXTBSY-style failure), so we `rm -f` first;
+    //         Linux unlink on a busy file just detaches the inode while
+    //         the running process keeps its mapping. The next scp lays
+    //         down a fresh file at the same path.
+    tracing::debug!("ensuring remote ~/.local/bin exists and target is removable");
+    let prep_status = Command::new("ssh")
         .arg(host)
-        .arg("mkdir -p ~/.local/bin")
+        .arg("mkdir -p ~/.local/bin && rm -f ~/.local/bin/berth")
         .status()
         .await
-        .context("invoking ssh to create remote ~/.local/bin")?;
-    if !mkdir_status.success() {
-        bail!("ssh {host} mkdir -p ~/.local/bin exited {mkdir_status}");
+        .context("invoking ssh to prepare remote ~/.local/bin/berth")?;
+    if !prep_status.success() {
+        bail!("ssh {host} prep step exited {prep_status}");
     }
 
     // Step 2: scp the binary across. scp accepts `~/...` on the remote
