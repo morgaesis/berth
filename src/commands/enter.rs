@@ -24,6 +24,11 @@ pub struct EnterOptions {
     /// and ssh-drop reconnect cleanly). The shell-init new-tab hook
     /// sets this so each tab gets its own independent supervisor.
     pub force_new: bool,
+    /// `--no-reconnect`: when SSH exits with status 255 (network
+    /// dropped), bail instead of automatically retrying. Default is
+    /// to silently reconnect until the network comes back or the user
+    /// Ctrl+Cs.
+    pub no_reconnect: bool,
     /// `--dir`: override the remote working directory for this run.
     pub dir: Option<String>,
     /// Trailing `-- <argv>`: override the workspace default command.
@@ -198,36 +203,66 @@ async fn enter_remote(
 
     berth::terminal::emit_enter_signals(&name);
 
-    // `--plain` skips the resumability cascade and opens a plain SSH
-    // login shell. The remote-dir override is still honored: the plain
-    // path uses `ssh_interactive` which itself `cd`s into the auto path,
-    // so for now `--dir` + `--plain` is a no-op-on-dir. (Plumbing the
-    // override through `ssh_interactive` is a follow-up.)
     tracing::info!(
         plain = opts.plain,
         has_dir = remote_dir.is_some(),
         has_cmd = command.is_some(),
+        no_reconnect = opts.no_reconnect,
         "starting remote ssh session"
     );
-    let result = if opts.plain {
-        ssh::ssh_interactive(host, &name, true).await
-    } else {
-        let overrides = ssh::RemoteEnterOverrides {
-            remote_dir,
-            command,
-            force_new: opts.force_new,
+
+    // Auto-reconnect loop. SSH exit status 255 = connection lost (not
+    // a remote-command exit), so we silently re-run ssh+attach until
+    // either the network comes back and the remote command exits
+    // cleanly (0) or the user Ctrl+Cs out of the wait.
+    //
+    // On the remote side, `--resume-or-new` + flock means the second
+    // SSH lands back on the same supervisor (the prior client's lock
+    // released when its process died), so the user's claude / shell /
+    // cwd is preserved across the reconnect. Mosh-like UX.
+    let mut backoff_ms: u64 = 500;
+    let mut attempt: u32 = 0;
+    let final_code = loop {
+        attempt += 1;
+        let result = if opts.plain {
+            ssh::ssh_interactive(host, &name, true).await
+        } else {
+            let overrides = ssh::RemoteEnterOverrides {
+                remote_dir,
+                command,
+                force_new: opts.force_new,
+            };
+            ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
         };
-        ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
+        let code = result?;
+        tracing::info!(code, attempt, "remote ssh session returned");
+        match (code, opts.no_reconnect) {
+            (255, false) => {
+                // Connection lost. Quiet first retry (covers the common
+                // case of a brief blip — back in <1s), louder if it
+                // takes longer.
+                if attempt == 1 {
+                    eprintln!(
+                        "{} connection lost; reconnecting…  (Ctrl+C to abort)",
+                        "·".dimmed()
+                    );
+                } else if attempt.is_multiple_of(4) {
+                    eprintln!("{} still reconnecting (attempt {attempt})…", "·".dimmed());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                continue;
+            }
+            _ => break code,
+        }
     };
-    tracing::info!(ok = result.is_ok(), "remote ssh session returned");
 
     berth::terminal::emit_exit_signals(&name);
     tracing::info!("emitted exit signals");
 
-    // No "session ended" line — the user just typed `exit`, they know.
-    // Errors propagate via Result; on success, stay silent. Anything
-    // worth keeping (versions, paths, timings) is in `berth logs`.
-    result?;
+    if final_code != 0 {
+        anyhow::bail!("remote exited with status {final_code}");
+    }
     Ok(())
 }
 

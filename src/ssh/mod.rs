@@ -32,13 +32,18 @@ fn remote_workspace_path_expr(workspace_name: &str) -> String {
     format!("{}/{}", prefix, shell_escape_arg(workspace_name))
 }
 
-pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool) -> Result<()> {
+/// `Ok(code)` carries the remote command's exit code (or the SSH
+/// transport error code: 255 = connection lost). Caller decides
+/// whether to bail or retry; ssh_interactive used to bail itself but
+/// that made the auto-reconnect loop impossible without parsing
+/// error strings.
+pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool) -> Result<i32> {
     if skip_ssh() {
         println!(
             "[TEST MODE] Would SSH to {} and enter workspace {}",
             host, workspace_name
         );
-        return Ok(());
+        return Ok(0);
     }
 
     let remote_path = remote_workspace_path_expr(workspace_name);
@@ -65,12 +70,7 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
         .arg("$SHELL")
         .status()
         .await?;
-
-    if !status.success() {
-        anyhow::bail!("remote exited with status {}", status);
-    }
-
-    Ok(())
+    Ok(status.code().unwrap_or(255))
 }
 
 /// Optional per-workspace overrides plumbed in from the enter command.
@@ -94,7 +94,7 @@ pub async fn ssh_interactive_runtime(
     workspace_name: &str,
     runtime: &Runtime,
     mounts: &[Mount],
-) -> Result<()> {
+) -> Result<i32> {
     ssh_interactive_runtime_with(
         host,
         workspace_name,
@@ -105,13 +105,16 @@ pub async fn ssh_interactive_runtime(
     .await
 }
 
+/// Returns the remote-command exit code (255 for connection lost).
+/// Caller decides whether to bail or retry — used by the auto-reconnect
+/// loop in `enter` to silently re-run on 255.
 pub async fn ssh_interactive_runtime_with(
     host: &str,
     workspace_name: &str,
     runtime: &Runtime,
     mounts: &[Mount],
     overrides: RemoteEnterOverrides<'_>,
-) -> Result<()> {
+) -> Result<i32> {
     let remote_path = match overrides.remote_dir {
         Some(dir) => normalize_remote_path(dir),
         None => remote_workspace_path_expr(workspace_name),
@@ -130,7 +133,7 @@ pub async fn ssh_interactive_runtime_with(
             "[TEST MODE] Would SSH to {} and enter workspace {} with command: {}",
             host, workspace_name, enter_cmd
         );
-        return Ok(());
+        return Ok(0);
     }
 
     tracing::info!(host = %host, "spawning ssh -tt");
@@ -145,14 +148,7 @@ pub async fn ssh_interactive_runtime_with(
         .status()
         .await?;
     tracing::info!(?status, "ssh exited");
-
-    if !status.success() {
-        // Remote berth-attach already printed the actionable error to
-        // the user's TTY. Just propagate a non-zero so the caller knows.
-        anyhow::bail!("remote exited with status {}", status);
-    }
-
-    Ok(())
+    Ok(status.code().unwrap_or(255))
 }
 
 /// Convenience wrapper retained for tests; the override-aware variant

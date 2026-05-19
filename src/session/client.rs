@@ -94,11 +94,43 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     let stdout_fd = std::io::stdout().as_raw_fd();
     let raw_guard = RawTtyGuard::new(stdin_fd)?;
 
-    let (cols, rows) = current_size(stdout_fd);
-    write_frame(&mut write_half, &Frame::Resize { cols, rows })
-        .await
-        .ok();
+    // Multiplex outgoing frames (initial resize + stdin chunks + SIGWINCH
+    // resize updates) through one mpsc → one writer task. Without this
+    // serialization the stdin task and a SIGWINCH task would both want
+    // exclusive access to write_half.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
+    // Initial size handshake.
+    let (cols, rows) = current_size(stdout_fd);
+    out_tx.send(Frame::Resize { cols, rows }).await.ok();
+
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = out_rx.recv().await {
+            if write_frame(&mut write_half, &frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // SIGWINCH propagation: on every terminal resize, query the new
+    // size and send a Resize frame. Without this, claude / vim / less
+    // never re-wrap when the user resizes their window.
+    let resize_tx = out_tx.clone();
+    let winch_task = tokio::spawn(async move {
+        let mut signal =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+        while signal.recv().await.is_some() {
+            let (cols, rows) = current_size(stdout_fd);
+            if resize_tx.send(Frame::Resize { cols, rows }).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let stdin_tx = out_tx.clone();
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
@@ -106,7 +138,8 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
             match stdin.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if write_frame(&mut write_half, &Frame::Stdin(buf[..n].to_vec()))
+                    if stdin_tx
+                        .send(Frame::Stdin(buf[..n].to_vec()))
                         .await
                         .is_err()
                     {
@@ -118,6 +151,7 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
         }
         Ok::<_, anyhow::Error>(())
     });
+    drop(out_tx); // sender count = stdin_tx + resize_tx now
 
     let mut exit_code: i32 = 0;
     let mut stdout = tokio::io::stdout();
@@ -140,6 +174,8 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     }
     drop(raw_guard);
     stdin_task.abort();
+    winch_task.abort();
+    writer_task.abort();
     // Drain stdout so the last bytes (commonly a shell prompt or exit
     // banner) actually reach the user's terminal before we exit.
     let _ = stdout.flush().await;

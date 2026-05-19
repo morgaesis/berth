@@ -203,6 +203,11 @@ enum Commands {
         )]
         new: bool,
         #[arg(
+            long = "no-reconnect",
+            help = "Disable the auto-reconnect loop on SSH-drop; bail on first connection loss"
+        )]
+        no_reconnect: bool,
+        #[arg(
             trailing_var_arg = true,
             help = "Override workspace default command (everything after `--`)"
         )]
@@ -557,6 +562,7 @@ impl Cli {
                     auto_deploy,
                     no_deploy,
                     new,
+                    no_reconnect,
                     command,
                 } => {
                     let name = compose_workspace_name(&name, org.as_deref())?;
@@ -569,6 +575,7 @@ impl Cli {
                         auto_deploy,
                         no_deploy,
                         force_new: new,
+                        no_reconnect,
                         dir,
                         command,
                     };
