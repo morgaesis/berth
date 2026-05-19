@@ -77,6 +77,15 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
 
     let pty_master = Arc::new(Mutex::new(pair.master));
 
+    // Sticky shutdown signal. handle_client tasks spawned during the
+    // grace period miss the original broadcast (broadcasts don't replay
+    // past messages), so each task ALSO checks this on entry: if set,
+    // we're already shutting down → send replay+Exit and return
+    // without taking ownership of stdin_tx/resize_tx clones for the
+    // long haul, which would otherwise hang writer_handle's cleanup.
+    let shutdown_fired: Arc<std::sync::atomic::AtomicI32> =
+        Arc::new(std::sync::atomic::AtomicI32::new(i32::MIN));
+
     let (stdout_tx, _) = broadcast::channel::<Vec<u8>>(64);
     let (stdin_tx, stdin_rx) = mpsc::channel::<Vec<u8>>(64);
     let (resize_tx, mut resize_rx) = mpsc::channel::<(u16, u16)>(16);
@@ -180,18 +189,20 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                         let stdout_rx = stdout_tx.subscribe();
                         let stdin_for_client = stdin_tx.clone();
                         let resize_for_client = resize_tx.clone();
-                        let shutdown_rx_for_client = shutdown_tx.subscribe();
+                        let shutdown_for_client = shutdown_tx.clone();
                         let active = active_client.clone();
                         let replay = replay_buf.clone();
+                        let shutdown_fired_for_client = shutdown_fired.clone();
                         tokio::spawn(handle_client(
                             stream_id,
                             stream,
                             stdout_rx,
                             stdin_for_client,
                             resize_for_client,
-                            shutdown_rx_for_client,
+                            shutdown_for_client,
                             active,
                             replay,
+                            shutdown_fired_for_client,
                         ));
                     }
                     Err(e) => {
@@ -201,7 +212,9 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                 }
             }
             code = shutdown_rx.recv() => {
-                pending_exit = Some(code.unwrap_or(0));
+                let c = code.unwrap_or(0);
+                pending_exit = Some(c);
+                shutdown_fired.store(c, std::sync::atomic::Ordering::SeqCst);
                 break;
             }
         }
@@ -222,18 +235,20 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                     let stdout_rx = stdout_tx.subscribe();
                     let stdin_for_client = stdin_tx.clone();
                     let resize_for_client = resize_tx.clone();
-                    let shutdown_rx_for_client = shutdown_tx.subscribe();
+                    let shutdown_for_client = shutdown_tx.clone();
                     let active = active_client.clone();
                     let replay = replay_buf.clone();
+                    let shutdown_fired_for_client = shutdown_fired.clone();
                     tokio::spawn(handle_client(
                         stream_id,
                         stream,
                         stdout_rx,
                         stdin_for_client,
                         resize_for_client,
-                        shutdown_rx_for_client,
+                        shutdown_for_client,
                         active,
                         replay,
+                        shutdown_fired_for_client,
                     ));
                 }
             }
@@ -241,13 +256,21 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         }
     }
 
+    tracing::info!("cleanup: awaiting pty_reader_handle");
     let _ = pty_reader_handle.await;
+    tracing::info!("cleanup: dropping stdin_tx");
     drop(stdin_tx);
+    tracing::info!("cleanup: awaiting writer_handle");
     let _ = writer_handle.await;
+    tracing::info!("cleanup: dropping resize_tx");
     drop(resize_tx);
+    tracing::info!("cleanup: awaiting resizer_handle");
     let _ = resizer_handle.await;
+    tracing::info!("cleanup: awaiting waiter_handle");
     let final_code = waiter_handle.await.unwrap_or(pending_exit.unwrap_or(0));
+    tracing::info!(?final_code, "cleanup: removing socket");
     let _ = fs::remove_file(&socket_for_cleanup);
+    tracing::info!("cleanup: done");
     Ok(final_code)
 }
 
@@ -258,10 +281,13 @@ async fn handle_client(
     mut stdout_rx: broadcast::Receiver<Vec<u8>>,
     stdin_tx: mpsc::Sender<Vec<u8>>,
     resize_tx: mpsc::Sender<(u16, u16)>,
-    mut shutdown_rx: broadcast::Receiver<i32>,
+    shutdown_tx: broadcast::Sender<i32>,
     _active: Arc<Mutex<u64>>,
     replay: Arc<std::sync::Mutex<Vec<u8>>>,
+    shutdown_fired: Arc<std::sync::atomic::AtomicI32>,
 ) {
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let mut shutdown_rx_for_read = shutdown_tx.subscribe();
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Replay any output the child has already produced. This is what
@@ -271,6 +297,18 @@ async fn handle_client(
     let replay_snapshot: Vec<u8> = replay.lock().map(|b| b.clone()).unwrap_or_default();
     if !replay_snapshot.is_empty() {
         let _ = write_frame(&mut write_half, &Frame::Stdout(replay_snapshot)).await;
+    }
+
+    // Grace-period short-circuit: if the supervisor has already fired
+    // shutdown by the time we got here, the original broadcast has
+    // come and gone — subscribing now gives us a receiver that will
+    // never fire. Send the buffered output + Exit + return, releasing
+    // our stdin_tx/resize_tx clones immediately so the supervisor's
+    // writer_handle.await can drain.
+    let pending = shutdown_fired.load(std::sync::atomic::Ordering::SeqCst);
+    if pending != i32::MIN {
+        let _ = write_frame(&mut write_half, &Frame::Exit { code: pending }).await;
+        return;
     }
 
     let writer_task = tokio::spawn(async move {
@@ -297,17 +335,29 @@ async fn handle_client(
     });
 
     loop {
-        match read_frame(&mut read_half).await {
-            Ok(Some(Frame::Stdin(bytes))) => {
-                if stdin_tx.send(bytes).await.is_err() {
-                    break;
+        tokio::select! {
+            frame = read_frame(&mut read_half) => {
+                match frame {
+                    Ok(Some(Frame::Stdin(bytes))) => {
+                        if stdin_tx.send(bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(Some(Frame::Resize { cols, rows })) => {
+                        let _ = resize_tx.send((cols, rows)).await;
+                    }
+                    Ok(Some(_)) | Ok(None) => break,
+                    Err(_) => break,
                 }
             }
-            Ok(Some(Frame::Resize { cols, rows })) => {
-                let _ = resize_tx.send((cols, rows)).await;
-            }
-            Ok(Some(_)) | Ok(None) => break,
-            Err(_) => break,
+            // Crucial for supervisor cleanup: if the supervisor's main
+            // loop has fired shutdown but the client hasn't closed its
+            // socket yet (or is just slow to receive Frame::Exit),
+            // break out anyway so this task's `stdin_tx` clone drops.
+            // Without this break, writer_handle's mpsc receiver never
+            // returns None and the supervisor hangs forever in its
+            // cleanup `await`.
+            _ = shutdown_rx_for_read.recv() => break,
         }
     }
     let _ = writer_task.await;
