@@ -76,9 +76,13 @@ const COMMON_PRELUDE: &str = r#"# berth shell integration (cascading)
 #   1. WezTerm/iTerm2 user var       (pane-scoped, doesn't cross tabs yet)
 #   2. BERTH_PROJECT_HINT env var    (explicit override)
 #   3. OSC 7 inherited PWD marker    (universal; how new tabs actually work)
+#   4. ~/.local/state/berth/last-active (WSL+WinTerm fallback, time-gated)
 #
 # When the marker path is detected, the hook `cd`s to $HOME *before*
 # invoking `berth enter`, so the user is never parked in the marker dir.
+#
+# OPT OUT (one shot):   BERTH_SKIP_AUTO=1 <command>
+# OPT OUT (this shell): export BERTH_SKIP_AUTO=1
 
 _berth_state_dir() {
     printf '%s/berth/active' "${XDG_STATE_HOME:-$HOME/.local/state}"
@@ -125,23 +129,65 @@ _berth_auto_enter_on_start() {
         *i*) : ;;
         *) return 0 ;;
     esac
-    local proj
-    proj="$(_berth_detect_project)" || return 0
-    [ -z "$proj" ] && return 0
-    # If we landed in the OSC 7 marker dir, leave it before doing anything
-    # visible — the marker carries our signal, not a place we want to stay.
-    local state_dir
+
+    local state_dir invoke_file invoke_line proj
     state_dir="$(_berth_state_dir)"
-    case "$PWD/" in
-        "$state_dir"/*) cd "$HOME" 2>/dev/null || cd / ;;
-    esac
-    export BERTH_SKIP_AUTO=1
-    # New tabs always get a fresh session — different from the default
-    # `berth enter` which resumes if a session exists. Without `--new`
-    # here, opening a second tab from inside an active workspace would
-    # attach the same supervisor in both tabs (shared PTY, exiting one
-    # closes both).
-    command berth enter --new "$proj"
+
+    # 1. Cwd-inheritance path: detect workspace from $PWD if it's inside
+    #    the marker dir tree. Hop out to $HOME before doing anything
+    #    visible so the user is never parked in the state dir.
+    proj="$(_berth_detect_project 2>/dev/null)" || proj=""
+    if [ -n "$proj" ]; then
+        case "$PWD/" in
+            "$state_dir"/*) cd "$HOME" 2>/dev/null || cd / ;;
+        esac
+        invoke_file="$state_dir/$(printf '%s' "$proj" | sed 's|/|_|g')/.invoke"
+        if [ -r "$invoke_file" ]; then
+            # eval the exact `berth enter --new <ws> [--dir D] [-- argv]`
+            # line written by the parent tab. Replays workspace + dir +
+            # command override verbatim. Prefix-guard the contents so a
+            # same-uid process planting a different shape can only run
+            # `berth enter --new …`, not arbitrary commands.
+            invoke_line="$(cat "$invoke_file" 2>/dev/null)"
+            case "$invoke_line" in
+                "BERTH_SKIP_AUTO=1 command berth enter --new "*)
+                    eval "$invoke_line"
+                    return $?
+                    ;;
+            esac
+        fi
+        # Fall back to bare invocation if marker exists but no .invoke.
+        export BERTH_SKIP_AUTO=1
+        command berth enter --new "$proj"
+        return $?
+    fi
+
+    # 2. Fallback path: cwd inheritance failed (e.g. WSL + Windows
+    #    Terminal can't honor OSC 7 paths pointing at the remote box).
+    #    Read the global last-active pointer — last writer wins. Tight
+    #    time gate (10 min) bounds the window in which a same-uid
+    #    process planting this file could get arbitrary code eval'd
+    #    in the user's next interactive shell. The expected workflow
+    #    (open new tab seconds-to-minutes after `berth enter`) fits
+    #    comfortably inside this window.
+    local last_file
+    last_file="${XDG_STATE_HOME:-$HOME/.local/state}/berth/last-active"
+    if [ -r "$last_file" ]; then
+        if [ -n "$(find "$last_file" -mmin -10 2>/dev/null)" ]; then
+            invoke_line="$(cat "$last_file" 2>/dev/null)"
+            # Defense-in-depth: only eval lines that match the exact
+            # shape berth writes. An attacker who pre-creates this file
+            # is constrained to invoking `berth enter --new …`, not
+            # arbitrary shell.
+            case "$invoke_line" in
+                "BERTH_SKIP_AUTO=1 command berth enter --new "*)
+                    eval "$invoke_line"
+                    return $?
+                    ;;
+            esac
+        fi
+    fi
+    return 0
 }
 
 # Defensive: if $PWD has vanished out from under us (older berth versions

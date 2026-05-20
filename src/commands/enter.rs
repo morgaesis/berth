@@ -152,7 +152,11 @@ fn enter_local(
 ) -> Result<()> {
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
-    berth::terminal::emit_enter_signals(name);
+    berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
+        workspace: name,
+        dir: None,
+        command: None,
+    });
 
     match runtime_config {
         Runtime::Bare => {
@@ -201,7 +205,12 @@ async fn enter_remote(
         let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
     }
 
-    berth::terminal::emit_enter_signals(&name);
+    // Capture the exact invocation for the new-tab hook to replicate.
+    berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
+        workspace: &name,
+        dir: remote_dir,
+        command,
+    });
 
     tracing::info!(
         plain = opts.plain,
