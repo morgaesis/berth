@@ -151,8 +151,13 @@ _berth_auto_enter_on_start() {
             invoke_line="$(cat "$invoke_file" 2>/dev/null)"
             case "$invoke_line" in
                 "BERTH_SKIP_AUTO=1 command berth enter --new "*)
-                    eval "$invoke_line"
+                    if ! eval "$invoke_line"; then
+                        printf 'berth: auto-enter failed (exit %s). Skipping.\n' "$?" >&2
+                    fi
                     return $?
+                    ;;
+                ?*)
+                    printf 'berth: ignoring malformed .invoke (%s)\n' "$invoke_file" >&2
                     ;;
             esac
         fi

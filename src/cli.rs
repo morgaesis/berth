@@ -154,7 +154,13 @@ enum Commands {
                       Resumability flags:\n  \
                       --plain         skip session-mux entirely; plain SSH login shell\n  \
                       --auto-deploy   deploy without prompting (overrides per-host trust)\n  \
-                      --no-deploy     never deploy; fall through to legacy multiplexers"
+                      --no-deploy     never deploy; fall through to legacy multiplexers\n\n\
+                      New-tab replay: with the shell hook installed (see `berth doctor`),\n  \
+                      new terminal tabs spawned from a berth session will re-run this same\n  \
+                      invocation verbatim — including any trailing `-- <argv>` override. If\n  \
+                      that command prompts interactively (e.g. sudo), the prompt will\n  \
+                      reappear in each new tab. Set BERTH_SKIP_AUTO=1 to opt out for one\n  \
+                      shell."
     )]
     Enter {
         #[arg(help = "Workspace name (org/project, or bare project paired with --org)")]
@@ -262,7 +268,7 @@ enum Commands {
         )]
         once: bool,
     },
-    #[command(about = "Show local runtime auto-discovery status")]
+    #[command(about = "Show shell-integration + local runtime status")]
     Doctor,
     #[command(about = "Delete a workspace configuration")]
     Delete {
