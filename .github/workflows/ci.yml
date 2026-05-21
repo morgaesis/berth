@@ -34,7 +34,14 @@ jobs:
       - name: Library tests
         run: cargo test --lib --quiet
 
-      - name: E2E tests (mocked, default-gated only)
+      - name: E2E tests (mocked path only — real runtimes run in release.yml)
+        env:
+          # The CI runner doesn't install podman or kubectl. The
+          # default-on real-runtime e2e gates would hard-fail here;
+          # disable both. Real-runtime coverage lives in release.yml,
+          # which runs on tag push with podman installed.
+          BERTH_E2E_PODMAN_ENABLED: "false"
+          BERTH_E2E_K8S_ENABLED: "false"
         run: cargo test --test e2e --quiet
 
       - name: Yamllint
