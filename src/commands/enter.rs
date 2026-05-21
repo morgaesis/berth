@@ -203,7 +203,7 @@ fn maybe_show_new_tab_hint(workspace: &str) {
 fn new_tab_hint_path() -> Option<std::path::PathBuf> {
     let base = env::var_os("XDG_STATE_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| dirs::state_dir())
+        .or_else(dirs::state_dir)
         .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?;
     Some(base.join("berth").join("new-tab-hint-count"))
 }
