@@ -312,16 +312,16 @@ fn normalize_remote_path(path: &str) -> String {
 fn normalize_remote_path_handles_tilde_and_dollar_home() {
     assert_eq!(normalize_remote_path("~"), "\"$HOME\"");
     assert_eq!(
-        normalize_remote_path("~/Projects/morgaesis/postil"),
-        "\"$HOME\"/\"Projects/morgaesis/postil\""
+        normalize_remote_path("~/code/org/proj"),
+        "\"$HOME\"/\"code/org/proj\""
     );
     assert_eq!(
-        normalize_remote_path("$HOME/code/postil"),
-        "\"$HOME/code/postil\""
+        normalize_remote_path("$HOME/code/proj"),
+        "\"$HOME/code/proj\""
     );
     assert_eq!(
-        normalize_remote_path("/var/work/postil"),
-        "\"/var/work/postil\""
+        normalize_remote_path("/var/work/proj"),
+        "\"/var/work/proj\""
     );
 }
 

@@ -23,9 +23,9 @@ defaults:
 # `remote` and `<remote_root>/<project>` from here, so you don't have to
 # repeat the prefix on every workspace.
 orgs:
-  acme:
+  org:
     remote: dev-box.internal
-    remote_root: ~/code/acme
+    remote_root: ~/code/org
 
 workspaces:
   # Bare local workspace — explicit opt-out from podman discovery.
@@ -57,11 +57,11 @@ workspaces:
     path: ~/code/remote-svc
     remote: dev-box
 
-  # Org-scoped workspace. With `orgs.acme.remote_root` above, this
-  # resolves to `dev-box.internal:~/code/acme/cluster-tools` without
+  # Org-scoped workspace. With `orgs.org.remote_root` above, this
+  # resolves to `dev-box.internal:~/code/org/proj` without
   # repeating the prefix.
-  acme/cluster-tools:
-    path: ~/code/acme/cluster-tools
+  org/proj:
+    path: ~/code/org/proj
 
   # Kubernetes-pod runtime — only contacts the cluster when berth runs
   # `kubectl run` / `kubectl delete pod` for this workspace.

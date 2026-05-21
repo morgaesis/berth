@@ -76,9 +76,9 @@ defaults:
 # CLI: `berth org set <org> --remote <host> --root <path>`,
 #      `berth org rm <org>`, `berth org list`, `berth org show <org>`.
 orgs: {}
-#   acme:
+#   org:
 #     remote: dev-box.internal
-#     remote_root: ~/code/acme
+#     remote_root: ~/code/org
 
 # ─── trusted_hosts ─────────────────────────────────────────────────────
 #

@@ -20,7 +20,7 @@ pub struct Config {
     pub trusted_hosts: HashMap<String, TrustedHost>,
     /// Per-org defaults. Workspace names of the form `<org>/<project>`
     /// look up their org here. `remote_root` lets you say "everything
-    /// under `morgaesis/*` lives under `~/Projects/morgaesis/` on the
+    /// under `org/*` lives under `~/code/org/` on the
     /// remote", so individual workspaces don't have to repeat the path
     /// prefix. `remote` provides a default host for the org.
     #[serde(default)]
@@ -475,60 +475,57 @@ mod tests {
 
     #[test]
     fn resolved_remote_dir_workspace_override_wins() {
-        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis"), None);
+        let cfg = cfg_with_org("org", Some("~/code/org"), None);
         let mut ws = Workspace::new("/tmp/x");
-        ws.remote_dir = Some("~/elsewhere/postil".into());
+        ws.remote_dir = Some("~/elsewhere/proj".into());
         assert_eq!(
-            cfg.resolved_remote_dir("morgaesis/postil", &ws),
-            Some("~/elsewhere/postil".into())
+            cfg.resolved_remote_dir("org/proj", &ws),
+            Some("~/elsewhere/proj".into())
         );
     }
 
     #[test]
     fn resolved_remote_dir_uses_org_root() {
-        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis"), None);
+        let cfg = cfg_with_org("org", Some("~/code/org"), None);
         let ws = Workspace::new("/tmp/x");
         assert_eq!(
-            cfg.resolved_remote_dir("morgaesis/postil", &ws),
-            Some("~/Projects/morgaesis/postil".into())
+            cfg.resolved_remote_dir("org/proj", &ws),
+            Some("~/code/org/proj".into())
         );
     }
 
     #[test]
     fn resolved_remote_dir_trims_trailing_slash_on_root() {
-        let cfg = cfg_with_org("morgaesis", Some("~/Projects/morgaesis/"), None);
+        let cfg = cfg_with_org("org", Some("~/code/org/"), None);
         let ws = Workspace::new("/tmp/x");
         assert_eq!(
-            cfg.resolved_remote_dir("morgaesis/postil", &ws),
-            Some("~/Projects/morgaesis/postil".into())
+            cfg.resolved_remote_dir("org/proj", &ws),
+            Some("~/code/org/proj".into())
         );
     }
 
     #[test]
     fn resolved_remote_dir_returns_none_for_unscoped_name() {
-        let cfg = cfg_with_org("morgaesis", Some("~/p"), None);
+        let cfg = cfg_with_org("org", Some("~/p"), None);
         let ws = Workspace::new("/tmp/x");
-        assert_eq!(cfg.resolved_remote_dir("postil", &ws), None);
+        assert_eq!(cfg.resolved_remote_dir("proj", &ws), None);
     }
 
     #[test]
     fn resolved_remote_dir_returns_none_when_org_unknown() {
-        let cfg = cfg_with_org("morgaesis", Some("~/p"), None);
+        let cfg = cfg_with_org("org", Some("~/p"), None);
         let ws = Workspace::new("/tmp/x");
-        assert_eq!(cfg.resolved_remote_dir("other/postil", &ws), None);
+        assert_eq!(cfg.resolved_remote_dir("other/proj", &ws), None);
     }
 
     #[test]
     fn resolved_remote_uses_workspace_first_then_org() {
-        let cfg = cfg_with_org("morgaesis", None, Some("morgaesis-dev"));
+        let cfg = cfg_with_org("org", None, Some("dev-box"));
         let mut ws = Workspace::new("/tmp/x");
-        assert_eq!(
-            cfg.resolved_remote("morgaesis/postil", &ws),
-            Some("morgaesis-dev".into())
-        );
+        assert_eq!(cfg.resolved_remote("org/proj", &ws), Some("dev-box".into()));
         ws.remote = Some("personal-box".into());
         assert_eq!(
-            cfg.resolved_remote("morgaesis/postil", &ws),
+            cfg.resolved_remote("org/proj", &ws),
             Some("personal-box".into())
         );
     }

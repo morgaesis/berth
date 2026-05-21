@@ -9,7 +9,7 @@ land in them: `berth enter <name>`.
   sudo prompt, your AI assistant mid-thought — all still there.
 - **New tab → new session, fully configured.** Workspaces can carry a
   multi-stage entry command — e.g.
-  `berth enter ws -- bash -c "sudo -u dev bash -ic 'cd app && claude'"`.
+  `berth enter my-project -- bash -c "sudo -u dev bash -ic 'cd app && claude'"`.
   With the shell hook installed, **Meta+T** (or Ctrl+Shift+T on Linux)
   opens a tab that lands you in an independent session with the same
   shape: same host, same user, same directory, same tool. Two claude
@@ -28,50 +28,54 @@ See [INSTALL.md](./INSTALL.md). Quick paths:
 
 ```bash
 cargo install --git https://github.com/morgaesis/berth --locked
-# or
+```
+
+```bash
 tooler run morgaesis/berth
 ```
 
-Or hand the link to a coding agent:
+Or hand this prompt to a coding agent:
 
-> Install berth from <https://github.com/morgaesis/berth>. Read and follow
-> `INSTALL.md` at the root of that repo. Verify the install by running
-> `berth --version` and `berth doctor`; report both outputs back.
+```text
+Install berth from https://github.com/morgaesis/berth. Read and follow
+INSTALL.md at the root of that repo. Verify the install by running
+`berth --version` and `berth doctor`; report both outputs back.
+```
 
 ## Usage
 
 ```bash
-berth list                                       # workspaces + last-used time
-berth show myproject                             # resolved config for one
-berth new myproject ~/projects/myproject         # create
-berth enter myproject                            # create-if-needed, then enter
-berth enter myproject -- claude --foo            # override the entry command
-berth set myproject --dir ~/code/myproject       # edit fields without yaml
-berth rm myproject                               # delete the configuration
+berth list                                    # workspaces + last-used time
+berth show my-project                         # resolved config for one
+berth new my-project ~/code/my-project        # create
+berth enter my-project                        # create-if-needed, then enter
+berth enter my-project -- claude --foo        # override the entry command
+berth set my-project --dir ~/code/my-project  # edit fields without yaml
+berth rm my-project                           # delete the configuration
 
-berth run myproject -- cargo test                # one-shot command in workspace
-berth tunnel myproject -p 3000,8080              # forward remote ports
-berth stop myproject                             # stop the runtime
-berth reap                                       # stop expired environments
-berth daemon --interval-seconds 300              # foreground idle reaper
-berth doctor                                     # local runtime + hook status
+berth run my-project -- cargo test            # one-shot command in workspace
+berth tunnel my-project -p 3000,8080          # forward remote ports
+berth stop my-project                         # stop the runtime
+berth reap                                    # stop expired environments
+berth daemon --interval-seconds 300           # foreground idle reaper
+berth doctor                                  # local runtime + hook status
 ```
 
-Remote workspaces work the same. `berth enter --remote <host> <ws>` probes
+Remote workspaces work the same. `berth enter --remote <host> <name>` probes
 the host, offers a one-time binary deploy when there's no compatible berth
 on the other side, and from then on every entry resumes the supervised
 session (so a flaky SSH link doesn't kill your shell):
 
 ```bash
-berth enter --remote prod-box myws               # prompts on first deploy
-berth enter --remote prod-box myws --auto-deploy # skip the prompt
-berth enter --remote prod-box myws --plain       # plain SSH, no resume
-berth deploy prod-box                            # explicit one-shot deploy
+berth enter --remote prod-box my-project                # prompts on first deploy
+berth enter --remote prod-box my-project --auto-deploy  # skip the prompt
+berth enter --remote prod-box my-project --plain        # plain SSH, no resume
+berth deploy prod-box                                   # explicit one-shot deploy
 ```
 
 Org-scoped workspaces (`<org>/<project>`) inherit a remote host and a
-remote-root directory from `berth org set`, so you write
-`acme/postil` once and stop repeating `--remote` and `--dir`.
+remote-root directory from `berth org set`, so you write `org/proj`
+once and stop repeating `--remote` and `--dir`.
 
 ## Configuration
 
@@ -106,12 +110,10 @@ cp .env.example .env
 # uncomment BERTH_E2E_K8S_ENABLED=false on hosts without a reachable cluster
 ```
 
-Re-recording the README's demo asset: `bash scripts/record-demo/record.sh`.
-Needs `asciinema` and `svg-term-cli` on the host (`npm i -g svg-term-cli`),
-plus the host runtimes berth's `doctor` probes for if you want them shown
-as ready. The driver script sandboxes `$HOME` and `PATH` under a tmpdir,
-then the wrapper sed-scrubs the tmpdir prefix out of the captured cast
-before rendering — so the resulting SVG only ever shows `/home/dev/…`.
+`assets/demo.svg` is hand-edited — open it in any text editor to
+tweak. The previous asciinema + svg-term pipeline was deleted; manual
+authoring produces a smaller, faster-loading asset whose timing can
+be tuned without re-running anything.
 
 ## Acknowledgements
 

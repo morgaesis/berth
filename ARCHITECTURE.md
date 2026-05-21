@@ -22,7 +22,7 @@ first hit:
    falls back to bare. Remote auto resolves to bare unconditionally
    because berth never probes a remote for runtime selection.
 
-`berth show <ws>` prints the resolved view; values colored as
+`berth show <name>` prints the resolved view; values colored as
 `(inherited)` came from layer 3 or 4.
 
 ## Local runtimes
@@ -81,7 +81,7 @@ reads the records and stops anything past its idle TTL.
 ## Remote entry
 
 Remote entry is SSH-first with batteries-included deployability. On
-`berth enter --remote <host> <ws>` the cascade is:
+`berth enter --remote <host> <name>` the cascade is:
 
 1. **Pre-flight probe** — single SSH round-trip, busybox-compatible:
    detect OS/architecture, check for an installed remote `berth`, and
@@ -94,7 +94,7 @@ Remote entry is SSH-first with batteries-included deployability. On
    smoke-tested via `<remote-path> --version`, and the host is
    recorded in `config.trusted_hosts` so future enters silently
    redeploy when the version drifts.
-3. **Session start** — remote `berth attach --resume-or-new <ws>` owns
+3. **Session start** — remote `berth attach --resume-or-new <name>` owns
    the PTY through a per-session Unix socket at
    `runtime_dir/sessions/<sanitized_workspace>/<session_id>.sock`.
    Every terminal tab gets an independent supervisor (so a kill on

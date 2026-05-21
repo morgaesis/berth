@@ -50,32 +50,32 @@ mod tests {
 
     #[test]
     fn compose_workspace_no_org_passes_through() {
-        assert_eq!(compose_workspace_name("postil", None).unwrap(), "postil");
+        assert_eq!(compose_workspace_name("proj", None).unwrap(), "proj");
         assert_eq!(
-            compose_workspace_name("morgaesis/postil", None).unwrap(),
-            "morgaesis/postil"
+            compose_workspace_name("org/proj", None).unwrap(),
+            "org/proj"
         );
     }
 
     #[test]
     fn compose_workspace_prepends_org_to_bare_name() {
         assert_eq!(
-            compose_workspace_name("postil", Some("morgaesis")).unwrap(),
-            "morgaesis/postil"
+            compose_workspace_name("proj", Some("org")).unwrap(),
+            "org/proj"
         );
     }
 
     #[test]
     fn compose_workspace_org_matches_existing_prefix() {
         assert_eq!(
-            compose_workspace_name("morgaesis/postil", Some("morgaesis")).unwrap(),
-            "morgaesis/postil"
+            compose_workspace_name("org/proj", Some("org")).unwrap(),
+            "org/proj"
         );
     }
 
     #[test]
     fn compose_workspace_conflicting_org_errors() {
-        assert!(compose_workspace_name("morgaesis/postil", Some("other")).is_err());
+        assert!(compose_workspace_name("org/proj", Some("other")).is_err());
     }
 }
 
@@ -119,14 +119,14 @@ enum Commands {
     #[command(
         about = "Create a new workspace configuration",
         long_about = "Create a new workspace configuration.\n\n\
-                      Workspaces can be plain (`postil`) or org-scoped (`morgaesis/postil`).\n\
+                      Workspaces can be plain (`proj`) or org-scoped (`org/proj`).\n\
                       Org-scoped workspaces inherit a remote host and remote-root directory\n\
                       from `orgs.<org>` in config (see `berth org set`).\n\n\
                       Examples:\n  \
-                      berth new postil\n  \
-                      berth new morgaesis/postil -r morgaesis-dev\n  \
-                      berth new morgaesis/postil --dir '~/Projects/morgaesis/postil.dev'\n  \
-                      berth new morgaesis/postil -- claude --dangerously-skip-permissions"
+                      berth new proj\n  \
+                      berth new org/proj -r dev-box\n  \
+                      berth new org/proj --dir '~/code/org/proj.dev'\n  \
+                      berth new org/proj -- claude --dangerously-skip-permissions"
     )]
     New {
         #[arg(help = "Workspace name (org/project, or bare project paired with --org)")]
@@ -138,7 +138,7 @@ enum Commands {
         #[arg(
             short = 'o',
             long = "org",
-            help = "Prepend this org to a bare workspace name (e.g. --org morgaesis postil → morgaesis/postil)"
+            help = "Prepend this org to a bare workspace name (e.g. --org org proj → org/proj)"
         )]
         org: Option<String>,
         #[arg(short = 'r', long = "remote", help = "SSH host for remote entry")]
@@ -199,15 +199,15 @@ enum Commands {
     #[command(
         about = "Enter a workspace (creates if needed)",
         long_about = "Enter a workspace, creating it if absent.\n\n\
-                      Workspaces can be plain (`postil`) or org-scoped (`morgaesis/postil`).\n\
+                      Workspaces can be plain (`proj`) or org-scoped (`org/proj`).\n\
                       Use --org to compose an org with a bare project name. Org-scoped\n\
                       workspaces inherit a remote host and a remote-root directory from\n\
                       `orgs.<org>` in config (see `berth org set`).\n\n\
                       Examples:\n  \
-                      berth enter postil --org morgaesis\n  \
-                      berth enter morgaesis/postil --remote dev-box\n  \
-                      berth enter morgaesis/postil --dir '~/Projects/morgaesis/postil'\n  \
-                      berth enter morgaesis/postil -- claude --dangerously-skip-permissions\n\n\
+                      berth enter proj --org org\n  \
+                      berth enter org/proj --remote dev-box\n  \
+                      berth enter org/proj --dir '~/code/org/proj'\n  \
+                      berth enter org/proj -- claude --dangerously-skip-permissions\n\n\
                       For remote workspaces, berth probes the host and selects the best\n\
                       session-mux available. If none, you'll be prompted to deploy the\n\
                       berth binary to the remote (one-time consent, persisted in config).\n\n\
@@ -228,7 +228,7 @@ enum Commands {
         #[arg(
             short = 'o',
             long = "org",
-            help = "Prepend this org to the workspace name (e.g. --org morgaesis postil → morgaesis/postil)"
+            help = "Prepend this org to the workspace name (e.g. --org org proj → org/proj)"
         )]
         org: Option<String>,
         #[arg(
@@ -242,7 +242,7 @@ enum Commands {
         #[arg(
             short = 'd',
             long = "dir",
-            help = "Override the remote working directory (e.g. ~/code/postil)"
+            help = "Override the remote working directory (e.g. ~/code/proj)"
         )]
         dir: Option<String>,
         #[arg(
@@ -360,9 +360,9 @@ enum Commands {
                       root from its org, so individual workspaces don't have to repeat the \
                       prefix.\n\n\
                       Examples:\n  \
-                      berth org set morgaesis --remote morgaesis-dev --root '~/Projects/morgaesis'\n  \
+                      berth org set org --remote dev-box --root '~/code/org'\n  \
                       berth org list\n  \
-                      berth org show morgaesis"
+                      berth org show org"
     )]
     Org(OrgCommands),
     #[command(
@@ -495,7 +495,7 @@ enum OrgCommands {
     },
     #[command(about = "Set or update an org's defaults")]
     Set {
-        #[arg(help = "Org name (e.g. morgaesis)")]
+        #[arg(help = "Org name (e.g. org)")]
         name: String,
         #[arg(
             short = 'r',

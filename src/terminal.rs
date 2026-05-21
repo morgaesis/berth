@@ -279,13 +279,13 @@ mod tests {
     #[test]
     fn build_invoke_workspace_only() {
         let s = EnterSignal {
-            workspace: "morgaesis/postil",
+            workspace: "org/proj",
             dir: None,
             command: None,
         };
         assert_eq!(
             build_invoke_line(&s),
-            "BERTH_SKIP_AUTO=1 command berth enter --new 'morgaesis/postil'"
+            "BERTH_SKIP_AUTO=1 command berth enter --new 'org/proj'"
         );
     }
 
@@ -293,14 +293,14 @@ mod tests {
     fn build_invoke_with_dir_and_command() {
         let cmd = vec!["zsh".to_string()];
         let s = EnterSignal {
-            workspace: "morgaesis/postil",
-            dir: Some("~/Projects/morgaesis/postil.dev"),
+            workspace: "org/proj",
+            dir: Some("~/code/org/proj.dev"),
             command: Some(&cmd),
         };
         assert_eq!(
             build_invoke_line(&s),
-            "BERTH_SKIP_AUTO=1 command berth enter --new 'morgaesis/postil' \
-             --dir '~/Projects/morgaesis/postil.dev' -- 'zsh'"
+            "BERTH_SKIP_AUTO=1 command berth enter --new 'org/proj' \
+             --dir '~/code/org/proj.dev' -- 'zsh'"
         );
     }
 
@@ -312,7 +312,7 @@ mod tests {
             "sudo -u dev bash -ic 'cd app && assist'".to_string(),
         ];
         let s = EnterSignal {
-            workspace: "acme/app",
+            workspace: "org/proj",
             dir: None,
             command: Some(&cmd),
         };
