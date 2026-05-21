@@ -1,126 +1,133 @@
 # Berth
 
-Berth opens consistent project workspaces on local or remote hosts.
+Berth gives you named workspaces — local or remote — and one command to
+land in them: `berth enter <name>`.
 
-By default Berth auto-discovers local runtime support. If rootless Podman is available, local workspaces run in a Podman environment with the project mounted at `/workspace`, selected config files mounted into the container, and lifecycle state recorded for idle cleanup. If Podman is unavailable, Berth falls back to a bare shell in the project directory. Explicit config can opt out.
+- **Session continuity, no failed SSH.** Close the laptop, hit a tunnel,
+  the VPN flaps — the session keeps running on the far side and the
+  next `berth enter` quietly reattaches. Scrollback, the half-typed
+  sudo prompt, your AI assistant mid-thought — all still there.
+- **New tab → new session, fully configured.** Workspaces can carry a
+  multi-stage entry command — e.g.
+  `berth enter ws -- bash -c "sudo -u dev bash -ic 'cd app && claude'"`.
+  With the shell hook installed, **Meta+T** (or Ctrl+Shift+T on Linux)
+  opens a tab that lands you in an independent session with the same
+  shape: same host, same user, same directory, same tool. Two claude
+  sessions side by side in the same environment, set up once.
+- **Same shape, local or remote.** `berth enter my-local` and
+  `berth enter my-remote` look identical at the prompt. The host
+  lives on the workspace itself, set once (`berth set --remote …`,
+  or inherited from an org). See
+  [examples/config.yaml](./examples/config.yaml).
 
 ![Berth Demo](./assets/demo.svg)
+
+## Install
+
+See [INSTALL.md](./INSTALL.md). Quick paths:
+
+```bash
+cargo install --git https://github.com/morgaesis/berth --locked
+# or
+tooler run morgaesis/berth
+```
+
+Or hand the link to a coding agent:
+
+> Install berth from <https://github.com/morgaesis/berth>. Read and follow
+> `INSTALL.md` at the root of that repo. Verify the install by running
+> `berth --version` and `berth doctor`; report both outputs back.
 
 ## Usage
 
 ```bash
-berth new myproject ~/projects/myproject
-berth enter myproject
-berth run myproject cargo test --quiet
-berth stop myproject
-berth reap
-berth daemon --interval-seconds 300
-berth doctor
-berth list
+berth list                                       # workspaces + last-used time
+berth show myproject                             # resolved config for one
+berth new myproject ~/projects/myproject         # create
+berth enter myproject                            # create-if-needed, then enter
+berth enter myproject -- claude --foo            # override the entry command
+berth set myproject --dir ~/code/myproject       # edit fields without yaml
+berth rm myproject                               # delete the configuration
+
+berth run myproject -- cargo test                # one-shot command in workspace
+berth tunnel myproject -p 3000,8080              # forward remote ports
+berth stop myproject                             # stop the runtime
+berth reap                                       # stop expired environments
+berth daemon --interval-seconds 300              # foreground idle reaper
+berth doctor                                     # local runtime + hook status
 ```
 
-The implicit `berth NAME` shorthand is intentionally disabled. Install shell niceties instead:
+Remote workspaces work the same. `berth enter --remote <host> <ws>` probes
+the host, offers a one-time binary deploy when there's no compatible berth
+on the other side, and from then on every entry resumes the supervised
+session (so a flaky SSH link doesn't kill your shell):
 
 ```bash
-eval "$(berth shell-init)"
-eval "$(berth shell-completions)"
-b myproject
+berth enter --remote prod-box myws               # prompts on first deploy
+berth enter --remote prod-box myws --auto-deploy # skip the prompt
+berth enter --remote prod-box myws --plain       # plain SSH, no resume
+berth deploy prod-box                            # explicit one-shot deploy
 ```
 
-The shell integration provides `b NAME`, a `berth enter` wrapper, completion, and an auto-entry hook for new terminal tabs. The hook reads a terminal user variable (WezTerm / iTerm2) or the explicit `BERTH_PROJECT_HINT` env var to know which workspace the new tab should join — it never hijacks `$PWD` or `$OSC 7` for signalling, so new tabs land in the parent shell's directory as usual.
+Org-scoped workspaces (`<org>/<project>`) inherit a remote host and a
+remote-root directory from `berth org set`, so you write
+`acme/postil` once and stop repeating `--remote` and `--dir`.
 
 ## Configuration
 
-Config file: `~/.config/berth/config.yaml`, or `BERTH_CONFIG_DIR/config.yaml` when `BERTH_CONFIG_DIR` is set.
+Config lives at `$BERTH_CONFIG_DIR/config.yaml` (or
+`~/.config/berth/config.yaml`). Most fields are edit-via-CLI
+(`berth set`, `berth org set`); hand-editing the yaml is also supported.
 
-```yaml
-defaults:
-  runtime:
-    type: auto
-  idle:
-    shutdown_after_seconds: 3600
+[`examples/config.default.yaml`](./examples/config.default.yaml) is the
+fully-documented reference — every field, every default, with the
+matching CLI flag where one exists. [`examples/config.yaml`](./examples/config.yaml)
+is a worked example showing bare, podman, kubernetes-pod, remote, and
+org-scoped workspaces.
 
-workspaces:
-  myproject:
-    path: ~/projects/myproject
-    ports: [3000, 8080]
+Internals — how runtimes, deploy, the new-tab hook, and the SSH session
+protocol work — live in [ARCHITECTURE.md](./ARCHITECTURE.md). What's
+next is in [ROADMAP.md](./ROADMAP.md).
 
-  containerproject:
-    path: ~/projects/podproject
-    runtime:
-      type: podman
-      image: docker.io/library/debian:stable-slim
-      project_mount: /workspace
-      userns: keep-id
-    mounts:
-      - source: ~/.gitconfig
-        target: /home/dev/.gitconfig
-        readonly: true
-
-  bareproject:
-    path: ~/projects/bareproject
-    runtime:
-      type: bare
-
-  remoteproject:
-    path: ~/projects/remoteproject
-    remote: white-vm2
-
-  kubeproject:
-    path: ~/projects/kubeproject
-    runtime:
-      type: kubernetes-pod
-      image: docker.io/library/debian:stable-slim
-      namespace: dev
-      pod_name: berth-kubeproject
-```
-
-## Runtime Behavior
-
-Bare runtime starts the user's shell or command directly in the project directory.
-
-`runtime.type: auto` is the built-in default for local workspaces. It selects Podman when `podman` is on `PATH`; otherwise it selects bare. Set `defaults.runtime.type: bare` or a workspace `runtime.type: bare` to opt out. `berth doctor` shows the current discovery result, including Podman health, minikube profile/config detection, and Kubernetes pod defaults.
-
-Podman runtime builds a rootless `podman run` command, mounts the project directory read/write, mounts configured files/directories readonly by default, sets the container workdir, and runs the requested shell or command. Berth uses `--userns=keep-id` when the local runtime supports it; otherwise it omits the user namespace argument. Set `runtime.userns` in config to force a specific Podman user namespace mode.
-
-Kubernetes pod runtime builds `kubectl run` for `enter` and `run`, and `kubectl delete pod` for `stop` and expired-state reaping. It only contacts a cluster when those explicit commands are invoked by the user.
-
-`berth reap` scans lifecycle state and stops expired local container environments. Podman workspaces are stopped with `podman stop berth-NAME`; Kubernetes pod workspaces are deleted with `kubectl delete pod` using the configured namespace and pod name. Bare workspaces and remote entries are not reaped locally.
-
-`berth daemon` runs in the foreground and periodically invokes the same idle reaper used by `berth reap`. It does not install services, create timers, read secret-bearing environment values, or modify remote hosts. Use `--interval-seconds N` to configure the cadence and `--once` for one deterministic iteration under an external supervisor.
-
-Remote entry uses SSH and offers full per-tab independent sessions plus
-resumability on whichever host you point it at. On first `berth enter --remote <host>`,
-Berth probes the host's OS/architecture, and — if no compatible `berth` binary
-is installed there — prompts to deploy one. On accept, the matching musl-static
-binary is fetched from this project's GitHub releases (SHA256-verified), copied to
-`~/.local/bin/berth` on the remote, and the host is added to `trusted_hosts` in
-your config so future enters silently redeploy when the version drifts.
+## Development
 
 ```bash
-berth enter --remote prod-box myws            # prompts on first deploy
-berth enter --remote prod-box myws --auto-deploy   # skip the prompt
-berth enter --remote prod-box myws --no-deploy     # use legacy mux only
-berth enter --remote prod-box myws --plain         # plain SSH, no resume
-berth deploy prod-box                          # explicit one-shot deploy
+cargo build --quiet --release
+cargo test --quiet
 ```
 
-When deploy is declined or impossible (architecture outside the build matrix),
-Berth falls through to a legacy cascade — `mosh-server` → `tmux` → `screen` →
-plain shell — each tmux/screen invocation using a unique `$$-$RANDOM` session
-suffix so multi-tab usage doesn't pile into one shared session. Plain SSH
-cannot reattach to a lost interactive process unless that process was launched
-under a remote multiplexer or supervisor.
-
-## Testing
+The default `cargo test` runs the full e2e suite — including real
+podman and real kubernetes against live runtimes. Per-machine opt-outs
+live in a gitignored `.env` at the repo root (see `.env.example`):
 
 ```bash
-cargo test --quiet --lib
-cargo test --quiet --test e2e
-BERTH_REAL_PODMAN_E2E=1 cargo test --quiet --test e2e test_real_podman_workspace_run_executes_in_container
-BERTH_REAL_PODMAN_E2E=1 cargo test --quiet --test e2e test_real_podman_daemon_once_reaps_live_container
-cargo test --quiet --test e2e daemon
-cargo test --quiet --test e2e reap
+cp .env.example .env
+# uncomment BERTH_E2E_PODMAN_ENABLED=false on hosts without podman
+# uncomment BERTH_E2E_K8S_ENABLED=false on hosts without a reachable cluster
 ```
 
-The default e2e suite still includes fast fake-exec checks for command construction. The gated Podman e2e path requires `podman` on `PATH` and runs a real Alpine container to verify project and config bind mounts.
+Re-recording the README's demo asset: `bash scripts/record-demo/record.sh`.
+Needs `asciinema` and `svg-term-cli` on the host (`npm i -g svg-term-cli`),
+plus the host runtimes berth's `doctor` probes for if you want them shown
+as ready. The driver script sandboxes `$HOME` and `PATH` under a tmpdir,
+then the wrapper sed-scrubs the tmpdir prefix out of the captured cast
+before rendering — so the resulting SVG only ever shows `/home/dev/…`.
+
+## Acknowledgements
+
+Berth stands on a long line of prior art for keeping development
+sessions alive across the network and across machines.
+
+- [**mosh**](https://mosh.org/) — the original answer to "my shell
+  shouldn't die when my Wi-Fi does." Berth's session-continuity UX
+  is a direct descendant.
+- [**Eternal Terminal**](https://eternalterminal.dev/) — SSH
+  replacement with seamless reconnect; same philosophy applied to
+  full TCP transport.
+- [**tmux**](https://github.com/tmux/tmux) and
+  [**GNU Screen**](https://www.gnu.org/software/screen/) — terminal
+  multiplexers. Berth uses them as the fallback session host when a
+  remote can't run berth itself.
+- [**devcontainers**](https://containers.dev/) — the workspace-as-spec
+  pattern that prefigures berth's "named recipe → reproducible
+  environment" model.

@@ -1,0 +1,74 @@
+# Example berth configuration.
+#
+# Real config lives at $BERTH_CONFIG_DIR/config.yaml or
+# ~/.config/berth/config.yaml. Most fields are edit-via-CLI
+# (`berth set`, `berth org set`, `berth new`); hand-editing the file is
+# also supported.
+#
+# This file is illustrative — copy fragments out of it, don't deploy it
+# wholesale. Names below are placeholders, not real hosts/users.
+
+defaults:
+  runtime:
+    type: auto                       # podman if discovered, else bare
+  idle:
+    shutdown_after_seconds: 3600     # reaped by `berth reap` / daemon
+  # When the shell hook is installed, opening a new terminal tab from
+  # inside a workspace replays the same `berth enter` (workspace + dir
+  # + command argv) so the new tab "just is" the workspace. Set to
+  # false to disable replay without removing the hook from your rc.
+  new_tab_auto_entry: true
+
+# Per-org defaults. Workspace names of the form `<org>/<project>` inherit
+# `remote` and `<remote_root>/<project>` from here, so you don't have to
+# repeat the prefix on every workspace.
+orgs:
+  acme:
+    remote: dev-box.internal
+    remote_root: ~/code/acme
+
+workspaces:
+  # Bare local workspace — explicit opt-out from podman discovery.
+  webapp:
+    path: ~/code/webapp
+    ports: [3000, 8080]
+    runtime:
+      type: bare
+
+  # Containerized local workspace. Project is mounted read/write at
+  # `project_mount`; each `mounts:` entry is readonly unless flipped.
+  service:
+    path: ~/code/service
+    runtime:
+      type: podman
+      image: docker.io/library/debian:stable-slim
+      project_mount: /workspace
+      userns: keep-id
+    mounts:
+      - source: ~/.gitconfig
+        target: /home/dev/.gitconfig
+        readonly: true
+
+  # Remote workspace — `berth enter remote-svc` SSHes to dev-box and
+  # opens a resumable session there. First time, berth offers to deploy
+  # its own binary to the remote so subsequent enters use the
+  # supervised-session path.
+  remote-svc:
+    path: ~/code/remote-svc
+    remote: dev-box
+
+  # Org-scoped workspace. With `orgs.acme.remote_root` above, this
+  # resolves to `dev-box.internal:~/code/acme/cluster-tools` without
+  # repeating the prefix.
+  acme/cluster-tools:
+    path: ~/code/acme/cluster-tools
+
+  # Kubernetes-pod runtime — only contacts the cluster when berth runs
+  # `kubectl run` / `kubectl delete pod` for this workspace.
+  cluster-shell:
+    path: ~/code/cluster-shell
+    runtime:
+      type: kubernetes-pod
+      image: docker.io/library/debian:stable-slim
+      namespace: dev
+      pod_name: berth-cluster-shell

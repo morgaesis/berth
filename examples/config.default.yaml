@@ -1,0 +1,191 @@
+# Berth — fully-documented configuration reference.
+#
+# Every field berth understands lives here, with its default value and
+# the matching CLI flag where one exists. This file is the reference;
+# `examples/config.yaml` is a worked example showing only the fields a
+# real-world setup tends to touch.
+#
+# Config location: `$BERTH_CONFIG_DIR/config.yaml`, else
+# `~/.config/berth/config.yaml`. The file is YAML; JSON (`config.json`)
+# is accepted as a fallback.
+#
+# Resolution order when a workspace command runs:
+#   1. CLI argument (`--remote`, `--dir`, `--ports`, trailing `-- argv`).
+#   2. Workspace field (e.g. `workspaces.<name>.remote`).
+#   3. Org default if the workspace name is `<org>/<project>`.
+#   4. Global `defaults`.
+#   5. Auto-discovery (only for `runtime.type: auto`).
+
+# ─── Top-level ─────────────────────────────────────────────────────────
+
+# When the local berth is newer than the binary on a *trusted* remote,
+# silently redeploy before entering. Default true: trusted hosts stay
+# in lockstep with the local install. Set false to be told via the
+# version banner but never have berth touch the remote without an
+# explicit `berth deploy --force`.
+auto_update_remote: true
+
+# ─── defaults ──────────────────────────────────────────────────────────
+#
+# Inherited by every workspace that doesn't override the field.
+defaults:
+  runtime:
+    # `auto` (default): pick podman if discovered, else bare. Remote
+    # workspaces always resolve auto → bare (berth never probes a
+    # remote for runtime selection). Other values: `bare`, `podman`,
+    # `kubernetes-pod`. Sub-fields below mirror the per-workspace
+    # runtime block.
+    type: auto
+
+  # Files/dirs to bind into every containerized workspace. Empty by
+  # default. Same shape as `workspaces.<name>.mounts`.
+  mounts: []
+
+  idle:
+    # TTL after which `berth reap` / the daemon will stop the workspace's
+    # runtime. `null` (or absent) disables idle reaping. Default 3600s.
+    shutdown_after_seconds: 3600
+    # What to do when expired. `stop-runtime` (default) stops the
+    # container; `stop-host` (reserved) would stop the underlying VM.
+    action: stop-runtime
+
+  remote_options:
+    # When set, berth prefixes the workspace's working directory with
+    # this path on the remote. `null` = no prefix.
+    project_root: null
+    # How to persist the remote session when no remote berth is
+    # available. `auto` (default) picks mosh > tmux > screen >
+    # plain-shell in that order based on what's installed. Other
+    # values: `none`, `tmux`, `screen`.
+    persistent: auto
+
+  # When the shell hook is installed (`eval "$(berth shell init)"`),
+  # a new terminal tab opened from inside a berth session re-runs the
+  # last `berth enter` invocation. Set to false to disable replay even
+  # with the hook sourced. First three hook-driven entries print a
+  # one-line `↪ new-tab hook auto-entered …` reminder explaining how
+  # to disable it.
+  new_tab_auto_entry: true
+
+# ─── orgs ──────────────────────────────────────────────────────────────
+#
+# Per-org defaults. A workspace named `<org>/<project>` inherits `remote`
+# and `<remote_root>/<project>` from its org entry here, so you don't
+# repeat them on every workspace.
+#
+# CLI: `berth org set <org> --remote <host> --root <path>`,
+#      `berth org rm <org>`, `berth org list`, `berth org show <org>`.
+orgs: {}
+#   acme:
+#     remote: dev-box.internal
+#     remote_root: ~/code/acme
+
+# ─── trusted_hosts ─────────────────────────────────────────────────────
+#
+# Hosts berth has been authorized to push its own binary to. Written
+# on first successful `berth deploy <host>`. Each entry records the
+# probed OS/arch target, the deployed version, and the remote path.
+# You don't edit this by hand — `berth deploy` manages it.
+trusted_hosts: {}
+#   prod-box:
+#     target: linux-x86_64
+#     version: 0.1.13
+#     remote_path: /home/user/.local/bin/berth
+
+# ─── workspaces ────────────────────────────────────────────────────────
+#
+# Each entry under `workspaces` is a named workspace. Most fields are
+# editable via `berth set <name> --<field> <value>` or
+# `berth set <name> --clear-<field>`.
+#
+# CLI: `berth new <name> [path]`, `berth set <name> …`,
+#      `berth rm <name>`, `berth show <name>`, `berth list`.
+workspaces: {}
+#   myws:
+#     # REQUIRED. Filesystem path where berth keeps the local stash for
+#     # this workspace. Defaults to $XDG_DATA_HOME/berth/projects/<name>
+#     # when `berth new` creates the workspace without an explicit path.
+#     path: ~/.local/share/berth/projects/myws
+#
+#     # SSH host for remote entry. `null` (default) = local workspace.
+#     # Inherited from `orgs.<org>.remote` for org-scoped names.
+#     # CLI: `berth set <name> --remote <host>` / `--clear-remote`.
+#     remote: null
+#
+#     # Ports to forward when entering this workspace (and via
+#     # `berth tunnel`). `null` = no forwarding.
+#     # CLI: `--ports 3000,8080` / `--clear-ports`.
+#     ports: null
+#
+#     # Override the working directory inside the session. Allows
+#     # remote-shell expansions (`~`, `$HOME`). `null` = use the
+#     # auto-managed `path`, or org's `<remote_root>/<project>`.
+#     # CLI: `--dir <path>` / `--clear-dir`.
+#     remote_dir: null
+#
+#     # Default command for `berth enter`. When unset, the supervisor
+#     # spawns `$SHELL -l`. When set, this argv replaces the shell.
+#     # CLI: `-- <argv…>` / `--clear-command`.
+#     command: null
+#     # Example: ["bash", "-c", "cd app && claude"]
+#
+#     # Per-workspace runtime override. Same shape as `defaults.runtime`.
+#     # Unset → inherit `defaults.runtime`.
+#     runtime: null
+#
+#     # Per-workspace mounts, appended to `defaults.mounts`.
+#     mounts: []
+#     # Example:
+#     #   - source: ~/.gitconfig
+#     #     target: /home/dev/.gitconfig
+#     #     readonly: true
+#     #     required: false
+#
+#     # Per-workspace idle override. Falls back to `defaults.idle` when
+#     # `shutdown_after_seconds` is unset.
+#     idle:
+#       shutdown_after_seconds: null
+#       action: stop-runtime
+#
+#     # Per-workspace remote options. Mirrors `defaults.remote_options`.
+#     remote_options:
+#       project_root: null
+#       persistent: auto
+
+# ─── Runtime variants (reference) ──────────────────────────────────────
+#
+# `runtime.type` accepts one of:
+#
+#   type: auto
+#     # podman if discovered, else bare; remote always resolves bare
+#
+#   type: bare
+#     # plain shell or command in the working directory
+#
+#   type: podman
+#     binary: podman                                  # PATH name
+#     image: docker.io/library/debian:stable-slim     # container image
+#     pull: missing                                   # missing|always|never
+#     ephemeral: false                                # --rm
+#     project_mount: /workspace                       # bind target
+#     userns: null                                    # e.g. keep-id
+#     extra_args: []                                  # extra `podman run` flags
+#
+#   type: kubernetes-pod
+#     kubectl: kubectl                                # PATH name
+#     image: docker.io/library/debian:stable-slim
+#     namespace: null                                 # cluster namespace
+#     pod_name: null                                  # deterministic name; defaults to berth-<ws>
+#     container: null                                 # specific container in the pod
+#     project_mount: /workspace
+#     ephemeral: false                                # --rm equivalent (`kubectl delete pod` on exit)
+#     extra_args: []                                  # extra `kubectl run` flags
+
+# ─── Mount entry (reference) ───────────────────────────────────────────
+#
+# Each entry in `defaults.mounts` or `workspaces.<name>.mounts`:
+#
+#   source: ~/.gitconfig    # host path
+#   target: /home/dev/.gitconfig  # container path
+#   readonly: true          # default true
+#   required: false         # default false; if true, missing source hard-errors
