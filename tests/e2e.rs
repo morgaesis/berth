@@ -585,9 +585,7 @@ fn test_unknown_subcommand_fails_cleanly() {
     assert!(!output.status.success(), "Unknown subcommand should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("unrecognized")
-            || stderr.contains("unknown")
-            || stderr.contains("Usage:"),
+        stderr.contains("unrecognized") || stderr.contains("unknown") || stderr.contains("Usage:"),
         "expected clap-style error, got: {stderr}"
     );
 

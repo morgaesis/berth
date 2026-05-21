@@ -66,10 +66,7 @@ pub async fn run() -> Result<()> {
             runtime.image.cyan()
         );
     } else {
-        println!(
-            "Kubernetes pod defaults: {}",
-            "unavailable".dimmed()
-        );
+        println!("Kubernetes pod defaults: {}", "unavailable".dimmed());
     }
 
     Ok(())

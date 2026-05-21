@@ -365,7 +365,11 @@ enum Commands {
                       berth org show morgaesis"
     )]
     Org(OrgCommands),
-    #[command(subcommand, name = "hosts", about = "Manage /etc/hosts entries for workspaces")]
+    #[command(
+        subcommand,
+        name = "hosts",
+        about = "Manage /etc/hosts entries for workspaces"
+    )]
     Hosts(HostsCommands),
     #[command(
         subcommand,

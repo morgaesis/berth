@@ -319,9 +319,7 @@ mod tests {
         let line = build_invoke_line(&s);
         // The whole shell-injection-shaped argv element must be a
         // single shell word in the invoke line.
-        assert!(line.contains(
-            "'bash' '-ic' 'sudo -u dev bash -ic '\"'\"'cd app && assist'\"'\"''"
-        ));
+        assert!(line.contains("'bash' '-ic' 'sudo -u dev bash -ic '\"'\"'cd app && assist'\"'\"''"));
     }
 
     #[test]
