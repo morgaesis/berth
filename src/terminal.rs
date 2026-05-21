@@ -309,10 +309,10 @@ mod tests {
         let cmd = vec![
             "bash".to_string(),
             "-ic".to_string(),
-            "sudo -u paperclip bash -ic 'cd postil && codex'".to_string(),
+            "sudo -u dev bash -ic 'cd app && assist'".to_string(),
         ];
         let s = EnterSignal {
-            workspace: "morgaesis/postil",
+            workspace: "acme/app",
             dir: None,
             command: Some(&cmd),
         };
@@ -320,7 +320,7 @@ mod tests {
         // The whole shell-injection-shaped argv element must be a
         // single shell word in the invoke line.
         assert!(line.contains(
-            "'bash' '-ic' 'sudo -u paperclip bash -ic '\"'\"'cd postil && codex'\"'\"''"
+            "'bash' '-ic' 'sudo -u dev bash -ic '\"'\"'cd app && assist'\"'\"''"
         ));
     }
 

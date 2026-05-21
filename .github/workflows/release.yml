@@ -32,7 +32,10 @@ jobs:
 
       - name: E2E tests with real podman
         env:
-          BERTH_REAL_PODMAN_E2E: "1"
+          # The runner has podman (installed above) but no kubeconfig
+          # or reachable cluster. Disable the k8s e2e here; the podman
+          # half runs against the real binary by default.
+          BERTH_E2E_K8S_ENABLED: "false"
         run: cargo test --test e2e --quiet
 
   build:

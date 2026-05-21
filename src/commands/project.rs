@@ -26,21 +26,6 @@ pub async fn show(name: String) -> Result<()> {
     Ok(())
 }
 
-pub async fn list_all() -> Result<()> {
-    let config = Config::load()?;
-    if config.workspaces.is_empty() {
-        println!("(no workspaces configured)");
-        return Ok(());
-    }
-    let mut names: Vec<&String> = config.workspaces.keys().collect();
-    names.sort();
-    for name in names {
-        print_workspace(&config, name, &config.workspaces[name]);
-        println!();
-    }
-    Ok(())
-}
-
 pub async fn set(args: SetArgs) -> Result<()> {
     let mut config = Config::load()?;
     let Some(ws) = config.workspaces.get_mut(&args.name) else {

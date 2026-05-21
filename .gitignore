@@ -3,3 +3,4 @@ TODO.md
 ACTIONLOG.md
 .cache/
 tmp/
+.env

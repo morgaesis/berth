@@ -101,8 +101,40 @@ fn repo_test_dir() -> PathBuf {
     path
 }
 
+/// Real-runtime e2e runs by default. The opt-out lives in a `.env` file
+/// at the repo root (gitignored) so each contributor's machine carries
+/// its own truth — a dev box without a kubeconfig sets
+/// `BERTH_E2E_K8S_ENABLED=false` locally; a box without podman sets
+/// `BERTH_E2E_PODMAN_ENABLED=false`. CI leaves both unset and runs the
+/// full suite. See `.env.example` for the documented vars.
+fn ensure_dotenv_loaded() {
+    use std::sync::Once;
+    static LOAD: Once = Once::new();
+    LOAD.call_once(|| {
+        // dotenvy::dotenv() returns Err when no .env exists — that's the
+        // expected case on most contributor machines, not a failure.
+        let _ = dotenvy::dotenv();
+    });
+}
+
 fn real_podman_e2e_enabled() -> bool {
-    std::env::var("BERTH_REAL_PODMAN_E2E").is_ok_and(|value| value == "1")
+    ensure_dotenv_loaded();
+    !is_disabled_env("BERTH_E2E_PODMAN_ENABLED")
+}
+
+fn real_k8s_e2e_enabled() -> bool {
+    ensure_dotenv_loaded();
+    !is_disabled_env("BERTH_E2E_K8S_ENABLED")
+}
+
+fn is_disabled_env(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
 }
 
 fn podman_is_available() -> bool {
@@ -110,10 +142,6 @@ fn podman_is_available() -> bool {
         .arg("--version")
         .output()
         .is_ok_and(|output| output.status.success())
-}
-
-fn real_k8s_e2e_enabled() -> bool {
-    std::env::var("BERTH_REAL_K8S_E2E").is_ok_and(|value| value == "1")
 }
 
 fn kubectl_is_available() -> bool {
@@ -247,7 +275,7 @@ fn test_list_empty() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("No workspaces"));
+    assert!(stdout.contains("no workspaces configured"));
 }
 
 #[test]
@@ -265,7 +293,7 @@ fn test_delete_workspace() {
 
     let delete_output = ctx
         .berth()
-        .args(["delete", "delproj"])
+        .args(["rm", "delproj"])
         .output()
         .expect("Failed to delete");
     assert!(delete_output.status.success());
@@ -280,7 +308,7 @@ fn test_delete_nonexistent_fails() {
 
     let output = ctx
         .berth()
-        .args(["delete", "nonexistent"])
+        .args(["rm", "nonexistent"])
         .output()
         .expect("Failed to run delete");
 
@@ -374,9 +402,11 @@ fn test_shell_init_bash() {
     assert!(stdout.contains("_berth_detect_project"));
     assert!(stdout.contains("WEZTERM_USER_VAR_BERTH_PROJECT"));
     assert!(stdout.contains("BASH_VERSION"));
-    assert!(stdout.contains("b()"));
-    assert!(stdout.contains("berth()"));
     assert!(stdout.contains("command berth enter"));
+    // Shell shorthands (`b`, `berth` wrapper) are removed; the hook
+    // script must not redefine them anymore.
+    assert!(!stdout.contains("\nb() {"));
+    assert!(!stdout.contains("\nberth() {"));
 }
 
 #[test]
@@ -539,7 +569,7 @@ fn test_help_mentions_shell_init_eval() {
 }
 
 #[test]
-fn test_workspace_shorthand_fails_with_enter_guidance() {
+fn test_unknown_subcommand_fails_cleanly() {
     let ctx = TestContext::new();
 
     let output = ctx
@@ -548,15 +578,23 @@ fn test_workspace_shorthand_fails_with_enter_guidance() {
         .output()
         .expect("Failed to run berth newproj");
 
-    assert!(!output.status.success(), "Shorthand should be invalid");
+    // No implicit-workspace-shorthand magic anymore: clap should reject
+    // an unrecognized verb outright. We don't pin the exact phrasing
+    // (clap can adjust it across versions), just confirm the error
+    // shape — non-zero exit and a clap-style usage hint.
+    assert!(!output.status.success(), "Unknown subcommand should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("berth enter newproj"));
-    assert!(stderr.contains("eval \"$(berth shell init)\""));
+    assert!(
+        stderr.contains("unrecognized")
+            || stderr.contains("unknown")
+            || stderr.contains("Usage:"),
+        "expected clap-style error, got: {stderr}"
+    );
 
     let project_path = ctx.project_path("newproj");
     assert!(
         !project_path.exists(),
-        "Shorthand should not create a project"
+        "Unknown verb should not create a project"
     );
 }
 
@@ -835,7 +873,7 @@ fn test_full_workflow() {
 
     let delete_output = ctx
         .berth()
-        .args(["delete", "workflow"])
+        .args(["rm", "workflow"])
         .output()
         .expect("Failed to delete");
     assert!(delete_output.status.success());
@@ -856,7 +894,7 @@ fn test_no_args_shows_list() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("No workspaces") || stdout.contains("NAME"));
+    assert!(stdout.contains("no workspaces configured") || stdout.contains("NAME"));
 }
 
 #[test]
@@ -1425,12 +1463,12 @@ fn test_stop_kubernetes_pod_workspace_deletes_configured_pod() {
 #[test]
 fn test_real_podman_workspace_run_executes_in_container() {
     if !real_podman_e2e_enabled() {
-        eprintln!("skipping real podman e2e; set BERTH_REAL_PODMAN_E2E=1 to run");
+        eprintln!("skipping real podman e2e (BERTH_E2E_PODMAN_ENABLED disables it)");
         return;
     }
     assert!(
         podman_is_available(),
-        "BERTH_REAL_PODMAN_E2E=1 requires podman on PATH"
+        "podman e2e is enabled by default; install podman or set BERTH_E2E_PODMAN_ENABLED=false"
     );
 
     let ctx = TestContext::new();
@@ -1489,12 +1527,12 @@ fn test_real_podman_workspace_run_executes_in_container() {
 #[test]
 fn test_real_podman_daemon_once_reaps_live_container() {
     if !real_podman_e2e_enabled() {
-        eprintln!("skipping real podman daemon e2e; set BERTH_REAL_PODMAN_E2E=1 to run");
+        eprintln!("skipping real podman daemon e2e (BERTH_E2E_PODMAN_ENABLED disables it)");
         return;
     }
     assert!(
         podman_is_available(),
-        "BERTH_REAL_PODMAN_E2E=1 requires podman on PATH"
+        "podman e2e is enabled by default; install podman or set BERTH_E2E_PODMAN_ENABLED=false"
     );
 
     let ctx = TestContext::new();
@@ -1588,12 +1626,13 @@ fn test_real_podman_daemon_once_reaps_live_container() {
 #[test]
 fn test_real_k8s_workspace_run_executes_in_pod() {
     if !real_k8s_e2e_enabled() {
-        eprintln!("skipping real k8s e2e; set BERTH_REAL_K8S_E2E=1 to run");
+        eprintln!("skipping real k8s e2e (BERTH_E2E_K8S_ENABLED disables it)");
         return;
     }
     assert!(
         kubectl_is_available(),
-        "BERTH_REAL_K8S_E2E=1 requires kubectl on PATH"
+        "k8s e2e is enabled by default; install kubectl + a reachable cluster, \
+         or set BERTH_E2E_K8S_ENABLED=false in .env"
     );
 
     let ctx = TestContext::new();

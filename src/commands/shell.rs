@@ -26,7 +26,7 @@ impl HookShell {
 pub fn run_init(shell: Option<HookShell>) -> Result<()> {
     let shell = match shell.or_else(HookShell::from_env) {
         Some(s) => s,
-        None => bail!("could not detect shell; pass one explicitly: `berth shell-init bash|zsh`"),
+        None => bail!("could not detect shell; pass one explicitly: `berth shell init bash|zsh`"),
     };
     print!("{}", init_script(shell));
     Ok(())
@@ -37,13 +37,127 @@ pub fn run_completions(shell: Option<CompletionShell>) -> Result<()> {
         Some(s) => s,
         None => detect_completion_shell()
             .ok_or_else(|| anyhow::anyhow!(
-                "could not detect shell; pass one explicitly: `berth shell-completions bash|zsh|fish|elvish|powershell`"
+                "could not detect shell; pass one explicitly: `berth shell completions bash|zsh|fish|elvish|powershell`"
             ))?,
     };
     let mut cmd = crate::cli::Cli::command();
-    clap_complete::generate(shell, &mut cmd, "berth", &mut io::stdout());
+    let mut buf: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "berth", &mut buf);
+    let script = String::from_utf8(buf)
+        .map_err(|e| anyhow::anyhow!("completion script was not valid utf-8: {e}"))?;
+
+    let augmented = match shell {
+        CompletionShell::Zsh => augment_zsh(&script),
+        CompletionShell::Bash => augment_bash(&script),
+        _ => script,
+    };
+    use io::Write;
+    io::stdout().write_all(augmented.as_bytes())?;
     Ok(())
 }
+
+/// zsh: clap emits the workspace-name positional as `:_default`. Swap it
+/// for our `_berth_workspaces` completer, do the same for `Org name` →
+/// `_berth_orgs`, and prepend the helper function bodies.
+fn augment_zsh(stock: &str) -> String {
+    let helpers = ZSH_COMPLETER_HELPERS;
+    let mut out = String::with_capacity(stock.len() + helpers.len() + 256);
+
+    // Insert helpers immediately after the `#compdef berth` line so they're
+    // defined before _berth references them.
+    let mut lines = stock.lines();
+    if let Some(first) = lines.next() {
+        out.push_str(first);
+        out.push('\n');
+        out.push_str(helpers);
+        out.push('\n');
+    }
+    for line in lines {
+        let rewritten = rewrite_zsh_positional(line);
+        out.push_str(&rewritten);
+        out.push('\n');
+    }
+    out
+}
+
+fn rewrite_zsh_positional(line: &str) -> String {
+    // Patterns clap generates, per `cli.rs` arg help text. Match on the
+    // distinctive help-text prefix so we don't accidentally hit the Org
+    // arg of `org set / show / rm` with workspace completion.
+    if line.contains(":name -- Workspace name") && line.ends_with(":_default' \\") {
+        return line.replace(":_default' \\", ":_berth_workspaces' \\");
+    }
+    if line.contains(":name -- Org name") && line.ends_with(":_default' \\") {
+        return line.replace(":_default' \\", ":_berth_orgs' \\");
+    }
+    line.to_string()
+}
+
+const ZSH_COMPLETER_HELPERS: &str = r#"
+# berth: dynamic completers — populate workspace/org names from the binary.
+_berth_workspaces() {
+    local -a names
+    names=("${(@f)$(command berth list 2>/dev/null \
+        | awk 'NR>1 && $1 != "" && $1 !~ /^-+$/ {print $1}')}")
+    _describe -t workspaces 'workspace' names
+}
+
+_berth_orgs() {
+    local -a names
+    names=("${(@f)$(command berth org list 2>/dev/null \
+        | awk '/^[[:space:]]+[A-Za-z0-9_./-]+:$/ {sub(/:$/, "", $1); print $1}')}")
+    _describe -t orgs 'org' names
+}
+"#;
+
+/// bash: clap's `_berth` dispatches to opts-only completion at positional
+/// slots. Wrap it so that for known workspace/org positional positions we
+/// inject the right candidate set; everything else falls through to clap.
+fn augment_bash(stock: &str) -> String {
+    let wrapper = BASH_COMPLETER_WRAPPER;
+    format!("{stock}\n{wrapper}\n")
+}
+
+const BASH_COMPLETER_WRAPPER: &str = r#"
+# berth: workspace-/org-name aware wrapper around the clap-generated `_berth`.
+_berth_workspace_names() {
+    command berth list 2>/dev/null \
+        | awk 'NR>1 && $1 != "" && $1 !~ /^-+$/ {print $1}'
+}
+
+_berth_org_names() {
+    command berth org list 2>/dev/null \
+        | awk '/^[[:space:]]+[A-Za-z0-9_./-]+:$/ {sub(/:$/, "", $1); print $1}'
+}
+
+_berth_with_dynamic() {
+    # Defer to clap first so flag completion and subcommand routing still work.
+    _berth "$@"
+
+    # Only override the candidate set when the user is on a positional slot
+    # at the workspace/org-name position and the current word isn't a flag.
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    [[ "$cur" == -* ]] && return 0
+    (( COMP_CWORD < 2 )) && return 0
+    [[ -z "${COMP_WORDS[1]:-}" ]] && return 0
+
+    local top="${COMP_WORDS[1]}"
+    case "$top" in
+        enter|show|set|rm|stop|run|attach|tunnel|new|tunnel)
+            if (( COMP_CWORD == 2 )); then
+                COMPREPLY=( $(compgen -W "$(_berth_workspace_names)" -- "$cur") )
+            fi
+            ;;
+        org)
+            # `berth org {show,set,rm} <name>` — org name at COMP_CWORD == 3.
+            if (( COMP_CWORD == 3 )) && [[ "${COMP_WORDS[2]:-}" =~ ^(show|set|rm)$ ]]; then
+                COMPREPLY=( $(compgen -W "$(_berth_org_names)" -- "$cur") )
+            fi
+            ;;
+    esac
+}
+complete -F _berth_with_dynamic -o nosort -o bashdefault -o default berth
+"#;
 
 fn detect_completion_shell() -> Option<CompletionShell> {
     let shell = std::env::var("SHELL").ok()?;
@@ -69,8 +183,8 @@ fn init_script(shell: HookShell) -> String {
     format!("{common}\n{body}\n{COMMON_EPILOGUE}\n")
 }
 
-const COMMON_PRELUDE: &str = r#"# berth shell integration (cascading)
-# Generated by `berth shell-init`. Re-run after upgrading berth.
+const COMMON_PRELUDE: &str = r#"# berth shell integration: new-tab auto-entry hook
+# Generated by `berth shell init`. Re-run after upgrading berth.
 #
 # Auto-entry signal cascade for new tabs:
 #   1. WezTerm/iTerm2 user var       (pane-scoped, doesn't cross tabs yet)
@@ -204,60 +318,6 @@ _berth_cwd_heal() {
     cd "$HOME" 2>/dev/null || cd /
 }
 
-_berth_workspace_names() {
-    command berth list 2>/dev/null \
-        | awk 'NR>2 && $1!="" && $1!~/^-+$/ {print $1}'
-}
-
-# `b` is the canonical shortcut for `berth enter`. Behavior:
-#   b                  — interactive fzf picker over configured workspaces
-#   b <query>          — exact-match a workspace name; on miss, fuzzy/substring match
-#   b <query> <args…>  — pass extra args through (e.g. -- <cmd>)
-# When fzf is available it powers both the no-arg picker and fuzzy filtering;
-# otherwise we fall back to `grep -F` substring matching.
-b() {
-    local picked query
-    if [ "$#" -eq 0 ]; then
-        if command -v fzf >/dev/null 2>&1; then
-            picked=$(_berth_workspace_names | fzf --prompt='berth> ' --height=40% --reverse) || return 0
-            [ -z "$picked" ] && return 0
-            BERTH_SKIP_AUTO=1 command berth enter "$picked"
-            return $?
-        fi
-        printf 'usage: b <workspace>  (install fzf for an interactive picker)\n' >&2
-        _berth_workspace_names
-        return 1
-    fi
-    query="$1"; shift
-    # Exact match wins.
-    if _berth_workspace_names | grep -qFx -- "$query"; then
-        BERTH_SKIP_AUTO=1 command berth enter "$query" "$@"
-        return $?
-    fi
-    # Fuzzy / substring match → single canonical winner.
-    if command -v fzf >/dev/null 2>&1; then
-        picked=$(_berth_workspace_names | fzf --filter "$query" | head -n1)
-    else
-        picked=$(_berth_workspace_names | grep -F -- "$query" | head -n1)
-    fi
-    if [ -z "$picked" ]; then
-        printf 'berth: no workspace matching %q\n' "$query" >&2
-        return 1
-    fi
-    BERTH_SKIP_AUTO=1 command berth enter "$picked" "$@"
-}
-
-berth() {
-    case "${1:-}" in
-        enter)
-            shift
-            BERTH_SKIP_AUTO=1 command berth enter "$@"
-            ;;
-        *)
-            command berth "$@"
-            ;;
-    esac
-}
 "#;
 
 const BASH_HOOK: &str = r#"# bash: run detection once per interactive shell start, and self-heal

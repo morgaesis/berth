@@ -35,8 +35,20 @@ impl LocalDiscovery {
             return Self::disabled();
         }
 
-        let podman = discover_podman();
-        let kubernetes = discover_kubernetes();
+        // Podman and Kubernetes probes are independent and both shell
+        // out to slow subprocesses (`podman info`, `minikube profile
+        // list`). Run them on separate threads so the wall time is
+        // dominated by the slower of the two instead of their sum.
+        let podman_handle = std::thread::spawn(discover_podman);
+        let kubernetes_handle = std::thread::spawn(discover_kubernetes);
+
+        let podman = podman_handle
+            .join()
+            .unwrap_or_else(|_| ToolStatus::probe_panicked("podman"));
+        let kubernetes = kubernetes_handle
+            .join()
+            .unwrap_or_else(|_| KubernetesStatus::probe_panicked());
+
         let default_runtime = if podman.available && podman.healthy {
             Runtime::Podman(PodmanRuntime {
                 ephemeral: true,
@@ -78,6 +90,30 @@ impl ToolStatus {
             available: false,
             healthy: false,
             detail: "auto-discovery disabled".to_string(),
+        }
+    }
+
+    /// Fallback when the thread that ran the probe panicked. We
+    /// don't crash discovery on a thread-panic; we report the probe
+    /// as failed and let the caller render that the same way it
+    /// renders any other probe failure.
+    fn probe_panicked(binary: &str) -> Self {
+        Self {
+            binary: binary.to_string(),
+            available: false,
+            healthy: false,
+            detail: "probe thread panicked".to_string(),
+        }
+    }
+}
+
+impl KubernetesStatus {
+    fn probe_panicked() -> Self {
+        Self {
+            kubectl: ToolStatus::probe_panicked("kubectl"),
+            minikube: ToolStatus::probe_panicked("minikube"),
+            namespace: default_namespace(),
+            runtime: None,
         }
     }
 }

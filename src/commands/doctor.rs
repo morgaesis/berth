@@ -1,42 +1,42 @@
 use anyhow::Result;
 use berth::config::Runtime;
 use berth::discovery::LocalDiscovery;
+use colored::Colorize;
 use std::path::PathBuf;
 
 pub async fn run() -> Result<()> {
     let discovery = LocalDiscovery::discover();
 
-    println!("Berth shell integration");
+    println!("{}", "Berth shell integration".bold());
     let hook = check_shell_hook();
-    println!("  Detected shell: {}", hook.shell_label);
-    println!(
-        "  Hook installed: {}",
-        if hook.installed {
-            "yes"
-        } else {
-            "no — add `eval \"$(berth shell init)\"` to your rc file"
-        }
-    );
-    println!("  berth on PATH: {}", hook.path_label);
+    println!("  Detected shell: {}", hook.shell_label.cyan());
+    let hook_status = if hook.installed {
+        "yes".green().to_string()
+    } else {
+        format!(
+            "{} — add `eval \"$(berth shell init)\"` to your rc file",
+            "no".yellow()
+        )
+    };
+    println!("  Hook installed: {}", hook_status);
+    println!("  berth on PATH: {}", hook.path_label.dimmed());
     println!();
 
-    println!("Berth discovery");
-    println!("Auto-discovery: {}", enabled(discovery.auto_enabled));
+    println!("{}", "Berth discovery".bold());
+    println!("Auto-discovery: {}", enabled_label(discovery.auto_enabled));
     println!(
         "Default local runtime: {}",
-        runtime_label(&discovery.default_runtime)
+        runtime_label(&discovery.default_runtime).cyan()
     );
-    println!(
-        "Default idle shutdown: {}",
-        discovery
-            .default_idle_shutdown_seconds
-            .map(|seconds| format!("{seconds}s"))
-            .unwrap_or_else(|| "disabled".to_string())
-    );
+    let idle_label = discovery
+        .default_idle_shutdown_seconds
+        .map(|seconds| format!("{seconds}s").cyan().to_string())
+        .unwrap_or_else(|| "disabled".dimmed().to_string());
+    println!("Default idle shutdown: {idle_label}");
     println!(
         "Podman: {} ({})",
         status_label(discovery.podman.available, discovery.podman.healthy),
-        discovery.podman.detail
+        discovery.podman.detail.dimmed()
     );
     println!(
         "kubectl: {} ({})",
@@ -44,7 +44,7 @@ pub async fn run() -> Result<()> {
             discovery.kubernetes.kubectl.available,
             discovery.kubernetes.kubectl.healthy
         ),
-        discovery.kubernetes.kubectl.detail
+        discovery.kubernetes.kubectl.detail.dimmed()
     );
     println!(
         "minikube: {} ({})",
@@ -52,35 +52,42 @@ pub async fn run() -> Result<()> {
             discovery.kubernetes.minikube.available,
             discovery.kubernetes.minikube.healthy
         ),
-        discovery.kubernetes.minikube.detail
+        discovery.kubernetes.minikube.detail.dimmed()
     );
 
     if let Some(runtime) = discovery.kubernetes.runtime {
         println!(
-            "Kubernetes pod defaults: available namespace={} image={}",
-            runtime.namespace.unwrap_or_else(|| "default".to_string()),
-            runtime.image
+            "Kubernetes pod defaults: {} namespace={} image={}",
+            "available".green(),
+            runtime
+                .namespace
+                .unwrap_or_else(|| "default".to_string())
+                .cyan(),
+            runtime.image.cyan()
         );
     } else {
-        println!("Kubernetes pod defaults: unavailable");
+        println!(
+            "Kubernetes pod defaults: {}",
+            "unavailable".dimmed()
+        );
     }
 
     Ok(())
 }
 
-fn enabled(value: bool) -> &'static str {
+fn enabled_label(value: bool) -> colored::ColoredString {
     if value {
-        "enabled"
+        "enabled".green()
     } else {
-        "disabled"
+        "disabled".dimmed()
     }
 }
 
-fn status_label(available: bool, healthy: bool) -> &'static str {
+fn status_label(available: bool, healthy: bool) -> colored::ColoredString {
     match (available, healthy) {
-        (true, true) => "ready",
-        (true, false) => "available",
-        (false, _) => "missing",
+        (true, true) => "ready".green(),
+        (true, false) => "available".yellow(),
+        (false, _) => "missing".dimmed(),
     }
 }
 

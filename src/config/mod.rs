@@ -120,6 +120,16 @@ pub struct Defaults {
     pub idle: Idle,
     #[serde(default)]
     pub remote_options: RemoteOptions,
+    /// Whether the new-tab shell hook is allowed to auto-enter a
+    /// workspace when a fresh shell starts inside the marker dir. True
+    /// by default; set to false to disable replay even with the hook
+    /// installed (without having to edit your rc).
+    #[serde(default = "default_new_tab_auto_entry")]
+    pub new_tab_auto_entry: bool,
+}
+
+fn default_new_tab_auto_entry() -> bool {
+    true
 }
 
 impl Default for Defaults {
@@ -129,6 +139,7 @@ impl Default for Defaults {
             mounts: Vec::new(),
             idle: Idle::default(),
             remote_options: RemoteOptions::default(),
+            new_tab_auto_entry: default_new_tab_auto_entry(),
         }
     }
 }

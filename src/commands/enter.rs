@@ -56,6 +56,19 @@ pub async fn run(
 ) -> Result<()> {
     let mut config = Config::load()?;
 
+    // Hook-driven entries — the shell hook prefixes its invocation with
+    // BERTH_SKIP_AUTO=1 to break the auto-entry recursion. Same env var
+    // doubles as our marker that this run came from the new-tab hook
+    // rather than a direct user invocation.
+    let from_new_tab_hook = env::var_os("BERTH_SKIP_AUTO").is_some();
+    if from_new_tab_hook {
+        if !config.defaults.new_tab_auto_entry {
+            tracing::debug!("new_tab_auto_entry disabled; skipping hook-driven entry");
+            return Ok(());
+        }
+        maybe_show_new_tab_hint(&name);
+    }
+
     let workspace = if let Some(ws) = config.workspaces.get(&name) {
         ws.clone()
     } else {
@@ -106,13 +119,18 @@ pub async fn run(
     let mounts = config.merged_mounts(&workspace);
     let idle = config.merged_idle(&workspace);
 
+    // Effective working directory: CLI override > workspace.remote_dir >
+    // org root > workspace.path. Shared by local and remote entry; the
+    // remote side keeps the string verbatim (the remote shell expands ~),
+    // the local side runs it through tilde expansion so Command::current_dir
+    // sees an absolute filesystem path.
+    let effective_dir = opts
+        .dir
+        .clone()
+        .or_else(|| config.resolved_remote_dir(&name, &workspace));
+
     if let Some(host) = remote {
         let host = host.clone();
-        // Resolve effective remote dir + command (CLI > workspace > org).
-        let remote_dir = opts
-            .dir
-            .clone()
-            .or_else(|| config.resolved_remote_dir(&name, &workspace));
         let command: Option<Vec<String>> = if !opts.command.is_empty() {
             Some(opts.command.clone())
         } else {
@@ -127,7 +145,7 @@ pub async fn run(
             &runtime_config,
             &mounts,
             &opts,
-            remote_dir.as_deref(),
+            effective_dir.as_deref(),
             command.as_deref(),
         )
         .await
@@ -138,10 +156,72 @@ pub async fn run(
             runtime_name(&runtime_config),
             idle.shutdown_after_seconds,
         );
-        let result = enter_local(&name, path, &runtime_config, &mounts);
+        let local_cwd = match effective_dir.as_deref() {
+            Some(d) => expand_tilde(d),
+            None => path.to_path_buf(),
+        };
+        if !local_cwd.exists() {
+            fs::create_dir_all(&local_cwd)?;
+        }
+        let result = enter_local(&name, &local_cwd, &runtime_config, &mounts);
         let _ = berth::lifecycle_state::remove(&name, None);
         result
     }
+}
+
+/// On the first few hook-driven entries, print a single dim line so the
+/// user understands what just happened. The shell hook is silent by
+/// design — the new tab "just is" the workspace — but the first time
+/// that happens it can read like a teleport. Three reminders is enough
+/// to teach the muscle memory.
+fn maybe_show_new_tab_hint(workspace: &str) {
+    const HINT_LIMIT: u32 = 3;
+    let path = match new_tab_hint_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let shown: u32 = fs::read_to_string(&path)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    if shown >= HINT_LIMIT {
+        return;
+    }
+    eprintln!(
+        "{} new-tab hook auto-entered '{workspace}'  ({}/{HINT_LIMIT}; \
+         set `defaults.new_tab_auto_entry: false` in config or \
+         `export BERTH_SKIP_AUTO=1` to opt out)",
+        "↪".dimmed(),
+        shown + 1
+    );
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(&path, (shown + 1).to_string());
+}
+
+fn new_tab_hint_path() -> Option<std::path::PathBuf> {
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::state_dir())
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?;
+    Some(base.join("berth").join("new-tab-hint-count"))
+}
+
+/// Expand a leading `~` or `~/…` to `$HOME/…` so `Command::current_dir`
+/// receives an actual filesystem path. Bare `~user` is left alone — only
+/// the common case is handled; anything else is treated as literal.
+fn expand_tilde(dir: &str) -> std::path::PathBuf {
+    if let Some(rest) = dir.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if dir == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    std::path::PathBuf::from(dir)
 }
 
 fn enter_local(
