@@ -7,6 +7,9 @@ use tokio::time::sleep;
 
 use crate::tunnel::TunnelState;
 
+mod osc7_filter;
+mod pty_proxy;
+
 fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
@@ -136,19 +139,31 @@ pub async fn ssh_interactive_runtime_with(
         return Ok(0);
     }
 
-    tracing::info!(host = %host, "spawning ssh -tt");
-    let status = Command::new("ssh")
-        .arg("-tt")
-        // Suppress ssh's own status lines ("Shared connection ... closed",
-        // motd banners). Errors still print.
-        .arg("-o")
-        .arg("LogLevel=ERROR")
-        .arg(host)
-        .arg(enter_cmd)
-        .status()
-        .await?;
-    tracing::info!(?status, "ssh exited");
-    Ok(status.code().unwrap_or(255))
+    tracing::info!(host = %host, "spawning ssh -tt via osc7-filter wrapper");
+    // Run ssh under a local PTY pair and pipe its stdout through an
+    // OSC 7 stripper before forwarding to the user's terminal. The
+    // remote shell's `precmd`/`PROMPT_COMMAND` typically emits
+    // OSC 7 reporting its (remote) cwd; the local terminal would
+    // otherwise record that path and try to chdir into it for any
+    // new tab the user opens. Stripping the sequence at the ssh
+    // boundary keeps berth's own marker dir (emitted before the ssh
+    // child starts) authoritative for new-tab inheritance.
+    let args: Vec<String> = vec![
+        "-tt".into(),
+        // Suppress ssh's own status lines ("Shared connection …
+        // closed", motd banners). Errors still print.
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        host.to_string(),
+        enter_cmd,
+    ];
+    // The proxy is sync (portable-pty's APIs are sync); shove it onto
+    // a blocking pool so the tokio scheduler doesn't park.
+    let code = tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))??;
+    tracing::info!(code, "ssh exited");
+    Ok(code)
 }
 
 /// Convenience wrapper retained for tests; the override-aware variant
