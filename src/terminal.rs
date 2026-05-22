@@ -192,6 +192,19 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
     }
     let _ = write_secure(&last, invoke.as_bytes());
 
+    // Record exactly what we're about to put on the wire. When a new
+    // tab later fails with a chdir error pointing at *some* path, this
+    // log line answers the first question — did berth ask for that
+    // path, or did the terminal emulator come up with it on its own?
+    tracing::info!(
+        workspace = signal.workspace,
+        osc7_path = %dir.display(),
+        last_active = %last.display(),
+        has_dir_override = signal.dir.is_some(),
+        has_command_override = signal.command.is_some_and(|c| !c.is_empty()),
+        "emit_enter_signals: OSC 7 cwd marker"
+    );
+
     let mut out = io::stdout().lock();
     let safe = title_safe(signal.workspace);
 

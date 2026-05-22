@@ -129,6 +129,23 @@ pub async fn run(
         .clone()
         .or_else(|| config.resolved_remote_dir(&name, &workspace));
 
+    // Snapshot the resolved entry shape into the log. When a new-tab
+    // chdir later fails (Windows Terminal / WSL Relay inheriting some
+    // path we don't control, etc.), this is the first thing to look at:
+    //   - what was the local stash path we registered for this workspace?
+    //   - what dir are we handing to the remote?
+    //   - which host (or `local`)?
+    //   - what's this process's local $PWD when emitting OSC signals?
+    tracing::info!(
+        workspace = %name,
+        workspace_path = %workspace.path,
+        effective_dir = ?effective_dir,
+        remote = ?remote,
+        from_new_tab_hook,
+        local_pwd = ?std::env::current_dir().ok(),
+        "berth enter resolved"
+    );
+
     if let Some(host) = remote {
         let host = host.clone();
         let command: Option<Vec<String>> = if !opts.command.is_empty() {
