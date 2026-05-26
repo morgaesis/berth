@@ -16,8 +16,11 @@ use super::osc7_filter::Osc7Filter;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::sync::mpsc;
+use std::os::fd::{AsRawFd, RawFd};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc,
+};
 use std::thread;
 
 /// Run `ssh <args>` in a local PTY pair; return the ssh exit code.
@@ -54,6 +57,7 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
         .slave
         .spawn_command(cmd)
         .context("spawning ssh under the local PTY")?;
+    let mut child_killer = child.clone_killer();
     drop(pair.slave);
 
     // Put the local terminal into raw mode so keystrokes flow through
@@ -79,14 +83,13 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
     // sigwinch handler on its own thread and call resize from there.
     let master_for_resize = pair.master;
     let (winch_tx, winch_rx) = mpsc::channel::<PtySize>();
+    let mut signals = signal_hook::iterator::Signals::new([signal_hook::consts::SIGWINCH]).ok();
+    let signals_handle = signals.as_ref().map(|s| s.handle());
     let winch_thread = thread::spawn(move || {
-        use signal_hook::consts::SIGWINCH;
-        use signal_hook::iterator::Signals;
-        let mut signals = match Signals::new([SIGWINCH]) {
-            Ok(s) => s,
-            Err(_) => return,
+        let Some(mut signals) = signals.take() else {
+            return;
         };
-        for _ in &mut signals {
+        for _ in signals.forever() {
             let (cols, rows) = current_terminal_size(stdout_fd);
             let sz = PtySize {
                 rows,
@@ -105,22 +108,32 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
         }
     });
 
-    // stdin -> pty.master
-    let stdin_thread = thread::spawn(move || {
-        let mut stdin = std::io::stdin();
-        let mut buf = [0u8; 4096];
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if master_writer.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = master_writer.flush();
-                }
-                Err(_) => break,
+    let helper_shutdown = Arc::new(AtomicBool::new(false));
+    let forced_reconnect = Arc::new(AtomicBool::new(false));
+    let watchdog_shutdown = helper_shutdown.clone();
+    let watchdog_forced_reconnect = forced_reconnect.clone();
+    let suspend_watchdog_thread = thread::spawn(move || {
+        let mut last = std::time::SystemTime::now();
+        while !watchdog_shutdown.load(Ordering::Acquire) {
+            thread::sleep(std::time::Duration::from_millis(500));
+            let now = std::time::SystemTime::now();
+            let gap = now
+                .duration_since(last)
+                .unwrap_or_else(|_| std::time::Duration::from_secs(0));
+            if gap > std::time::Duration::from_secs(10) {
+                watchdog_forced_reconnect.store(true, Ordering::Release);
+                let _ = child_killer.kill();
+                break;
             }
+            last = now;
         }
+    });
+
+    // stdin -> pty.master
+    let stdin_shutdown_for_thread = helper_shutdown.clone();
+    let stdin_thread = thread::spawn(move || {
+        let _ =
+            forward_stdin_until_shutdown(stdin_fd, &mut master_writer, &stdin_shutdown_for_thread);
     });
 
     // pty.master -> OSC 7 filter -> stdout
@@ -144,18 +157,73 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
 
     // Wait for ssh to exit.
     let status = child.wait().context("waiting for ssh child")?;
-    let exit_code = status.exit_code() as i32;
+    let exit_code = if forced_reconnect.load(Ordering::Acquire) {
+        255
+    } else {
+        status.exit_code() as i32
+    };
 
-    // Reader thread will exit when the PTY master sees EOF on the
-    // slave side (which happens when ssh exits). Stdin thread is
-    // best-effort: a pending blocking read on fd 0 keeps it alive
-    // until the user hits a key, so we don't wait for it.
-    drop(reader_thread);
-    drop(stdin_thread);
-    drop(winch_thread);
-    drop(resize_thread);
+    // Stop helper threads before returning. Leaving an old stdin
+    // thread blocked on fd 0 across the reconnect loop creates
+    // multiple readers racing for keystrokes.
+    helper_shutdown.store(true, Ordering::Release);
+    if let Some(handle) = signals_handle {
+        handle.close();
+    }
+
+    let _ = stdin_thread.join();
+    let _ = suspend_watchdog_thread.join();
+    let _ = reader_thread.join();
+    let _ = winch_thread.join();
+    let _ = resize_thread.join();
 
     Ok(exit_code)
+}
+
+fn forward_stdin_until_shutdown<W: Write>(
+    stdin_fd: RawFd,
+    writer: &mut W,
+    shutdown: &AtomicBool,
+) -> std::io::Result<()> {
+    let mut buf = [0u8; 4096];
+    while !shutdown.load(Ordering::Acquire) {
+        let mut fds = [libc::pollfd {
+            fd: stdin_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 100) };
+        if rc == 0 {
+            continue;
+        }
+        if rc < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n = unsafe { libc::read(stdin_fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n == 0 {
+                break;
+            }
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            writer.write_all(&buf[..n as usize])?;
+            writer.flush()?;
+            continue;
+        }
+        if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn current_terminal_size(stdout_fd: i32) -> (u16, u16) {
@@ -235,5 +303,30 @@ impl Drop for RawTtyGuard {
             SetArg::TCSANOW,
             &self.original,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_forwarder_drains_pipe_before_hup() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+        let payload = b"typed-before-close";
+
+        let written = unsafe { libc::write(write_fd, payload.as_ptr().cast(), payload.len()) };
+        assert_eq!(written, payload.len() as isize);
+        assert_eq!(unsafe { libc::close(write_fd) }, 0);
+
+        let shutdown = AtomicBool::new(false);
+        let mut out = Vec::new();
+        forward_stdin_until_shutdown(read_fd, &mut out, &shutdown).expect("forward stdin");
+        assert_eq!(unsafe { libc::close(read_fd) }, 0);
+
+        assert_eq!(out, payload);
     }
 }

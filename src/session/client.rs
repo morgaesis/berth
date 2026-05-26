@@ -34,6 +34,19 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
     p
 }
 
+pub fn session_activity_time(socket_path: &Path) -> Option<std::time::SystemTime> {
+    lock_path_for(socket_path)
+        .metadata()
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .or_else(|| {
+            socket_path
+                .metadata()
+                .ok()
+                .and_then(|meta| meta.modified().ok())
+        })
+}
+
 /// Probe whether a session is currently attached, without disturbing
 /// it. Returns true if no client holds the flock; false if held.
 /// Used by `attach --resume-or-new` to skip busy sessions.
@@ -73,7 +86,12 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
         .open(&lock_path)
         .with_context(|| format!("opening session lock {}", lock_path.display()))?;
     match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-        Ok(lock) => {
+        Ok(mut lock) => {
+            let _ = lock.set_len(0);
+            let _ = std::io::Write::write_all(
+                &mut *lock,
+                format!("pid={} attached\n", std::process::id()).as_bytes(),
+            );
             // Leak into a heap allocation so it stays alive (and the
             // kernel keeps holding the flock) until process exit.
             Box::leak(Box::new(lock));

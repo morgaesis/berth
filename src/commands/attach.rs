@@ -58,7 +58,7 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
 /// supervisor instead. If none exist at all, also spawn fresh.
 async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
     let sessions = session::list_sessions(&workspace)?;
-    let live: Vec<String> = sessions
+    let mut live: Vec<String> = sessions
         .into_iter()
         .filter(|id| {
             session::session_socket(&workspace, id)
@@ -66,6 +66,11 @@ async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
                 .unwrap_or(false)
         })
         .collect();
+    live.sort_by(|a, b| {
+        session_mtime(&workspace, b)
+            .cmp(&session_mtime(&workspace, a))
+            .then_with(|| a.cmp(b))
+    });
     for id in &live {
         let socket = session::session_socket(&workspace, id)?;
         if session::client::is_session_free(&socket) {
@@ -76,6 +81,12 @@ async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
     // sibling tab is attached). Honor the user's intent to be in this
     // workspace by spawning a new supervisor for them.
     start_fresh(workspace, command).await
+}
+
+fn session_mtime(workspace: &str, id: &str) -> Option<std::time::SystemTime> {
+    session::session_socket(workspace, id)
+        .ok()
+        .and_then(|path| session::client::session_activity_time(&path))
 }
 
 async fn run_supervisor(

@@ -62,10 +62,10 @@ pub async fn ssh_interactive(host: &str, workspace_name: &str, ensure_dir: bool)
         )
     };
 
-    let status = Command::new("ssh")
-        .arg("-tt")
-        .arg("-o")
-        .arg("LogLevel=ERROR")
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-tt");
+    add_interactive_ssh_options(&mut cmd);
+    let status = cmd
         .arg(host)
         .arg(&ensure_cmd)
         .arg("&&")
@@ -148,15 +148,10 @@ pub async fn ssh_interactive_runtime_with(
     // new tab the user opens. Stripping the sequence at the ssh
     // boundary keeps berth's own marker dir (emitted before the ssh
     // child starts) authoritative for new-tab inheritance.
-    let args: Vec<String> = vec![
-        "-tt".into(),
-        // Suppress ssh's own status lines ("Shared connection …
-        // closed", motd banners). Errors still print.
-        "-o".into(),
-        "LogLevel=ERROR".into(),
-        host.to_string(),
-        enter_cmd,
-    ];
+    let mut args: Vec<String> = vec!["-tt".into()];
+    push_interactive_ssh_options(&mut args);
+    args.push(host.to_string());
+    args.push(enter_cmd);
     // The proxy is sync (portable-pty's APIs are sync); shove it onto
     // a blocking pool so the tokio scheduler doesn't park.
     let code = tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
@@ -164,6 +159,21 @@ pub async fn ssh_interactive_runtime_with(
         .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))??;
     tracing::info!(code, "ssh exited");
     Ok(code)
+}
+
+fn push_interactive_ssh_options(args: &mut Vec<String>) {
+    // Suppress ssh's own status lines ("Shared connection closed",
+    // motd banners). Errors still print.
+    args.extend(["-o".into(), "LogLevel=ERROR".into()]);
+    // Make transport loss visible to the reconnect loop promptly.
+    args.extend(["-o".into(), "ServerAliveInterval=5".into()]);
+    args.extend(["-o".into(), "ServerAliveCountMax=2".into()]);
+}
+
+fn add_interactive_ssh_options(cmd: &mut Command) {
+    let mut args = Vec::new();
+    push_interactive_ssh_options(&mut args);
+    cmd.args(args);
 }
 
 /// Convenience wrapper retained for tests; the override-aware variant
