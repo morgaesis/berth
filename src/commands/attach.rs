@@ -258,7 +258,9 @@ fn list_sessions(workspace: &str, all: bool, long: bool) -> Result<i32> {
     if !all && !long {
         let sessions = session::list_sessions(workspace)?;
         if sessions.is_empty() {
-            println!("(no sessions for workspace '{workspace}')");
+            println!(
+                "(no active sessions for workspace '{workspace}'; use `berth attach --list --all --long {workspace}` to include exited session logs)"
+            );
         } else {
             for id in sessions {
                 println!("{id}");
@@ -269,7 +271,13 @@ fn list_sessions(workspace: &str, all: bool, long: bool) -> Result<i32> {
 
     let sessions = session_inventory(workspace, all)?;
     if sessions.is_empty() {
-        println!("(no sessions for workspace '{workspace}')");
+        if all {
+            println!("(no sessions for workspace '{workspace}')");
+        } else {
+            println!(
+                "(no active sessions for workspace '{workspace}'; use `berth attach --list --all --long {workspace}` to include exited session logs)"
+            );
+        }
     } else {
         println!(
             "{:<14}  {:<7}  {:<8}  {:<3}  UPDATED",

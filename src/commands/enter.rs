@@ -47,7 +47,7 @@ pub async fn run(
     name: String,
     remote_override: Option<String>,
     ports_override: Vec<u16>,
-    opts: EnterOptions,
+    mut opts: EnterOptions,
 ) -> Result<()> {
     let mut config = Config::load()?;
 
@@ -60,6 +60,11 @@ pub async fn run(
             tracing::debug!("new_tab_auto_entry disabled; skipping hook-driven entry");
             return Ok(());
         }
+        // Hook-triggered entry is an opportunistic new-tab convenience,
+        // not an explicit user command. It must not sit in a reconnect
+        // loop, deploy prompt, or SSH key prompt after a network flap.
+        opts.no_reconnect = true;
+        opts.no_deploy = true;
         maybe_show_new_tab_hint(&name);
     }
 
@@ -153,7 +158,9 @@ pub async fn run(
             runtime_name(&runtime_config),
             idle.shutdown_after_seconds,
         );
-        refresh_remote_session_statuses(&config, &host).await;
+        if !from_new_tab_hook {
+            refresh_remote_session_statuses(&config, &host).await;
+        }
         ensure_remote_ready(&mut config, &host, &opts).await?;
         let result = enter_remote(
             name,
@@ -167,7 +174,9 @@ pub async fn run(
             command.as_deref(),
         )
         .await;
-        refresh_remote_session_statuses(&config, &host).await;
+        if !from_new_tab_hook {
+            refresh_remote_session_statuses(&config, &host).await;
+        }
         result
     } else {
         let _ = berth::lifecycle_state::touch(
@@ -414,6 +423,7 @@ async fn enter_remote(
                     backoff_ms,
                     "remote ssh transport lost; reconnecting"
                 );
+                restore_terminal_modes_for_status();
                 if attempt == 1 {
                     eprintln!(
                         "{} connection lost; reconnecting…  (Ctrl+C to abort)",
@@ -424,7 +434,6 @@ async fn enter_remote(
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                repaint_before_reconnect();
                 continue;
             }
             _ => break code,
@@ -441,11 +450,20 @@ async fn enter_remote(
     Ok(())
 }
 
-fn repaint_before_reconnect() {
-    if std::io::stderr().is_terminal() {
-        print!("\x1b[!p\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
+fn restore_terminal_modes_for_status() {
+    if !std::io::stderr().is_terminal() {
+        return;
     }
+    print!("{}", terminal_status_restore_sequence());
+    let _ = std::io::stdout().flush();
+}
+
+fn terminal_status_restore_sequence() -> &'static str {
+    // Leave alternate screen, show cursor, disable common mouse modes
+    // and bracketed paste, reset styling, then start the status on a
+    // fresh line. Avoid RIS/full clear so scrollback and prompt context
+    // survive reconnect churn.
+    "\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?2004l\x1b[0m\r\n"
 }
 
 fn podman_enter_spec(
@@ -731,5 +749,21 @@ impl<T> ContextHardFail<T> for Result<T> {
                  • run `berth deploy {host}` interactively to inspect the failure"
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::terminal_status_restore_sequence;
+
+    #[test]
+    fn reconnect_status_restore_does_not_clear_scrollback() {
+        let seq = terminal_status_restore_sequence();
+
+        assert!(seq.contains("\x1b[?1049l"));
+        assert!(seq.contains("\x1b[?25h"));
+        assert!(seq.contains("\x1b[?2004l"));
+        assert!(!seq.contains("\x1b[2J"));
+        assert!(!seq.contains("\x1b[!p"));
     }
 }

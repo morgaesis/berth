@@ -658,7 +658,8 @@ fn test_attach_list_empty_workspace_succeeds() {
         output
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("no sessions"));
+    assert!(stdout.contains("no active sessions"));
+    assert!(stdout.contains("--all --long"));
 }
 
 #[test]

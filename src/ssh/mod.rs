@@ -14,6 +14,10 @@ fn skip_ssh() -> bool {
     env::var("BERTH_SKIP_SSH").is_ok()
 }
 
+fn hook_auto_entry() -> bool {
+    env::var_os("BERTH_FROM_HOOK").is_some()
+}
+
 fn remote_projects_path() -> &'static str {
     "$HOME/.local/share/berth/projects"
 }
@@ -147,7 +151,7 @@ pub async fn ssh_interactive_runtime_with(
     // boundary keeps berth's own marker dir (emitted before the ssh
     // child starts) authoritative for new-tab inheritance.
     let mut args: Vec<String> = vec!["-tt".into()];
-    push_interactive_ssh_options(&mut args);
+    push_interactive_ssh_options(&mut args, hook_auto_entry());
     args.push(host.to_string());
     args.push(enter_cmd);
     // The proxy is sync (portable-pty's APIs are sync); shove it onto
@@ -215,7 +219,7 @@ pub async fn ssh_attach_remote(
         return Ok(0);
     }
     let mut args: Vec<String> = vec!["-tt".into()];
-    push_interactive_ssh_options(&mut args);
+    push_interactive_ssh_options(&mut args, hook_auto_entry());
     args.push(host.to_string());
     args.push(remote);
     tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
@@ -223,18 +227,24 @@ pub async fn ssh_attach_remote(
         .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))?
 }
 
-fn push_interactive_ssh_options(args: &mut Vec<String>) {
+fn push_interactive_ssh_options(args: &mut Vec<String>, noninteractive: bool) {
     // Suppress ssh's own status lines ("Shared connection closed",
     // motd banners). Errors still print.
     args.extend(["-o".into(), "LogLevel=ERROR".into()]);
     // Make transport loss visible to the reconnect loop promptly.
     args.extend(["-o".into(), "ServerAliveInterval=5".into()]);
     args.extend(["-o".into(), "ServerAliveCountMax=2".into()]);
+    // New-tab auto-entry is best-effort. If the SSH agent/key is not
+    // ready after resume, fail cleanly instead of surprising the user
+    // with a passphrase prompt in a terminal they did not command.
+    if noninteractive {
+        args.extend(["-o".into(), "BatchMode=yes".into()]);
+    }
 }
 
 fn add_interactive_ssh_options(cmd: &mut Command) {
     let mut args = Vec::new();
-    push_interactive_ssh_options(&mut args);
+    push_interactive_ssh_options(&mut args, hook_auto_entry());
     cmd.args(args);
 }
 
@@ -458,20 +468,7 @@ pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<
         }
     }
 
-    let mut args = vec![
-        "-N".to_string(),
-        "-f".to_string(),
-        "-o".to_string(),
-        "ServerAliveInterval=60".to_string(),
-        "-o".to_string(),
-        "ServerAliveCountMax=3".to_string(),
-    ];
-
-    for port in ports {
-        args.push(format!("-L {}:localhost:{}", port, port));
-    }
-    args.push(host.to_string());
-
+    let args = tunnel_ssh_args(host, ports, hook_auto_entry());
     let result = process::Command::new("ssh").args(&args).spawn();
 
     match result {
@@ -487,6 +484,26 @@ pub async fn start_tunnel(host: &str, workspace: &str, ports: &[u16]) -> Result<
             anyhow::bail!("Failed to start tunnel: {}", e);
         }
     }
+}
+
+fn tunnel_ssh_args(host: &str, ports: &[u16], noninteractive: bool) -> Vec<String> {
+    let mut args = vec![
+        "-N".to_string(),
+        "-f".to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=60".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=3".to_string(),
+    ];
+    if noninteractive {
+        args.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
+    }
+
+    for port in ports {
+        args.push(format!("-L {}:localhost:{}", port, port));
+    }
+    args.push(host.to_string());
+    args
 }
 
 pub fn stop_tunnel(workspace: &str, port: u16) -> Result<()> {
@@ -641,5 +658,29 @@ mod tests {
         // so multi-tab tmux/screen sessions don't collide. The prefix is
         // quoted; $$ and $RANDOM are not, so the remote shell expands them.
         assert!(command.contains("'berth-team-work'-$$-$RANDOM"));
+    }
+
+    #[test]
+    fn hook_auto_entry_ssh_options_are_noninteractive() {
+        let mut args = Vec::new();
+        push_interactive_ssh_options(&mut args, true);
+
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+    }
+
+    #[test]
+    fn explicit_ssh_options_can_prompt() {
+        let mut args = Vec::new();
+        push_interactive_ssh_options(&mut args, false);
+
+        assert!(!args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+    }
+
+    #[test]
+    fn hook_auto_entry_tunnel_options_are_noninteractive() {
+        let mut args = tunnel_ssh_args("host", &[8080], true);
+
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert_eq!(args.pop().as_deref(), Some("host"));
     }
 }

@@ -3,6 +3,7 @@ pub mod kubernetes;
 pub mod podman;
 
 use std::collections::BTreeMap;
+#[cfg(debug_assertions)]
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
