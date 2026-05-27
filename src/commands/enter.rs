@@ -19,10 +19,6 @@ pub struct EnterOptions {
     pub auto_deploy: bool,
     /// `--no-deploy`: never push; fall through to legacy mux or fail.
     pub no_deploy: bool,
-    /// `--new`: retained for compatibility; `enter` already creates a
-    /// fresh session per invocation and only reattaches to that same
-    /// generated session while its reconnect loop is running.
-    pub force_new: bool,
     /// `--no-reconnect`: when SSH exits with status 255 (network
     /// dropped), bail instead of automatically retrying. Default is
     /// to silently reconnect until the network comes back or the user
@@ -198,9 +194,8 @@ async fn refresh_remote_session_statuses(config: &Config, host: &str) {
     let workspaces: Vec<String> = config
         .workspaces
         .iter()
-        .filter_map(|(name, ws)| {
-            (config.resolved_remote(name, ws).as_deref() == Some(host)).then(|| name.clone())
-        })
+        .filter(|(name, ws)| config.resolved_remote(name, ws).as_deref() == Some(host))
+        .map(|(name, _)| name.clone())
         .collect();
     if workspaces.is_empty() {
         return;
@@ -402,7 +397,6 @@ async fn enter_remote(
             let overrides = ssh::RemoteEnterOverrides {
                 remote_dir,
                 command,
-                force_new: opts.force_new,
                 session_id: Some(&session_id),
             };
             ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
@@ -414,6 +408,13 @@ async fn enter_remote(
                 // Connection lost. Quiet first retry (covers the common
                 // case of a brief blip — back in <1s), louder if it
                 // takes longer.
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    attempt,
+                    backoff_ms,
+                    "remote ssh transport lost; reconnecting"
+                );
                 if attempt == 1 {
                     eprintln!(
                         "{} connection lost; reconnecting…  (Ctrl+C to abort)",
@@ -435,6 +436,7 @@ async fn enter_remote(
     tracing::info!("emitted exit signals");
 
     if final_code != 0 {
+        tracing::error!(workspace = %name, host, final_code, "remote session exited with error");
         anyhow::bail!("remote exited with status {final_code}");
     }
     Ok(())

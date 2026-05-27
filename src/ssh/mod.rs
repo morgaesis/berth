@@ -85,10 +85,6 @@ pub struct RemoteEnterOverrides<'a> {
     /// Workspace-supplied default command argv. Forwarded to the remote
     /// `berth attach` cascade arm as trailing `-- <argv...>`.
     pub command: Option<&'a [String]>,
-    /// Retained for callers that explicitly request `--new`; normal
-    /// `enter` also passes a generated session id so reconnects in one
-    /// invocation return to that specific session.
-    pub force_new: bool,
     pub session_id: Option<&'a str>,
 }
 
@@ -129,7 +125,6 @@ pub async fn ssh_interactive_runtime_with(
         runtime,
         mounts,
         overrides.command,
-        overrides.force_new,
         overrides.session_id,
         Some(config.detach_key_env_value().as_str()),
     );
@@ -258,7 +253,6 @@ fn remote_enter_command(
         runtime,
         mounts,
         None,
-        false,
         None,
         None,
     )
@@ -276,7 +270,6 @@ fn remote_enter_command_with(
     runtime: &Runtime,
     mounts: &[Mount],
     workspace_command: Option<&[String]>,
-    force_new: bool,
     session_id: Option<&str>,
     detach_key: Option<&str>,
 ) -> String {
@@ -336,8 +329,6 @@ fn remote_enter_command_with(
     // $SHELL -l".
     let attach_verb = if let Some(id) = session_id {
         format!("--new --session {}", shell_escape_arg(id))
-    } else if force_new {
-        "--new".to_string()
     } else {
         "--new".to_string()
     };

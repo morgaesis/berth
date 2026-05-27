@@ -403,13 +403,22 @@ enum Commands {
                       supervisor logs (which capture the PTY child's stdout+stderr — \
                       this is where a failed shell command's error text ends up).\n\n\
                       Useful for sharing state back to an AI agent or coworker when \
-                      something hangs or errors unexpectedly."
+                      something hangs or errors unexpectedly.\n\n\
+                      Examples:\n  \
+                      berth logs --level warn\n  \
+                      berth logs --follow --level warn"
     )]
     Logs {
         #[arg(short = 'n', long = "lines", help = "Tail length (default 200)")]
         lines: Option<usize>,
-        #[arg(long = "follow", help = "Follow new log lines (not yet implemented)")]
+        #[arg(long = "follow", help = "Follow new log lines")]
         follow: bool,
+        #[arg(
+            long = "level",
+            value_parser = ["trace", "debug", "info", "warn", "error"],
+            help = "Only show log lines at this level or higher"
+        )]
+        level: Option<String>,
         #[arg(
             long = "sessions",
             help = "Always include per-session supervisor logs even with -n"
@@ -614,7 +623,7 @@ impl Cli {
                     plain,
                     auto_deploy,
                     no_deploy,
-                    new,
+                    new: _,
                     no_reconnect,
                     command,
                 } => {
@@ -627,7 +636,6 @@ impl Cli {
                         plain,
                         auto_deploy,
                         no_deploy,
-                        force_new: new,
                         no_reconnect,
                         dir,
                         command,
@@ -717,8 +725,9 @@ impl Cli {
                 Commands::Logs {
                     lines,
                     follow,
+                    level,
                     sessions,
-                } => commands::logs::run(lines, follow, sessions).await,
+                } => commands::logs::run(lines, follow, sessions, level.as_deref()).await,
                 Commands::Doctor => commands::doctor::run().await,
                 Commands::Daemon {
                     interval_seconds,
