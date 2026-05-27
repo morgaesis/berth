@@ -13,6 +13,7 @@
 //! shell's behaviour is irrelevant.
 
 use super::osc7_filter::Osc7Filter;
+use crate::config::Config;
 use anyhow::{Context, Result};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
@@ -27,6 +28,7 @@ use std::thread;
 /// OSC 7 sequences in the ssh stdout stream are stripped before
 /// reaching the user's terminal.
 pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
+    let detach_key = Config::load()?.detach_key_bytes()?;
     let stdin_fd = std::io::stdin().as_raw_fd();
     let stdout_fd = std::io::stdout().as_raw_fd();
     let (cols, rows) = current_terminal_size(stdout_fd);
@@ -110,6 +112,7 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
 
     let helper_shutdown = Arc::new(AtomicBool::new(false));
     let forced_reconnect = Arc::new(AtomicBool::new(false));
+    let detach_requested = Arc::new(AtomicBool::new(false));
     let watchdog_shutdown = helper_shutdown.clone();
     let watchdog_forced_reconnect = forced_reconnect.clone();
     let suspend_watchdog_thread = thread::spawn(move || {
@@ -131,9 +134,19 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
 
     // stdin -> pty.master
     let stdin_shutdown_for_thread = helper_shutdown.clone();
+    let stdin_detach_requested = detach_requested.clone();
     let stdin_thread = thread::spawn(move || {
-        let _ =
-            forward_stdin_until_shutdown(stdin_fd, &mut master_writer, &stdin_shutdown_for_thread);
+        match forward_stdin_until_shutdown(
+            stdin_fd,
+            &mut master_writer,
+            &stdin_shutdown_for_thread,
+            detach_key.as_deref(),
+        ) {
+            Ok(StdinForwardOutcome::Detached) => {
+                stdin_detach_requested.store(true, Ordering::Release);
+            }
+            Ok(StdinForwardOutcome::Closed) | Err(_) => {}
+        }
     });
 
     // pty.master -> OSC 7 filter -> stdout
@@ -156,13 +169,53 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
     });
 
     // Wait for ssh to exit.
-    let status = child.wait().context("waiting for ssh child")?;
-    let exit_code = if forced_reconnect.load(Ordering::Acquire) {
-        255
-    } else {
-        status.exit_code() as i32
-    };
+    while !detach_requested.load(Ordering::Acquire) {
+        if let Some(status) = child.try_wait().context("polling ssh child")? {
+            let exit_code = if forced_reconnect.load(Ordering::Acquire) {
+                255
+            } else {
+                status.exit_code() as i32
+            };
+            return finish_ssh_proxy(
+                exit_code,
+                helper_shutdown,
+                signals_handle,
+                stdin_thread,
+                suspend_watchdog_thread,
+                reader_thread,
+                winch_thread,
+                resize_thread,
+            );
+        }
+        thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let exit_code = 0;
 
+    finish_ssh_proxy(
+        exit_code,
+        helper_shutdown,
+        signals_handle,
+        stdin_thread,
+        suspend_watchdog_thread,
+        reader_thread,
+        winch_thread,
+        resize_thread,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_ssh_proxy(
+    exit_code: i32,
+    helper_shutdown: Arc<AtomicBool>,
+    signals_handle: Option<signal_hook::iterator::Handle>,
+    stdin_thread: thread::JoinHandle<()>,
+    suspend_watchdog_thread: thread::JoinHandle<()>,
+    reader_thread: thread::JoinHandle<()>,
+    winch_thread: thread::JoinHandle<()>,
+    resize_thread: thread::JoinHandle<()>,
+) -> Result<i32> {
     // Stop helper threads before returning. Leaving an old stdin
     // thread blocked on fd 0 across the reconnect loop creates
     // multiple readers racing for keystrokes.
@@ -180,12 +233,19 @@ pub fn ssh_through_filter(args: &[String]) -> Result<i32> {
     Ok(exit_code)
 }
 
+enum StdinForwardOutcome {
+    Closed,
+    Detached,
+}
+
 fn forward_stdin_until_shutdown<W: Write>(
     stdin_fd: RawFd,
     writer: &mut W,
     shutdown: &AtomicBool,
-) -> std::io::Result<()> {
+    detach_key: Option<&[u8]>,
+) -> std::io::Result<StdinForwardOutcome> {
     let mut buf = [0u8; 4096];
+    let mut matcher = DetachMatcher::new(detach_key);
     while !shutdown.load(Ordering::Acquire) {
         let mut fds = [libc::pollfd {
             fd: stdin_fd,
@@ -215,15 +275,67 @@ fn forward_stdin_until_shutdown<W: Write>(
                 }
                 return Err(err);
             }
-            writer.write_all(&buf[..n as usize])?;
-            writer.flush()?;
+            let chunk = &buf[..n as usize];
+            match matcher.filter(chunk) {
+                DetachFilterResult::Forward(bytes) => {
+                    if !bytes.is_empty() {
+                        writer.write_all(&bytes)?;
+                        writer.flush()?;
+                    }
+                }
+                DetachFilterResult::Detached(bytes) => {
+                    if !bytes.is_empty() {
+                        writer.write_all(&bytes)?;
+                        writer.flush()?;
+                    }
+                    return Ok(StdinForwardOutcome::Detached);
+                }
+            }
             continue;
         }
         if fds[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
             break;
         }
     }
-    Ok(())
+    Ok(StdinForwardOutcome::Closed)
+}
+
+enum DetachFilterResult {
+    Forward(Vec<u8>),
+    Detached(Vec<u8>),
+}
+
+struct DetachMatcher<'a> {
+    key: Option<&'a [u8]>,
+    pending: Vec<u8>,
+}
+
+impl<'a> DetachMatcher<'a> {
+    fn new(key: Option<&'a [u8]>) -> Self {
+        Self {
+            key: key.filter(|k| !k.is_empty()),
+            pending: Vec::new(),
+        }
+    }
+
+    fn filter(&mut self, bytes: &[u8]) -> DetachFilterResult {
+        let Some(key) = self.key else {
+            return DetachFilterResult::Forward(bytes.to_vec());
+        };
+        let mut out = Vec::with_capacity(self.pending.len() + bytes.len());
+        for &byte in bytes {
+            self.pending.push(byte);
+            if self.pending == key {
+                return DetachFilterResult::Detached(out);
+            }
+            if key.starts_with(&self.pending) {
+                continue;
+            }
+            out.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        DetachFilterResult::Forward(out)
+    }
 }
 
 fn current_terminal_size(stdout_fd: i32) -> (u16, u16) {
@@ -324,9 +436,18 @@ mod tests {
 
         let shutdown = AtomicBool::new(false);
         let mut out = Vec::new();
-        forward_stdin_until_shutdown(read_fd, &mut out, &shutdown).expect("forward stdin");
+        forward_stdin_until_shutdown(read_fd, &mut out, &shutdown, None).expect("forward stdin");
         assert_eq!(unsafe { libc::close(read_fd) }, 0);
 
         assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn detach_matcher_strips_detach_key_and_keeps_prior_bytes() {
+        let mut matcher = DetachMatcher::new(Some(&[0x1d]));
+        match matcher.filter(b"abc\x1dignored") {
+            DetachFilterResult::Detached(bytes) => assert_eq!(bytes, b"abc"),
+            DetachFilterResult::Forward(_) => panic!("expected detach"),
+        }
     }
 }

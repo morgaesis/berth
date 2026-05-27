@@ -4,9 +4,9 @@ Berth gives you named workspaces — local or remote — and one command to
 land in them: `berth enter <name>`.
 
 - **Session continuity, no failed SSH.** Close the laptop, hit a tunnel,
-  the VPN flaps — the session keeps running on the far side and the
-  next `berth enter` quietly reattaches. Scrollback, the half-typed
-  sudo prompt, your AI assistant mid-thought — all still there.
+  the VPN flaps — the current `berth enter` invocation reconnects to
+  the same far-side session until you detach or exit it. Later,
+  `berth attach` is the explicit way back to an existing session.
 - **New tab → new session, fully configured.** Workspaces can carry a
   multi-stage entry command — e.g.
   `berth enter my-project -- bash -c "sudo -u dev bash -ic 'cd app && claude'"`.
@@ -63,8 +63,8 @@ berth doctor                                  # local runtime + hook status
 
 Remote workspaces work the same. `berth enter --remote <host> <name>` probes
 the host, offers a one-time binary deploy when there's no compatible berth
-on the other side, and from then on every entry resumes the supervised
-session (so a flaky SSH link doesn't kill your shell):
+on the other side. Each `berth enter` starts a fresh supervised session,
+then keeps reconnecting to that same session if the SSH link drops:
 
 ```bash
 berth enter --remote prod-box my-project                # prompts on first deploy
@@ -73,9 +73,13 @@ berth enter --remote prod-box my-project --plain        # plain SSH, no resume
 berth deploy prod-box                                   # explicit one-shot deploy
 ```
 
-Org-scoped workspaces (`<org>/<project>`) inherit a remote host and a
-remote-root directory from `berth org set`, so you write `org/proj`
-once and stop repeating `--remote` and `--dir`.
+Press `Ctrl-]` while attached to detach the client without stopping the
+session. Change `defaults.detach_key` in config to another key such as
+`ctrl-a` or `esc`, or set it to `null` to disable.
+
+Org-scoped workspaces (`<org>/<project>`) inherit a remote host, remote
+user, and remote-root directory from `berth org set`, so you write
+`org/proj` once and stop repeating `--remote`, `--user`, and `--dir`.
 
 ## Configuration
 

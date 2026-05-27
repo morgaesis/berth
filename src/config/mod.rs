@@ -49,6 +49,10 @@ pub struct Org {
     /// Default host for any workspace in this org that doesn't set its own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote: Option<String>,
+    /// Default SSH user for org workspaces. Applied when the effective
+    /// host does not already include `user@`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_user: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,10 +130,21 @@ pub struct Defaults {
     /// installed (without having to edit your rc).
     #[serde(default = "default_new_tab_auto_entry")]
     pub new_tab_auto_entry: bool,
+    /// Key sequence that detaches the current berth attach client
+    /// without stopping the supervised session. Set to null to disable.
+    #[serde(
+        default = "default_detach_key",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub detach_key: Option<String>,
 }
 
 fn default_new_tab_auto_entry() -> bool {
     true
+}
+
+fn default_detach_key() -> Option<String> {
+    Some("ctrl-]".to_string())
 }
 
 impl Default for Defaults {
@@ -140,6 +155,7 @@ impl Default for Defaults {
             idle: Idle::default(),
             remote_options: RemoteOptions::default(),
             new_tab_auto_entry: default_new_tab_auto_entry(),
+            detach_key: default_detach_key(),
         }
     }
 }
@@ -403,6 +419,24 @@ impl Config {
         }
     }
 
+    pub fn detach_key_bytes(&self) -> Result<Option<Vec<u8>>> {
+        if let Ok(value) = env::var("BERTH_DETACH_KEY") {
+            return parse_detach_key(Some(value.as_str()));
+        }
+        self.detach_key_bytes_for_remote()
+    }
+
+    pub fn detach_key_bytes_for_remote(&self) -> Result<Option<Vec<u8>>> {
+        parse_detach_key(self.defaults.detach_key.as_deref())
+    }
+
+    pub fn detach_key_env_value(&self) -> String {
+        self.defaults
+            .detach_key
+            .clone()
+            .unwrap_or_else(|| "none".to_string())
+    }
+
     /// Resolve the effective remote directory for a workspace, in order:
     ///   1. workspace.remote_dir (explicit override on the workspace)
     ///   2. `<orgs[<org>].remote_root>/<project>` if the workspace name
@@ -428,13 +462,19 @@ impl Config {
     ///   1. CLI `--remote` (handled by the caller)
     ///   2. workspace.remote
     ///   3. orgs[<org>].remote if the workspace name is `<org>/<project>`
+    ///   4. orgs[<org>].remote_user if the host has no explicit user
     pub fn resolved_remote(&self, workspace_name: &str, workspace: &Workspace) -> Option<String> {
-        if let Some(host) = &workspace.remote {
-            return Some(host.clone());
-        }
-        let (org, _project) = workspace_name.split_once('/')?;
-        let org_cfg = self.orgs.get(org)?;
-        org_cfg.remote.clone()
+        let org_cfg = workspace_name
+            .split_once('/')
+            .and_then(|(org, _project)| self.orgs.get(org));
+        let host = workspace
+            .remote
+            .as_ref()
+            .or_else(|| org_cfg.and_then(|org| org.remote.as_ref()))?;
+        Some(apply_remote_user(
+            host,
+            org_cfg.and_then(|org| org.remote_user.as_deref()),
+        ))
     }
 
     pub fn config_dir() -> Result<PathBuf> {
@@ -448,6 +488,75 @@ impl Config {
         dirs::config_dir()
             .map(|p| p.join(super::BERTH_DIR))
             .ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))
+    }
+}
+
+fn apply_remote_user(host: &str, user: Option<&str>) -> String {
+    let Some(user) = user.filter(|u| !u.trim().is_empty()) else {
+        return host.to_string();
+    };
+    if host.contains('@') {
+        host.to_string()
+    } else {
+        format!("{user}@{host}")
+    }
+}
+
+fn parse_detach_key(value: Option<&str>) -> Result<Option<Vec<u8>>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed.eq_ignore_ascii_case("off")
+        || trimmed.eq_ignore_ascii_case("disabled")
+    {
+        return Ok(None);
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "esc" || lower == "escape" {
+        return Ok(Some(vec![0x1b]));
+    }
+    if let Some(rest) = lower
+        .strip_prefix("ctrl-")
+        .or_else(|| lower.strip_prefix("ctrl+"))
+        .or_else(|| lower.strip_prefix("c-"))
+        .or_else(|| lower.strip_prefix("c+"))
+    {
+        let byte = ctrl_byte(rest).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid defaults.detach_key '{trimmed}'; expected ctrl-A..ctrl-Z, ctrl-], esc, or null"
+            )
+        })?;
+        return Ok(Some(vec![byte]));
+    }
+
+    if trimmed.len() == 1 && trimmed.is_ascii() {
+        return Ok(Some(trimmed.as_bytes().to_vec()));
+    }
+
+    anyhow::bail!(
+        "invalid defaults.detach_key '{trimmed}'; expected ctrl-A..ctrl-Z, ctrl-], esc, a single ASCII character, or null"
+    )
+}
+
+fn ctrl_byte(value: &str) -> Option<u8> {
+    let mut chars = value.chars();
+    let c = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    match c {
+        'a'..='z' => Some((c as u8) - b'a' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        '^' => Some(0x1e),
+        '_' => Some(0x1f),
+        '?' => Some(0x7f),
+        _ => None,
     }
 }
 
@@ -468,6 +577,7 @@ mod tests {
             Org {
                 remote_root: remote_root.map(Into::into),
                 remote: remote.map(Into::into),
+                remote_user: None,
             },
         );
         c
@@ -528,5 +638,67 @@ mod tests {
             cfg.resolved_remote("org/proj", &ws),
             Some("personal-box".into())
         );
+    }
+
+    #[test]
+    fn resolved_remote_applies_org_user_to_bare_host() {
+        let mut cfg = cfg_with_org("org", None, Some("dev-box"));
+        cfg.orgs.get_mut("org").unwrap().remote_user = Some("alice".into());
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(
+            cfg.resolved_remote("org/proj", &ws),
+            Some("alice@dev-box".into())
+        );
+    }
+
+    #[test]
+    fn resolved_remote_does_not_override_explicit_host_user() {
+        let mut cfg = cfg_with_org("org", None, Some("dev-box"));
+        cfg.orgs.get_mut("org").unwrap().remote_user = Some("alice".into());
+        let mut ws = Workspace::new("/tmp/x");
+        ws.remote = Some("bob@other-box".into());
+        assert_eq!(
+            cfg.resolved_remote("org/proj", &ws),
+            Some("bob@other-box".into())
+        );
+    }
+
+    #[test]
+    fn resolved_remote_keeps_unscoped_workspace_remote() {
+        let cfg = Config {
+            workspaces: HashMap::new(),
+            defaults: Defaults::default(),
+            trusted_hosts: HashMap::new(),
+            orgs: HashMap::new(),
+            auto_update_remote: true,
+        };
+        let mut ws = Workspace::new("/tmp/x");
+        ws.remote = Some("dev-box".into());
+        assert_eq!(cfg.resolved_remote("proj", &ws), Some("dev-box".into()));
+    }
+
+    #[test]
+    fn default_detach_key_is_ctrl_bracket() {
+        let cfg = Config {
+            workspaces: HashMap::new(),
+            defaults: Defaults::default(),
+            trusted_hosts: HashMap::new(),
+            orgs: HashMap::new(),
+            auto_update_remote: true,
+        };
+        assert_eq!(cfg.detach_key_bytes().unwrap(), Some(vec![0x1d]));
+    }
+
+    #[test]
+    fn detach_key_can_be_disabled() {
+        assert_eq!(parse_detach_key(None).unwrap(), None);
+        assert_eq!(parse_detach_key(Some("none")).unwrap(), None);
+    }
+
+    #[test]
+    fn detach_key_parses_common_control_names() {
+        assert_eq!(parse_detach_key(Some("ctrl-a")).unwrap(), Some(vec![1]));
+        assert_eq!(parse_detach_key(Some("ctrl-]")).unwrap(), Some(vec![0x1d]));
+        assert_eq!(parse_detach_key(Some("esc")).unwrap(), Some(vec![0x1b]));
     }
 }

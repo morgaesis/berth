@@ -1,4 +1,4 @@
-use crate::config::{Mount, Runtime};
+use crate::config::{Config, Mount, Runtime};
 use anyhow::Result;
 use std::env;
 use std::process;
@@ -85,11 +85,11 @@ pub struct RemoteEnterOverrides<'a> {
     /// Workspace-supplied default command argv. Forwarded to the remote
     /// `berth attach` cascade arm as trailing `-- <argv...>`.
     pub command: Option<&'a [String]>,
-    /// When true, force a fresh independent session (`berth attach --new`).
-    /// When false (default), prefer to attach to an existing session so
-    /// SSH-drop / hibernation reconnects cleanly
-    /// (`berth attach --resume-or-new`).
+    /// Retained for callers that explicitly request `--new`; normal
+    /// `enter` also passes a generated session id so reconnects in one
+    /// invocation return to that specific session.
     pub force_new: bool,
+    pub session_id: Option<&'a str>,
 }
 
 pub async fn ssh_interactive_runtime(
@@ -122,6 +122,7 @@ pub async fn ssh_interactive_runtime_with(
         Some(dir) => normalize_remote_path(dir),
         None => remote_workspace_path_expr(workspace_name),
     };
+    let config = Config::load()?;
     let enter_cmd = remote_enter_command_with(
         workspace_name,
         &remote_path,
@@ -129,6 +130,8 @@ pub async fn ssh_interactive_runtime_with(
         mounts,
         overrides.command,
         overrides.force_new,
+        overrides.session_id,
+        Some(config.detach_key_env_value().as_str()),
     );
 
     if skip_ssh() {
@@ -161,6 +164,70 @@ pub async fn ssh_interactive_runtime_with(
     Ok(code)
 }
 
+#[allow(clippy::too_many_arguments)]
+pub async fn ssh_attach_remote(
+    host: &str,
+    workspace_name: &str,
+    list: bool,
+    list_all: bool,
+    list_long: bool,
+    session: Option<&str>,
+    new: bool,
+    command: &[String],
+) -> Result<i32> {
+    let config = Config::load()?;
+    let mut remote = String::from(
+        "berth_bin=; if command -v berth >/dev/null 2>&1; then berth_bin=$(command -v berth); elif [ -x \"$HOME/.local/bin/berth\" ]; then berth_bin=\"$HOME/.local/bin/berth\"; else printf 'berth not found on remote\\n' >&2; exit 127; fi; BERTH_ATTACH_LOCAL=1 ",
+    );
+    remote.push_str("BERTH_DETACH_KEY=");
+    remote.push_str(&shell_escape_arg(&config.detach_key_env_value()));
+    remote.push_str(" exec \"$berth_bin\" attach");
+    if list {
+        remote.push_str(" --list");
+        if list_all {
+            remote.push_str(" --all");
+        }
+        if list_long {
+            remote.push_str(" --long");
+        }
+    }
+    if new {
+        remote.push_str(" --new");
+    }
+    if let Some(id) = session {
+        remote.push_str(" --session ");
+        remote.push_str(&shell_escape_arg(id));
+    }
+    remote.push(' ');
+    remote.push_str(&shell_escape_arg(workspace_name));
+    if !command.is_empty() {
+        remote.push_str(" --");
+        for arg in command {
+            remote.push(' ');
+            remote.push_str(&shell_escape_arg(arg));
+        }
+    }
+
+    if list {
+        print!("{}", run_remote_command(host, &remote).await?);
+        return Ok(0);
+    }
+    if skip_ssh() {
+        println!(
+            "[TEST MODE] Would SSH to {} and attach workspace {} with command: {}",
+            host, workspace_name, remote
+        );
+        return Ok(0);
+    }
+    let mut args: Vec<String> = vec!["-tt".into()];
+    push_interactive_ssh_options(&mut args);
+    args.push(host.to_string());
+    args.push(remote);
+    tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
+        .await
+        .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))?
+}
+
 fn push_interactive_ssh_options(args: &mut Vec<String>) {
     // Suppress ssh's own status lines ("Shared connection closed",
     // motd banners). Errors still print.
@@ -185,16 +252,24 @@ fn remote_enter_command(
     runtime: &Runtime,
     mounts: &[Mount],
 ) -> String {
-    remote_enter_command_with(workspace_name, remote_path, runtime, mounts, None, false)
+    remote_enter_command_with(
+        workspace_name,
+        remote_path,
+        runtime,
+        mounts,
+        None,
+        false,
+        None,
+        None,
+    )
 }
 
 /// `remote_path` is a shell *expression* (already quoted/composed by
 /// [`remote_workspace_path_expr`]) and is interpolated raw here.
 ///
-/// `force_new` selects the attach verb passed to the remote berth:
-/// false (default) → `attach --resume-or-new` (smart resume), true →
-/// `attach --new` (always fresh). The new-tab auto-entry hook passes
-/// true; `berth enter` passes false.
+/// `session_id` selects the attach target for one `enter` invocation:
+/// the first connection creates it, reconnects attach back to it, and
+/// future `enter` invocations generate a different id.
 fn remote_enter_command_with(
     workspace_name: &str,
     remote_path: &str,
@@ -202,6 +277,8 @@ fn remote_enter_command_with(
     mounts: &[Mount],
     workspace_command: Option<&[String]>,
     force_new: bool,
+    session_id: Option<&str>,
+    detach_key: Option<&str>,
 ) -> String {
     let base = format!("mkdir -p {remote_path} && cd {remote_path}");
     let shell = "${SHELL:-/bin/sh}";
@@ -257,10 +334,12 @@ fn remote_enter_command_with(
     // PID 1 instead of `$SHELL -l`. Each argv element is shell-quoted
     // independently. Empty / None means "no override; supervisor runs
     // $SHELL -l".
-    let attach_verb = if force_new {
-        "--new"
+    let attach_verb = if let Some(id) = session_id {
+        format!("--new --session {}", shell_escape_arg(id))
+    } else if force_new {
+        "--new".to_string()
     } else {
-        "--resume-or-new"
+        "--new".to_string()
     };
     let attach_cmd_suffix = match workspace_command {
         Some(argv) if !argv.is_empty() => {
@@ -273,6 +352,9 @@ fn remote_enter_command_with(
         }
         _ => String::new(),
     };
+    let attach_env = detach_key
+        .map(|key| format!("BERTH_DETACH_KEY={} ", shell_escape_arg(key)))
+        .unwrap_or_default();
 
     // Resumability cascade. Best to worst:
     //   1. berth attach --new: PTY-multiplexing supervisor managed by berth
@@ -296,7 +378,7 @@ fn remote_enter_command_with(
            berth_bin=\"$HOME/.local/bin/berth\"; \
          fi; \
          if [ -n \"$berth_bin\" ]; then \
-           exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
+           {attach_env}exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
          elif command -v mosh-server >/dev/null 2>&1; then \
            exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
@@ -500,9 +582,10 @@ mod tests {
 
         // The exec is now via the resolved `$berth_bin` (either `command -v`
         // result or the explicit `~/.local/bin/berth` fallback path).
-        // Default verb is --resume-or-new so SSH-drop reattaches cleanly;
-        // tabs that want isolation pass `berth enter --new`.
-        assert!(command.contains("exec \"$berth_bin\" attach --resume-or-new 'work'"));
+        // Default entry starts a fresh session. Production entry passes a
+        // generated --session id so reconnects within one invocation attach
+        // back to that same session.
+        assert!(command.contains("exec \"$berth_bin\" attach --new 'work'"));
         assert!(command.contains("mosh-server new --"));
         // Legacy fallbacks use a unique session id per invocation so
         // multiple terminal tabs don't pile into one shared session.

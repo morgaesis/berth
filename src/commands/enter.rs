@@ -19,10 +19,9 @@ pub struct EnterOptions {
     pub auto_deploy: bool,
     /// `--no-deploy`: never push; fall through to legacy mux or fail.
     pub no_deploy: bool,
-    /// `--new`: force a fresh session even if one is already alive.
-    /// Default is to resume the existing supervisor (so hibernation
-    /// and ssh-drop reconnect cleanly). The shell-init new-tab hook
-    /// sets this so each tab gets its own independent supervisor.
+    /// `--new`: retained for compatibility; `enter` already creates a
+    /// fresh session per invocation and only reattaches to that same
+    /// generated session while its reconnect loop is running.
     pub force_new: bool,
     /// `--no-reconnect`: when SSH exits with status 255 (network
     /// dropped), bail instead of automatically retrying. Default is
@@ -153,8 +152,15 @@ pub async fn run(
         } else {
             workspace.command.clone()
         };
+        let _ = berth::lifecycle_state::touch(
+            &name,
+            Some(&host),
+            runtime_name(&runtime_config),
+            idle.shutdown_after_seconds,
+        );
+        refresh_remote_session_statuses(&config, &host).await;
         ensure_remote_ready(&mut config, &host, &opts).await?;
-        enter_remote(
+        let result = enter_remote(
             name,
             &host,
             path,
@@ -165,7 +171,9 @@ pub async fn run(
             effective_dir.as_deref(),
             command.as_deref(),
         )
-        .await
+        .await;
+        refresh_remote_session_statuses(&config, &host).await;
+        result
     } else {
         let _ = berth::lifecycle_state::touch(
             &name,
@@ -184,6 +192,64 @@ pub async fn run(
         let _ = berth::lifecycle_state::remove(&name, None);
         result
     }
+}
+
+async fn refresh_remote_session_statuses(config: &Config, host: &str) {
+    let workspaces: Vec<String> = config
+        .workspaces
+        .iter()
+        .filter_map(|(name, ws)| {
+            (config.resolved_remote(name, ws).as_deref() == Some(host)).then(|| name.clone())
+        })
+        .collect();
+    if workspaces.is_empty() {
+        return;
+    }
+
+    let mut script = String::from(
+        r#"b="$HOME/.local/bin/berth"
+if [ ! -x "$b" ]; then exit 0; fi
+"#,
+    );
+    for ws in &workspaces {
+        let quoted = shell_quote(ws);
+        script.push_str("printf '%s\\t' ");
+        script.push_str(&quoted);
+        script.push('\n');
+        script.push_str("BERTH_ATTACH_LOCAL=1 \"$b\" attach --session-counts ");
+        script.push_str(&quoted);
+        script.push_str(" 2>/dev/null || printf '0\\t0\\t0\\n'\n");
+    }
+
+    let Ok(out) = ssh::run_remote_command(host, &script).await else {
+        return;
+    };
+    for line in out.lines() {
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let Ok(live) = parts[1].parse::<usize>() else {
+            continue;
+        };
+        let Ok(attached) = parts[2].parse::<usize>() else {
+            continue;
+        };
+        let Ok(exited) = parts[3].parse::<usize>() else {
+            continue;
+        };
+        let _ = berth::lifecycle_state::update_session_status(
+            parts[0],
+            Some(host),
+            live,
+            attached,
+            exited,
+        );
+    }
+}
+
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\"'\"'"))
 }
 
 /// On the first few hook-driven entries, print a single dim line so the
@@ -322,12 +388,12 @@ async fn enter_remote(
     // either the network comes back and the remote command exits
     // cleanly (0) or the user Ctrl+Cs out of the wait.
     //
-    // On the remote side, `--resume-or-new` + flock means the second
-    // SSH lands back on the same supervisor (the prior client's lock
-    // released when its process died), so the user's claude / shell /
-    // cwd is preserved across the reconnect. Mosh-like UX.
+    // On the remote side, this invocation uses a generated session id.
+    // The first SSH creates it; later retries attach back to that same
+    // id, while a future `berth enter` starts a different session.
     let mut backoff_ms: u64 = 500;
     let mut attempt: u32 = 0;
+    let session_id = berth::session::new_session_id();
     let final_code = loop {
         attempt += 1;
         let result = if opts.plain {
@@ -337,6 +403,7 @@ async fn enter_remote(
                 remote_dir,
                 command,
                 force_new: opts.force_new,
+                session_id: Some(&session_id),
             };
             ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
         };
@@ -357,6 +424,7 @@ async fn enter_remote(
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                repaint_before_reconnect();
                 continue;
             }
             _ => break code,
@@ -370,6 +438,13 @@ async fn enter_remote(
         anyhow::bail!("remote exited with status {final_code}");
     }
     Ok(())
+}
+
+fn repaint_before_reconnect() {
+    if std::io::stderr().is_terminal() {
+        print!("\x1b[!p\x1b[2J\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
 }
 
 fn podman_enter_spec(

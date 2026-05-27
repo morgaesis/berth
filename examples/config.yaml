@@ -18,6 +18,9 @@ defaults:
   # + command argv) so the new tab "just is" the workspace. Set to
   # false to disable replay without removing the hook from your rc.
   new_tab_auto_entry: true
+  # Press this while attached to detach without stopping the session.
+  # Set to null to disable.
+  detach_key: ctrl-]
 
 # Per-org defaults. Workspace names of the form `<org>/<project>` inherit
 # `remote` and `<remote_root>/<project>` from here, so you don't have to
@@ -25,6 +28,7 @@ defaults:
 orgs:
   org:
     remote: dev-box.internal
+    remote_user: dev
     remote_root: ~/code/org
 
 workspaces:

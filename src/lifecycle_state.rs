@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct State {
     pub environments: HashMap<String, Environment>,
+    #[serde(default)]
+    pub sessions: HashMap<String, SessionStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,6 +19,16 @@ pub struct Environment {
     pub runtime: String,
     pub last_active_epoch_seconds: u64,
     pub idle_shutdown_after_seconds: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionStatus {
+    pub workspace: String,
+    pub host: Option<String>,
+    pub refreshed_epoch_seconds: u64,
+    pub live_sessions: usize,
+    pub attached_sessions: usize,
+    pub exited_sessions: usize,
 }
 
 impl Environment {
@@ -57,6 +69,36 @@ pub fn remove(workspace: &str, host: Option<&str>) -> std::io::Result<()> {
     let mut state = load();
     state.environments.remove(&key(workspace, host));
     save(&state)
+}
+
+pub fn update_session_status(
+    workspace: &str,
+    host: Option<&str>,
+    live_sessions: usize,
+    attached_sessions: usize,
+    exited_sessions: usize,
+) -> std::io::Result<()> {
+    let mut state = load();
+    state.sessions.insert(
+        key(workspace, host),
+        SessionStatus {
+            workspace: workspace.to_string(),
+            host: host.map(str::to_string),
+            refreshed_epoch_seconds: now(),
+            live_sessions,
+            attached_sessions,
+            exited_sessions,
+        },
+    );
+    save(&state)
+}
+
+pub fn session_status<'a>(
+    state: &'a State,
+    workspace: &str,
+    host: Option<&str>,
+) -> Option<&'a SessionStatus> {
+    state.sessions.get(&key(workspace, host))
 }
 
 pub fn load() -> State {

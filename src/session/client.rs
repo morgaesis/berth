@@ -1,4 +1,5 @@
 use super::protocol::{read_frame, write_frame, Frame};
+use crate::config::Config;
 use anyhow::{Context, Result};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -71,7 +72,21 @@ pub fn is_session_free(socket_path: &Path) -> bool {
     }
 }
 
+pub fn is_session_attached(socket_path: &Path) -> Option<bool> {
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_path = lock_path_for(socket_path);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_path)
+        .ok()?;
+    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+        Ok(_lock) => Some(false),
+        Err(_) => Some(true),
+    }
+}
+
 pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
+    let detach_key = Config::load()?.detach_key_bytes()?;
     // Take an exclusive flock on a sibling lock file. The lock handle
     // is leaked so it stays alive for the lifetime of this process;
     // the kernel releases the lock automatically when the process dies
@@ -149,18 +164,34 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     });
 
     let stdin_tx = out_tx.clone();
+    let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut detach_rx_open = true;
     let stdin_task = tokio::spawn(async move {
         let mut stdin = tokio::io::stdin();
         let mut buf = [0u8; 4096];
+        let mut detach_tx = Some(detach_tx);
         loop {
             match stdin.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if stdin_tx
-                        .send(Frame::Stdin(buf[..n].to_vec()))
-                        .await
-                        .is_err()
-                    {
+                    let chunk = &buf[..n];
+                    if let Some(key) = detach_key.as_deref() {
+                        if let Some(pos) = find_subslice(chunk, key) {
+                            if pos > 0
+                                && stdin_tx
+                                    .send(Frame::Stdin(chunk[..pos].to_vec()))
+                                    .await
+                                    .is_err()
+                            {
+                                break;
+                            }
+                            if let Some(tx) = detach_tx.take() {
+                                let _ = tx.send(());
+                            }
+                            break;
+                        }
+                    }
+                    if stdin_tx.send(Frame::Stdin(chunk.to_vec())).await.is_err() {
                         break;
                     }
                 }
@@ -172,22 +203,38 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     drop(out_tx); // sender count = stdin_tx + resize_tx now
 
     let mut exit_code: i32 = 0;
+    let mut detached = false;
     let mut stdout = tokio::io::stdout();
     loop {
-        match read_frame(&mut read_half).await {
-            Ok(Some(Frame::Stdout(bytes))) => {
-                if stdout.write_all(&bytes).await.is_err() {
-                    break;
+        tokio::select! {
+            frame = read_frame(&mut read_half) => {
+                match frame {
+                    Ok(Some(Frame::Stdout(bytes))) => {
+                        if stdout.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                        let _ = stdout.flush().await;
+                    }
+                    Ok(Some(Frame::Exit { code })) => {
+                        exit_code = code;
+                        break;
+                    }
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
-                let _ = stdout.flush().await;
             }
-            Ok(Some(Frame::Exit { code })) => {
-                exit_code = code;
-                break;
+            detach = &mut detach_rx, if detach_rx_open => {
+                match detach {
+                    Ok(()) => {
+                    detached = true;
+                    break;
+                    }
+                    Err(_) => {
+                        detach_rx_open = false;
+                    }
+                }
             }
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(_) => break,
         }
     }
     drop(raw_guard);
@@ -197,6 +244,9 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     // Drain stdout so the last bytes (commonly a shell prompt or exit
     // banner) actually reach the user's terminal before we exit.
     let _ = stdout.flush().await;
+    if detached {
+        eprintln!("\r\n[detached]");
+    }
 
     // `tokio::io::stdin()` reads via a dedicated blocking thread; aborting
     // the future cancels the await but the read syscall on the underlying
@@ -207,6 +257,13 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     // immediately. raw_guard was dropped above so the user's tty is back
     // in cooked mode by the time the process actually goes away.
     std::process::exit(exit_code)
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn current_size(fd: i32) -> (u16, u16) {
@@ -252,5 +309,17 @@ impl Drop for RawTtyGuard {
                 libc::tcsetattr(self.fd, libc::TCSANOW, &saved);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn find_subslice_locates_detach_key() {
+        assert_eq!(find_subslice(b"abc\x1d", &[0x1d]), Some(3));
+        assert_eq!(find_subslice(b"abc", &[0x1d]), None);
+        assert_eq!(find_subslice(b"abc", &[]), None);
     }
 }

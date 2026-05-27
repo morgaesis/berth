@@ -16,7 +16,8 @@ first hit:
 2. **Workspace** — `workspace.remote`, `workspace.remote_dir`,
    `workspace.ports`, `workspace.command` in `config.yaml`.
 3. **Org defaults** — when the workspace name is `<org>/<project>`, look
-   up `orgs.<org>` and inherit `remote` and `<remote_root>/<project>`.
+   up `orgs.<org>` and inherit `remote`, `remote_user`, and
+   `<remote_root>/<project>`.
 4. **Global defaults** — `defaults.runtime`, `defaults.idle`, etc.
 5. **Auto-discovery** — `runtime.type: auto` discovers local Podman and
    falls back to bare. Remote auto resolves to bare unconditionally
@@ -94,12 +95,15 @@ Remote entry is SSH-first with batteries-included deployability. On
    smoke-tested via `<remote-path> --version`, and the host is
    recorded in `config.trusted_hosts` so future enters silently
    redeploy when the version drifts.
-3. **Session start** — remote `berth attach --resume-or-new <name>` owns
-   the PTY through a per-session Unix socket at
+3. **Session start** — remote `berth attach --new --session <id> <name>`
+   owns the PTY through a per-session Unix socket at
    `runtime_dir/sessions/<sanitized_workspace>/<session_id>.sock`.
-   Every terminal tab gets an independent supervisor (so a kill on
-   one tab does not nuke the workspace), and `berth enter` re-attaches
-   transparently when the SSH transport drops.
+   Every `berth enter` invocation gets an independent supervisor, while
+   reconnects within that invocation reuse the same generated session id
+   when the SSH transport drops. The attach client also
+   recognizes `defaults.detach_key` (default `ctrl-]`) as a local
+   detach signal: the client exits, while the supervisor and PTY keep
+   running for the next attach.
 
 Flags that change the cascade:
 

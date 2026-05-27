@@ -67,17 +67,25 @@ defaults:
   # to disable it.
   new_tab_auto_entry: true
 
+  # Key that detaches the current berth client without stopping the
+  # supervised session. Press it while attached to return to the local
+  # shell; the next `berth enter` resumes the same session. Set to
+  # null to disable. Accepted forms include `ctrl-]`, `ctrl-a`, `esc`,
+  # or a single ASCII character.
+  detach_key: ctrl-]
+
 # ─── orgs ──────────────────────────────────────────────────────────────
 #
 # Per-org defaults. A workspace named `<org>/<project>` inherits `remote`
 # and `<remote_root>/<project>` from its org entry here, so you don't
 # repeat them on every workspace.
 #
-# CLI: `berth org set <org> --remote <host> --root <path>`,
+# CLI: `berth org set <org> --remote <host> --user <ssh-user> --root <path>`,
 #      `berth org rm <org>`, `berth org list`, `berth org show <org>`.
 orgs: {}
 #   org:
 #     remote: dev-box.internal
+#     remote_user: dev
 #     remote_root: ~/code/org
 
 # ─── trusted_hosts ─────────────────────────────────────────────────────

@@ -1,27 +1,36 @@
 use anyhow::{bail, Context, Result};
+use berth::config::Config;
 use berth::session::{self, supervisor};
+use berth::ssh;
 use portable_pty::PtySize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub struct AttachOptions {
     pub supervisor: bool,
     pub new: bool,
-    /// If true and no session exists, create a fresh one; if exactly
-    /// one session exists, attach to it; if multiple, attach to the
-    /// newest. Used as the default verb invoked by `berth enter` so
-    /// SSH-drop / hibernation produces a clean reconnect rather than
-    /// orphaning the prior supervisor.
+    /// Attach to the newest free session, or create one if none are
+    /// available. Kept for explicit attach workflows; `berth enter`
+    /// uses a generated session id instead.
     pub resume_or_new: bool,
     pub session: Option<String>,
     pub list: bool,
+    pub list_all: bool,
+    pub list_long: bool,
+    pub session_counts: bool,
     pub command: Vec<String>,
 }
 
 pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
     if let Some(id) = &opts.session {
         berth::validate_session_id(id)?;
+    }
+    if !opts.supervisor {
+        if let Some(code) = maybe_remote_attach(&workspace, &opts).await? {
+            return Ok(code);
+        }
     }
     if opts.supervisor {
         let id = opts
@@ -30,14 +39,22 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
             .context("--supervisor requires --session <id>")?;
         return run_supervisor(workspace, id, opts.command).await;
     }
+    if opts.session_counts {
+        let (live, attached, exited) = session_inventory_counts(&workspace)?;
+        println!("{live}\t{attached}\t{exited}");
+        return Ok(0);
+    }
     if opts.list {
         if !opts.command.is_empty() {
             bail!("--list does not accept a command override");
         }
-        return list_sessions(&workspace);
+        return list_sessions(&workspace, opts.list_all, opts.list_long);
     }
     if opts.new {
-        return start_fresh(workspace, opts.command).await;
+        return match opts.session {
+            Some(id) => start_or_attach_session(workspace, id, opts.command).await,
+            None => start_fresh(workspace, opts.command).await,
+        };
     }
     if opts.resume_or_new {
         return resume_or_new(workspace, opts.command).await;
@@ -48,6 +65,31 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
         );
     }
     resume(workspace, opts.session).await
+}
+
+async fn maybe_remote_attach(workspace: &str, opts: &AttachOptions) -> Result<Option<i32>> {
+    if std::env::var_os("BERTH_ATTACH_LOCAL").is_some() {
+        return Ok(None);
+    }
+    let config = Config::load()?;
+    let Some(ws) = config.workspaces.get(workspace) else {
+        return Ok(None);
+    };
+    let Some(host) = config.resolved_remote(workspace, ws) else {
+        return Ok(None);
+    };
+    let code = ssh::ssh_attach_remote(
+        &host,
+        workspace,
+        opts.list,
+        opts.list_all,
+        opts.list_long,
+        opts.session.as_deref(),
+        opts.new,
+        &opts.command,
+    )
+    .await?;
+    Ok(Some(code))
 }
 
 /// Smart attach: try each live session in turn; the first one whose
@@ -114,10 +156,21 @@ async fn run_supervisor(
 
 async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
     let id = session::new_session_id();
+    start_or_attach_session(workspace, id, command).await
+}
+
+async fn start_or_attach_session(
+    workspace: String,
+    id: String,
+    command: Vec<String>,
+) -> Result<i32> {
     let sessions_dir = session::sessions_dir(&workspace)?;
     std::fs::create_dir_all(&sessions_dir)
         .with_context(|| format!("creating sessions dir {}", sessions_dir.display()))?;
     let socket_path = session::session_socket(&workspace, &id)?;
+    if socket_path.exists() {
+        return session::client::attach(&socket_path).await;
+    }
     let _log_path = supervisor_log_path(&workspace, &id)?;
     spawn_supervisor(&workspace, &id, &command)?;
     if wait_for_socket(&socket_path, Duration::from_secs(5)).is_err() {
@@ -201,16 +254,139 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
     session::client::attach(&socket_path).await
 }
 
-fn list_sessions(workspace: &str) -> Result<i32> {
-    let sessions = session::list_sessions(workspace)?;
+fn list_sessions(workspace: &str, all: bool, long: bool) -> Result<i32> {
+    if !all && !long {
+        let sessions = session::list_sessions(workspace)?;
+        if sessions.is_empty() {
+            println!("(no sessions for workspace '{workspace}')");
+        } else {
+            for id in sessions {
+                println!("{id}");
+            }
+        }
+        return Ok(0);
+    }
+
+    let sessions = session_inventory(workspace, all)?;
     if sessions.is_empty() {
         println!("(no sessions for workspace '{workspace}')");
     } else {
-        for id in sessions {
-            println!("{id}");
+        println!(
+            "{:<14}  {:<7}  {:<8}  {:<3}  UPDATED",
+            "SESSION", "STATUS", "ATTACHED", "LOG"
+        );
+        for s in sessions {
+            println!(
+                "{:<14}  {:<7}  {:<8}  {:<3}  {}",
+                s.id,
+                s.status,
+                s.attached_label(),
+                if s.has_log { "yes" } else { "no" },
+                format_epoch(s.updated),
+            );
         }
     }
     Ok(0)
+}
+
+#[derive(Debug)]
+struct SessionRow {
+    id: String,
+    status: &'static str,
+    attached: Option<bool>,
+    has_log: bool,
+    updated: Option<SystemTime>,
+}
+
+impl SessionRow {
+    fn attached_label(&self) -> &'static str {
+        match self.attached {
+            Some(true) => "yes",
+            Some(false) => "no",
+            None => "-",
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionFiles {
+    socket: Option<PathBuf>,
+    lock: Option<PathBuf>,
+    log: Option<PathBuf>,
+}
+
+pub fn session_inventory_counts(workspace: &str) -> Result<(usize, usize, usize)> {
+    let rows = session_inventory(workspace, true)?;
+    let live = rows.iter().filter(|r| r.status == "live").count();
+    let attached = rows.iter().filter(|r| r.attached == Some(true)).count();
+    let exited = rows.iter().filter(|r| r.status == "exited").count();
+    Ok((live, attached, exited))
+}
+
+fn session_inventory(workspace: &str, include_exited: bool) -> Result<Vec<SessionRow>> {
+    let dir = session::sessions_dir(workspace)?;
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut by_id: BTreeMap<String, SessionFiles> = BTreeMap::new();
+    for entry in std::fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = entry?.path();
+        let Some(name) = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if let Some(id) = name.strip_suffix(".sock") {
+            by_id.entry(id.to_string()).or_default().socket = Some(path);
+        } else if let Some(id) = name.strip_suffix(".sock.client-lock") {
+            by_id.entry(id.to_string()).or_default().lock = Some(path);
+        } else if let Some(id) = name.strip_suffix(".log") {
+            by_id.entry(id.to_string()).or_default().log = Some(path);
+        }
+    }
+
+    let mut rows = Vec::new();
+    for (id, files) in by_id {
+        let live = files.socket.as_ref().is_some_and(|p| p.exists());
+        if !include_exited && !live {
+            continue;
+        }
+        let attached = files
+            .socket
+            .as_ref()
+            .filter(|_| live)
+            .and_then(|socket| session::client::is_session_attached(socket));
+        rows.push(SessionRow {
+            id,
+            status: if live { "live" } else { "exited" },
+            attached,
+            has_log: files.log.is_some(),
+            updated: latest_mtime([
+                files.socket.as_ref(),
+                files.lock.as_ref(),
+                files.log.as_ref(),
+            ]),
+        });
+    }
+    rows.sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| a.id.cmp(&b.id)));
+    Ok(rows)
+}
+
+fn latest_mtime<'a>(paths: impl IntoIterator<Item = Option<&'a PathBuf>>) -> Option<SystemTime> {
+    paths
+        .into_iter()
+        .flatten()
+        .filter_map(|path| path.metadata().ok()?.modified().ok())
+        .max()
+}
+
+fn format_epoch(t: Option<SystemTime>) -> String {
+    t.and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 /// Where the supervisor for `(workspace, session_id)` redirects its

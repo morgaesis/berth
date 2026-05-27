@@ -25,12 +25,18 @@ pub async fn run(long: bool, absolute_time: bool) -> Result<()> {
         .map(|(name, ws)| {
             let host = config.resolved_remote(name, ws);
             let last_used = last_used_seconds(&state, name, host.as_deref());
+            let session_status = host
+                .as_deref()
+                .and_then(|host| lifecycle_state::session_status(&state, name, Some(host)))
+                .map(format_session_status)
+                .unwrap_or_default();
             Row {
                 name: name.clone(),
                 ws_type: if host.is_some() { "remote" } else { "local" },
                 last_used: format_last_used(last_used, now, absolute_time),
                 last_used_epoch: last_used,
                 path: ws.path.clone(),
+                session_status,
             }
         })
         .collect();
@@ -72,7 +78,7 @@ pub async fn run(long: bool, absolute_time: bool) -> Result<()> {
         let type_pad = " ".repeat(type_w.saturating_sub(row.ws_type.chars().count()));
         let used_pad = " ".repeat(used_w.saturating_sub(row.last_used.chars().count()));
         println!(
-            "{}{}  {}{}  {}{}  {}",
+            "{}{}  {}{}  {}{}  {}{}",
             row.name.bold(),
             name_pad,
             type_colored,
@@ -80,6 +86,7 @@ pub async fn run(long: bool, absolute_time: bool) -> Result<()> {
             used_colored,
             used_pad,
             row.path.dimmed(),
+            row.session_status,
         );
     }
 
@@ -92,6 +99,7 @@ struct Row {
     last_used: String,
     last_used_epoch: Option<u64>,
     path: String,
+    session_status: String,
 }
 
 fn col_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
@@ -100,6 +108,20 @@ fn col_width<'a>(header: &str, values: impl Iterator<Item = &'a str>) -> usize {
         .max()
         .unwrap_or(0)
         .max(header.chars().count())
+}
+
+fn format_session_status(status: &lifecycle_state::SessionStatus) -> String {
+    if status.live_sessions == 0 && status.exited_sessions == 0 {
+        return String::new();
+    }
+    format!(
+        "  {}",
+        format!(
+            "sessions: {} live, {} attached, {} exited",
+            status.live_sessions, status.attached_sessions, status.exited_sessions
+        )
+        .dimmed()
+    )
 }
 
 fn current_epoch_seconds() -> u64 {

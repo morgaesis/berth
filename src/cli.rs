@@ -313,10 +313,24 @@ enum Commands {
         )]
         list: bool,
         #[arg(
+            long = "all",
+            requires = "list",
+            help = "With --list, include exited sessions that still have logs"
+        )]
+        all: bool,
+        #[arg(
+            long = "long",
+            requires = "list",
+            help = "With --list, show status, attachment state, and log presence"
+        )]
+        long: bool,
+        #[arg(
             long = "supervisor",
             help = "Internal: run as the session supervisor in the foreground"
         )]
         supervisor: bool,
+        #[arg(long = "session-counts", hide = true)]
+        session_counts: bool,
         #[arg(
             trailing_var_arg = true,
             help = "Override session command (defaults to login shell)"
@@ -360,7 +374,7 @@ enum Commands {
                       root from its org, so individual workspaces don't have to repeat the \
                       prefix.\n\n\
                       Examples:\n  \
-                      berth org set org --remote dev-box --root '~/code/org'\n  \
+                      berth org set org --remote dev-box --user dev --root '~/code/org'\n  \
                       berth org list\n  \
                       berth org show org"
     )]
@@ -509,6 +523,8 @@ enum OrgCommands {
             help = "Default remote-root directory (final workspace dir = <root>/<project>)"
         )]
         root: Option<String>,
+        #[arg(long = "user", help = "Default SSH user for this org")]
+        user: Option<String>,
     },
     #[command(about = "Remove an org from config (doesn't touch any workspace)")]
     Rm {
@@ -624,7 +640,10 @@ impl Cli {
                     resume_or_new,
                     session,
                     list,
+                    all,
+                    long,
                     supervisor,
+                    session_counts,
                     command,
                 } => {
                     berth::validate_workspace_name(&name)?;
@@ -636,6 +655,9 @@ impl Cli {
                             resume_or_new,
                             session,
                             list,
+                            list_all: all,
+                            list_long: long,
+                            session_counts,
                             command,
                         },
                     )
@@ -668,11 +690,16 @@ impl Cli {
                 Commands::Org(command) => match command {
                     OrgCommands::List => commands::org::list().await,
                     OrgCommands::Show { name } => commands::org::show(name).await,
-                    OrgCommands::Set { name, remote, root } => {
+                    OrgCommands::Set {
+                        name,
+                        remote,
+                        root,
+                        user,
+                    } => {
                         if let Some(host) = &remote {
                             berth::validate_ssh_host(host)?;
                         }
-                        commands::org::set(name, remote, root).await
+                        commands::org::set(name, remote, root, user).await
                     }
                     OrgCommands::Rm { name } => commands::org::remove(name).await,
                 },

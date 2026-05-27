@@ -1,7 +1,12 @@
 use anyhow::Result;
 use berth::config::{Config, Org};
 
-pub async fn set(name: String, remote: Option<String>, root: Option<String>) -> Result<()> {
+pub async fn set(
+    name: String,
+    remote: Option<String>,
+    root: Option<String>,
+    user: Option<String>,
+) -> Result<()> {
     let mut config = Config::load()?;
     let entry = config.orgs.entry(name.clone()).or_default();
     if let Some(r) = remote.as_ref() {
@@ -9,6 +14,9 @@ pub async fn set(name: String, remote: Option<String>, root: Option<String>) -> 
     }
     if let Some(r) = root.as_ref() {
         entry.remote_root = Some(r.clone());
+    }
+    if let Some(u) = user.as_ref() {
+        entry.remote_user = Some(u.clone());
     }
     config.save()?;
     println!("org '{}' updated:", name);
@@ -65,6 +73,10 @@ fn print_org(name: &str, org: &Org) {
     println!(
         "    remote_root = {}",
         org.remote_root.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "    remote_user = {}",
+        org.remote_user.as_deref().unwrap_or("(none)")
     );
 }
 
