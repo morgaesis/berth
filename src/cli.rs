@@ -1,6 +1,6 @@
 use crate::commands;
 use crate::commands::shell::HookShell;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell as CompletionShell;
 
 #[derive(Parser)]
@@ -97,7 +97,12 @@ impl Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    #[command(about = "List configured workspaces (with last-used time)")]
+    #[command(subcommand, about = "Manage workspace config")]
+    Config(ConfigCommands),
+    #[command(
+        about = "List configured workspaces (with last-used time)",
+        hide = true
+    )]
     List {
         #[arg(
             short = 'l',
@@ -111,12 +116,13 @@ enum Commands {
         )]
         abs: bool,
     },
-    #[command(about = "Show one workspace's resolved config")]
+    #[command(about = "Show one workspace's resolved config", hide = true)]
     Show {
         #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
     },
     #[command(
+        hide = true,
         about = "Create a new workspace configuration",
         long_about = "Create a new workspace configuration.\n\n\
                       Workspaces can be plain (`proj`) or org-scoped (`org/proj`).\n\
@@ -143,7 +149,12 @@ enum Commands {
         org: Option<String>,
         #[arg(short = 'r', long = "remote", help = "SSH host for remote entry")]
         remote: Option<String>,
-        #[arg(short = 'p', long = "ports", value_delimiter = ',')]
+        #[arg(
+            short = 'p',
+            long = "ports",
+            value_delimiter = ',',
+            help = "Forward remote port(s), repeatable or comma-separated"
+        )]
         ports: Vec<u16>,
         #[arg(
             short = 'd',
@@ -158,6 +169,7 @@ enum Commands {
         command: Vec<String>,
     },
     #[command(
+        hide = true,
         about = "Set or update fields on a workspace",
         long_about = "Update one or more fields on an existing workspace. \
                       Pair a `--<field>` flag with a value to set it, or \
@@ -169,29 +181,55 @@ enum Commands {
     Set {
         #[arg(help = "Workspace name")]
         name: String,
-        #[arg(short = 'r', long = "remote", conflicts_with = "clear_remote")]
+        #[arg(
+            short = 'r',
+            long = "remote",
+            conflicts_with = "clear_remote",
+            help = "Set SSH host"
+        )]
         remote: Option<String>,
-        #[arg(long = "clear-remote", conflicts_with = "remote")]
+        #[arg(
+            long = "clear-remote",
+            conflicts_with = "remote",
+            help = "Unset SSH host"
+        )]
         clear_remote: bool,
-        #[arg(short = 'd', long = "dir", conflicts_with = "clear_dir")]
+        #[arg(
+            short = 'd',
+            long = "dir",
+            conflicts_with = "clear_dir",
+            help = "Set remote working directory"
+        )]
         dir: Option<String>,
-        #[arg(long = "clear-dir", conflicts_with = "dir")]
+        #[arg(
+            long = "clear-dir",
+            conflicts_with = "dir",
+            help = "Unset remote working directory"
+        )]
         clear_dir: bool,
         #[arg(
             short = 'p',
             long = "ports",
             value_delimiter = ',',
-            conflicts_with = "clear_ports"
+            conflicts_with = "clear_ports",
+            help = "Forward remote port(s), repeatable or comma-separated"
         )]
         ports: Option<Vec<u16>>,
-        #[arg(long = "clear-ports", conflicts_with = "ports")]
+        #[arg(
+            long = "clear-ports",
+            conflicts_with = "ports",
+            help = "Unset forwarded ports"
+        )]
         clear_ports: bool,
-        #[arg(long = "clear-command")]
+        #[arg(long = "clear-command", help = "Unset default command")]
         clear_command: bool,
-        #[arg(trailing_var_arg = true)]
+        #[arg(
+            trailing_var_arg = true,
+            help = "Set default command (everything after `--`)"
+        )]
         command: Vec<String>,
     },
-    #[command(about = "Delete a workspace configuration")]
+    #[command(about = "Delete a workspace configuration", hide = true)]
     Rm {
         #[arg(help = "Workspace name (org/project format allowed)")]
         name: String,
@@ -237,7 +275,12 @@ enum Commands {
             help = "SSH host (overrides workspace/org default)"
         )]
         remote: Option<String>,
-        #[arg(short = 'p', long = "ports", value_delimiter = ',')]
+        #[arg(
+            short = 'p',
+            long = "ports",
+            value_delimiter = ',',
+            help = "Forward remote port(s), repeatable or comma-separated"
+        )]
         ports: Vec<u16>,
         #[arg(
             short = 'd',
@@ -265,7 +308,8 @@ enum Commands {
         no_deploy: bool,
         #[arg(
             long = "new",
-            help = "Force a fresh session even if one is already alive (default: resume if a session exists)"
+            hide = true,
+            help = "Compatibility no-op: enter already starts a fresh session per invocation"
         )]
         new: bool,
         #[arg(
@@ -298,6 +342,7 @@ enum Commands {
         #[arg(
             long = "resume-or-new",
             conflicts_with = "new",
+            hide = true,
             help = "Attach to an existing session if one exists, else create new (the verb `berth enter` invokes on the remote)"
         )]
         resume_or_new: bool,
@@ -326,6 +371,7 @@ enum Commands {
         long: bool,
         #[arg(
             long = "supervisor",
+            hide = true,
             help = "Internal: run as the session supervisor in the foreground"
         )]
         supervisor: bool,
@@ -398,12 +444,10 @@ enum Commands {
     )]
     Shell(ShellSubcommands),
     #[command(
-        about = "Dump recent berth activity from local + supervisor logs",
-        long_about = "Print the tail of the global berth log plus any per-session \
-                      supervisor logs (which capture the PTY child's stdout+stderr — \
-                      this is where a failed shell command's error text ends up).\n\n\
-                      Useful for sharing state back to an AI agent or coworker when \
-                      something hangs or errors unexpectedly.\n\n\
+        about = "Show recent berth logs",
+        long_about = "Show recent berth logs.\n\n\
+                      Includes global logs and, with --sessions, session supervisor logs. \
+                      Use --follow to stream new entries.\n\n\
                       Examples:\n  \
                       berth logs --level warn\n  \
                       berth logs --follow --level warn"
@@ -427,7 +471,7 @@ enum Commands {
     },
     #[command(about = "Show shell-integration + local runtime status")]
     Doctor,
-    #[command(about = "Run the local Berth daemon in the foreground")]
+    #[command(about = "Run the local Berth daemon in the foreground", hide = true)]
     Daemon {
         #[arg(
             long = "interval-seconds",
@@ -441,7 +485,7 @@ enum Commands {
         )]
         once: bool,
     },
-    #[command(about = "Stop expired local container environments")]
+    #[command(about = "Stop expired local container environments", hide = true)]
     Reap,
     #[command(
         about = "Deploy the berth binary to a remote host over SSH",
@@ -450,8 +494,9 @@ enum Commands {
                       SHA256), and scp it to ~/.local/bin/berth on the remote.\n\
                       \n\
                       Subsequent `berth enter --remote <host>` invocations will then run\n\
-                      `berth attach --new <ws>` on the far side for full per-tab independent\n\
-                      sessions and resume support.\n\
+                      `berth attach --new --session <id> <ws>` on the far side, so each\n\
+                      enter invocation gets an independent session while transport reconnects\n\
+                      return to that same session.\n\
                       \n\
                       Adds the host to `trusted_hosts` in the config on success so future\n\
                       enters auto-deploy without prompting when the remote binary is stale\n\
@@ -468,11 +513,77 @@ enum Commands {
         #[arg(long = "force", help = "Redeploy even if the remote binary matches")]
         force: bool,
     },
-    #[command(about = "Run berth agent on remote machine (internal)")]
+    #[command(about = "Run berth agent on remote machine (internal)", hide = true)]
     Agent {
         #[arg(short = 'p', long = "ports", value_delimiter = ',')]
         ports: Vec<u16>,
     },
+    #[command(hide = true)]
+    VersionInfo,
+    #[command(hide = true)]
+    HookRun {
+        #[arg(help = "Path to a berth .invoke file")]
+        invoke_file: std::path::PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    #[command(about = "List configured workspaces")]
+    List {
+        #[arg(short = 'l', long = "long", help = "Show resolved config blocks")]
+        long: bool,
+        #[arg(long = "abs", help = "Render last-used as absolute UTC timestamps")]
+        abs: bool,
+    },
+    #[command(about = "Show one workspace config")]
+    Show {
+        #[arg(help = "Workspace name")]
+        name: String,
+    },
+    #[command(about = "Create or update a workspace config")]
+    Set {
+        #[arg(help = "Workspace name")]
+        name: String,
+        #[arg(long = "path", help = "Local path for the workspace when creating it")]
+        path: Option<String>,
+        #[arg(short = 'r', long = "remote", help = "Set SSH host")]
+        remote: Option<String>,
+        #[arg(short = 'd', long = "dir", help = "Set remote working directory")]
+        dir: Option<String>,
+        #[arg(
+            short = 'p',
+            long = "ports",
+            value_delimiter = ',',
+            help = "Forward remote port(s), repeatable or comma-separated"
+        )]
+        ports: Option<Vec<u16>>,
+        #[arg(
+            trailing_var_arg = true,
+            help = "Set default command (everything after `--`)"
+        )]
+        command: Vec<String>,
+    },
+    #[command(about = "Unset workspace config fields")]
+    Unset {
+        #[arg(help = "Workspace name")]
+        name: String,
+        #[arg(value_enum, help = "Field(s) to unset: remote dir ports command")]
+        fields: Vec<ConfigUnsetField>,
+    },
+    #[command(about = "Delete a workspace config")]
+    Rm {
+        #[arg(help = "Workspace name")]
+        name: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ConfigUnsetField {
+    Remote,
+    Dir,
+    Ports,
+    Command,
 }
 
 #[derive(Subcommand)]
@@ -556,6 +667,76 @@ impl Cli {
     pub async fn run(self) -> anyhow::Result<()> {
         if let Some(cmd) = self.command {
             match cmd {
+                Commands::Config(command) => match command {
+                    ConfigCommands::List { long, abs } => commands::list::run(long, abs).await,
+                    ConfigCommands::Show { name } => {
+                        berth::validate_workspace_name(&name)?;
+                        commands::project::show(name).await
+                    }
+                    ConfigCommands::Set {
+                        name,
+                        path,
+                        remote,
+                        dir,
+                        ports,
+                        command,
+                    } => {
+                        berth::validate_workspace_name(&name)?;
+                        if let Some(host) = &remote {
+                            berth::validate_ssh_host(host)?;
+                        }
+                        let exists = berth::config::Config::load()?
+                            .workspaces
+                            .contains_key(&name);
+                        if exists {
+                            if path.is_some() {
+                                anyhow::bail!(
+                                    "`berth config set <existing> <path>` is ambiguous; \
+                                     omit the path or recreate the workspace config"
+                                );
+                            }
+                            commands::project::set(commands::project::SetArgs {
+                                name,
+                                remote,
+                                clear_remote: false,
+                                dir,
+                                clear_dir: false,
+                                ports,
+                                clear_ports: false,
+                                command,
+                                clear_command: false,
+                            })
+                            .await
+                        } else {
+                            commands::new::run(commands::new::NewArgs {
+                                name,
+                                path,
+                                remote,
+                                ports: ports.unwrap_or_default(),
+                                remote_dir: dir,
+                                command,
+                            })
+                            .await
+                        }
+                    }
+                    ConfigCommands::Unset { name, fields } => {
+                        berth::validate_workspace_name(&name)?;
+                        let fields = fields
+                            .into_iter()
+                            .map(|field| match field {
+                                ConfigUnsetField::Remote => commands::project::UnsetField::Remote,
+                                ConfigUnsetField::Dir => commands::project::UnsetField::Dir,
+                                ConfigUnsetField::Ports => commands::project::UnsetField::Ports,
+                                ConfigUnsetField::Command => commands::project::UnsetField::Command,
+                            })
+                            .collect();
+                        commands::project::unset(name, fields).await
+                    }
+                    ConfigCommands::Rm { name } => {
+                        berth::validate_workspace_name(&name)?;
+                        commands::delete::run(name).await
+                    }
+                },
                 Commands::List { long, abs } => commands::list::run(long, abs).await,
                 Commands::Show { name } => {
                     berth::validate_workspace_name(&name)?;
@@ -742,6 +923,12 @@ impl Cli {
                     commands::deploy::run(host, tag, force).await
                 }
                 Commands::Agent { ports } => commands::agent::run(ports).await,
+                Commands::VersionInfo => {
+                    println!("VERSION={}", berth::build_info::version());
+                    println!("BUILD={}", berth::build_info::build_id());
+                    Ok(())
+                }
+                Commands::HookRun { invoke_file } => commands::shell::run_hook_file(&invoke_file),
             }
         } else {
             commands::list::run(false, false).await

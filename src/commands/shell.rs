@@ -2,6 +2,7 @@ use anyhow::{bail, Result};
 use clap::{CommandFactory, ValueEnum};
 use clap_complete::Shell as CompletionShell;
 use std::io;
+use std::path::Path;
 
 #[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
 pub enum HookShell {
@@ -46,14 +47,251 @@ pub fn run_completions(shell: Option<CompletionShell>) -> Result<()> {
     let script = String::from_utf8(buf)
         .map_err(|e| anyhow::anyhow!("completion script was not valid utf-8: {e}"))?;
 
+    let visible = hide_completion_artifacts(&script, shell);
     let augmented = match shell {
-        CompletionShell::Zsh => augment_zsh(&script),
-        CompletionShell::Bash => augment_bash(&script),
-        _ => script,
+        CompletionShell::Zsh => augment_zsh(&visible),
+        CompletionShell::Bash => augment_bash(&visible),
+        _ => visible,
     };
     use io::Write;
     io::stdout().write_all(augmented.as_bytes())?;
     Ok(())
+}
+
+fn hide_completion_artifacts(script: &str, shell: CompletionShell) -> String {
+    const HIDDEN_TOP: &[&str] = &[
+        "list",
+        "show",
+        "new",
+        "set",
+        "rm",
+        "daemon",
+        "reap",
+        "agent",
+        "version-info",
+        "hook-run",
+    ];
+    const HIDDEN_INTERNAL: &[&str] = &["daemon", "reap", "agent", "version-info", "hook-run"];
+    const HIDDEN_ATTACH_FLAGS: &[&str] = &["resume-or-new", "supervisor", "session-counts"];
+    const HIDDEN_ENTER_FLAGS: &[&str] = &["new"];
+
+    match shell {
+        CompletionShell::Bash => {
+            let mut out = String::with_capacity(script.len());
+            for line in script.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("opts=")
+                    && line.contains("--resume-or-new")
+                    && line.contains("--session-counts")
+                {
+                    out.push_str(&remove_long_flags(line, HIDDEN_ATTACH_FLAGS));
+                    out.push('\n');
+                } else if trimmed.starts_with("opts=") && line.contains("--new") {
+                    out.push_str(&remove_long_flags(line, HIDDEN_ENTER_FLAGS));
+                    out.push('\n');
+                } else if line.trim_start().starts_with("opts=")
+                    && line.contains("config list show new set rm enter")
+                {
+                    out.push_str("            opts=\"-v -q -h -V --verbose --quiet --help --version config enter attach stop run tunnel org hosts shell logs doctor deploy help\"\n");
+                } else {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        CompletionShell::Fish => {
+            let mut out = String::with_capacity(script.len());
+            for line in script.lines() {
+                if fish_line_is_hidden(line, HIDDEN_TOP, HIDDEN_INTERNAL, HIDDEN_ATTACH_FLAGS) {
+                    continue;
+                }
+                if line.contains("__fish_berth_using_subcommand enter") && line.contains("-l new") {
+                    continue;
+                }
+                let line = sanitize_fish_seen_subcommand_list(line, HIDDEN_TOP);
+                out.push_str(&line);
+                out.push('\n');
+            }
+            out
+        }
+        CompletionShell::Zsh => {
+            let mut out = String::with_capacity(script.len());
+            let mut top_command_function = false;
+            for line in script.lines() {
+                let trimmed = line.trim();
+                if line.contains("_berth_commands()")
+                    || line.contains("_berth__subcmd__help_commands()")
+                {
+                    top_command_function = true;
+                } else if top_command_function && trimmed == "}" {
+                    top_command_function = false;
+                }
+                if zsh_line_is_hidden(
+                    line,
+                    HIDDEN_TOP,
+                    HIDDEN_INTERNAL,
+                    HIDDEN_ATTACH_FLAGS,
+                    HIDDEN_ENTER_FLAGS,
+                    top_command_function,
+                ) {
+                    continue;
+                }
+                out.push_str(line);
+                out.push('\n');
+            }
+            out
+        }
+        CompletionShell::Elvish | CompletionShell::PowerShell => {
+            hide_line_oriented_completion_artifacts(
+                script,
+                HIDDEN_TOP,
+                HIDDEN_INTERNAL,
+                HIDDEN_ATTACH_FLAGS,
+                HIDDEN_ENTER_FLAGS,
+            )
+        }
+        _ => hide_line_oriented_completion_artifacts(
+            script,
+            HIDDEN_TOP,
+            HIDDEN_INTERNAL,
+            HIDDEN_ATTACH_FLAGS,
+            HIDDEN_ENTER_FLAGS,
+        ),
+    }
+}
+
+fn fish_line_is_hidden(
+    line: &str,
+    hidden_top: &[&str],
+    hidden_internal: &[&str],
+    hidden_flags: &[&str],
+) -> bool {
+    hidden_top.iter().any(|cmd| {
+        line.contains("__fish_berth_needs_command") && line.contains(&format!("-a \"{cmd}\""))
+            || line.contains("__fish_berth_using_subcommand help")
+                && line.contains(&format!("-a \"{cmd}\""))
+            || line.contains(&format!("__fish_berth_using_subcommand {cmd}\""))
+    }) || hidden_internal
+        .iter()
+        .any(|cmd| line.contains(&format!("__fish_berth_using_subcommand {cmd}")))
+        || hidden_flags.iter().any(|flag| {
+            line.contains("__fish_berth_using_subcommand attach")
+                && line.contains(&format!("-l {flag}"))
+        })
+}
+
+fn sanitize_fish_seen_subcommand_list(line: &str, hidden_top: &[&str]) -> String {
+    if !line.contains("__fish_seen_subcommand_from")
+        || !line.contains("__fish_berth_using_subcommand help")
+    {
+        return line.to_string();
+    }
+    remove_words(line, hidden_top)
+}
+
+fn zsh_line_is_hidden(
+    line: &str,
+    hidden_top: &[&str],
+    _hidden_internal: &[&str],
+    hidden_flags: &[&str],
+    hidden_enter_flags: &[&str],
+    top_command_function: bool,
+) -> bool {
+    (top_command_function
+        && hidden_top
+            .iter()
+            .any(|cmd| line.trim_start().starts_with(&format!("'{cmd}:"))))
+        || line.contains("--interval-seconds")
+        || line.contains("--once[Run one daemon")
+        || hidden_flags
+            .iter()
+            .any(|flag| line.contains(&format!("--{flag}")))
+        || hidden_enter_flags
+            .iter()
+            .any(|flag| line.contains(&format!("--{flag}[")))
+}
+
+fn hide_line_oriented_completion_artifacts(
+    script: &str,
+    hidden_top: &[&str],
+    hidden_internal: &[&str],
+    hidden_attach_flags: &[&str],
+    hidden_enter_flags: &[&str],
+) -> String {
+    script
+        .lines()
+        .filter(|line| {
+            !hidden_top.iter().any(|cmd| {
+                line.contains(&format!(" {cmd} "))
+                    || line.contains(&format!("'{cmd}'"))
+                    || line.contains(&format!("\"{cmd}\""))
+            }) && !hidden_internal.iter().any(|cmd| line.contains(cmd))
+                && !hidden_attach_flags
+                    .iter()
+                    .any(|flag| line.contains(&format!("--{flag}")))
+                && !hidden_enter_flags
+                    .iter()
+                    .any(|flag| line.contains(&format!("--{flag}")))
+        })
+        .map(|line| format!("{line}\n"))
+        .collect()
+}
+
+fn remove_words(line: &str, words: &[&str]) -> String {
+    let mut out = line.to_string();
+    for word in words {
+        out = out.replace(&format!(" {word}"), "");
+        out = out.replace(&format!("{word} "), "");
+    }
+    out
+}
+
+fn remove_long_flags(line: &str, flags: &[&str]) -> String {
+    let mut out = line.to_string();
+    for flag in flags {
+        out = out.replace(&format!(" --{flag}"), "");
+    }
+    out
+}
+
+pub fn run_hook_file(path: &Path) -> Result<()> {
+    let line = std::fs::read_to_string(path)?;
+    let argv = hook_argv(&line)?;
+    let status = std::process::Command::new(std::env::current_exe()?)
+        .env("BERTH_FROM_HOOK", "1")
+        .env("BERTH_SKIP_AUTO", "1")
+        .args(argv)
+        .status()?;
+    std::process::exit(status.code().unwrap_or(1));
+}
+
+fn hook_argv(line: &str) -> Result<Vec<String>> {
+    let tokens = shell_words::split(line.trim())?;
+    if tokens.len() < 4 {
+        bail!("malformed hook invoke file");
+    }
+    let current_prefix = tokens[0] == "BERTH_FROM_HOOK=1"
+        && tokens[1] == "BERTH_SKIP_AUTO=1"
+        && tokens[2] == "command"
+        && tokens[3] == "berth";
+    let legacy_prefix = tokens[0] == "BERTH_SKIP_AUTO=1"
+        && tokens[1] == "command"
+        && tokens[2] == "berth"
+        && tokens[3] == "enter";
+    if current_prefix || legacy_prefix {
+        let mut argv = if legacy_prefix {
+            vec!["enter".to_string()]
+        } else {
+            Vec::new()
+        };
+        argv.extend(tokens[4..].iter().cloned());
+        if argv.first().map(|s| s.as_str()) != Some("enter") {
+            bail!("hook invoke file must run `berth enter`");
+        }
+        return Ok(argv);
+    }
+    bail!("malformed hook invoke file");
 }
 
 /// zsh: clap emits the workspace-name positional as `:_default`. Swap it
@@ -143,7 +381,7 @@ _berth_with_dynamic() {
 
     local top="${COMP_WORDS[1]}"
     case "$top" in
-        enter|show|set|rm|stop|run|attach|tunnel|new|tunnel)
+        enter|stop|run|attach|tunnel)
             if (( COMP_CWORD == 2 )); then
                 COMPREPLY=( $(compgen -W "$(_berth_workspace_names)" -- "$cur") )
             fi
@@ -186,11 +424,8 @@ fn init_script(shell: HookShell) -> String {
 const COMMON_PRELUDE: &str = r#"# berth shell integration: new-tab auto-entry hook
 # Generated by `berth shell init`. Re-run after upgrading berth.
 #
-# Auto-entry signal cascade for new tabs:
-#   1. WezTerm/iTerm2 user var       (pane-scoped, doesn't cross tabs yet)
-#   2. BERTH_PROJECT_HINT env var    (explicit override)
-#   3. OSC 7 inherited PWD marker    (universal; how new tabs actually work)
-#   4. ~/.local/state/berth/last-active (WSL+WinTerm fallback, time-gated)
+# Auto-entry signal:
+#   OSC 7 inherited PWD marker under ~/.local/state/berth/active.
 #
 # When the marker path is detected, the hook `cd`s to $HOME *before*
 # invoking `berth enter`, so the user is never parked in the marker dir.
@@ -203,10 +438,6 @@ _berth_state_dir() {
 }
 
 _berth_detect_project() {
-    if [ -n "${WEZTERM_USER_VAR_BERTH_PROJECT:-}" ]; then
-        printf '%s' "$WEZTERM_USER_VAR_BERTH_PROJECT"
-        return 0
-    fi
     if [ -n "${BERTH_PROJECT_HINT:-}" ]; then
         printf '%s' "$BERTH_PROJECT_HINT"
         return 0
@@ -244,7 +475,7 @@ _berth_auto_enter_on_start() {
         *) return 0 ;;
     esac
 
-    local state_dir invoke_file invoke_line proj
+    local state_dir invoke_file invoke_line proj status
     state_dir="$(_berth_state_dir)"
 
     # 1. Cwd-inheritance path: detect workspace from $PWD if it's inside
@@ -257,18 +488,27 @@ _berth_auto_enter_on_start() {
         esac
         invoke_file="$state_dir/$(printf '%s' "$proj" | sed 's|/|_|g')/.invoke"
         if [ -r "$invoke_file" ]; then
-            # eval the exact `berth enter --new <ws> [--dir D] [-- argv]`
+            # Run the exact `berth enter <ws> [--dir D] [-- argv]`
             # line written by the parent tab. Replays workspace + dir +
-            # command override verbatim. Prefix-guard the contents so a
-            # same-uid process planting a different shape can only run
-            # `berth enter --new …`, not arbitrary commands.
+            # command override verbatim. Parsing is delegated back to
+            # berth so this hook does not eval file contents as shell.
             invoke_line="$(cat "$invoke_file" 2>/dev/null)"
             case "$invoke_line" in
-                "BERTH_SKIP_AUTO=1 command berth enter --new "*)
-                    if ! eval "$invoke_line"; then
-                        printf 'berth: auto-enter failed (exit %s). Skipping.\n' "$?" >&2
+                "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter "*)
+                    command berth hook-run "$invoke_file"
+                    status=$?
+                    if [ "$status" -ne 0 ]; then
+                        printf 'berth: auto-enter failed. Skipping.\n' >&2
                     fi
-                    return $?
+                    return "$status"
+                    ;;
+                "BERTH_SKIP_AUTO=1 command berth enter --new "*)
+                    command berth hook-run "$invoke_file"
+                    status=$?
+                    if [ "$status" -ne 0 ]; then
+                        printf 'berth: auto-enter failed. Skipping.\n' >&2
+                    fi
+                    return "$status"
                     ;;
                 ?*)
                     printf 'berth: ignoring malformed .invoke (%s)\n' "$invoke_file" >&2
@@ -276,35 +516,8 @@ _berth_auto_enter_on_start() {
             esac
         fi
         # Fall back to bare invocation if marker exists but no .invoke.
-        export BERTH_SKIP_AUTO=1
-        command berth enter --new "$proj"
+        BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter "$proj"
         return $?
-    fi
-
-    # 2. Fallback path: cwd inheritance failed (e.g. WSL + Windows
-    #    Terminal can't honor OSC 7 paths pointing at the remote box).
-    #    Read the global last-active pointer — last writer wins. Tight
-    #    time gate (10 min) bounds the window in which a same-uid
-    #    process planting this file could get arbitrary code eval'd
-    #    in the user's next interactive shell. The expected workflow
-    #    (open new tab seconds-to-minutes after `berth enter`) fits
-    #    comfortably inside this window.
-    local last_file
-    last_file="${XDG_STATE_HOME:-$HOME/.local/state}/berth/last-active"
-    if [ -r "$last_file" ]; then
-        if [ -n "$(find "$last_file" -mmin -10 2>/dev/null)" ]; then
-            invoke_line="$(cat "$last_file" 2>/dev/null)"
-            # Defense-in-depth: only eval lines that match the exact
-            # shape berth writes. An attacker who pre-creates this file
-            # is constrained to invoking `berth enter --new …`, not
-            # arbitrary shell.
-            case "$invoke_line" in
-                "BERTH_SKIP_AUTO=1 command berth enter --new "*)
-                    eval "$invoke_line"
-                    return $?
-                    ;;
-            esac
-        fi
     fi
     return 0
 }
@@ -341,3 +554,28 @@ fi
 
 const COMMON_EPILOGUE: &str = r#"# end berth shell integration
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::hook_argv;
+
+    #[test]
+    fn hook_argv_accepts_current_format() {
+        let argv = hook_argv(
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter 'org/proj' -- 'echo' 'a && b'",
+        )
+        .unwrap();
+        assert_eq!(argv, ["enter", "org/proj", "--", "echo", "a && b"]);
+    }
+
+    #[test]
+    fn hook_argv_accepts_legacy_format() {
+        let argv = hook_argv("BERTH_SKIP_AUTO=1 command berth enter --new 'org/proj'").unwrap();
+        assert_eq!(argv, ["enter", "--new", "org/proj"]);
+    }
+
+    #[test]
+    fn hook_argv_rejects_non_enter() {
+        assert!(hook_argv("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth logs").is_err());
+    }
+}

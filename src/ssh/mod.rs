@@ -172,7 +172,7 @@ pub async fn ssh_attach_remote(
 ) -> Result<i32> {
     let config = Config::load()?;
     let mut remote = String::from(
-        "berth_bin=; if command -v berth >/dev/null 2>&1; then berth_bin=$(command -v berth); elif [ -x \"$HOME/.local/bin/berth\" ]; then berth_bin=\"$HOME/.local/bin/berth\"; else printf 'berth not found on remote\\n' >&2; exit 127; fi; BERTH_ATTACH_LOCAL=1 ",
+        "berth_bin=; if [ -x \"$HOME/.local/bin/berth\" ]; then berth_bin=\"$HOME/.local/bin/berth\"; elif command -v berth >/dev/null 2>&1; then berth_bin=$(command -v berth); else printf 'berth not found on remote\\n' >&2; exit 127; fi; BERTH_ATTACH_LOCAL=1 ",
     );
     remote.push_str("BERTH_DETACH_KEY=");
     remote.push_str(&shell_escape_arg(&config.detach_key_env_value()));
@@ -356,17 +356,15 @@ fn remote_enter_command_with(
     //   3. tmux / screen: legacy multiplexers if installed. Each invocation
     //      uses a unique session id so tabs don't pile into one session.
     //   4. plain shell: last resort, no reattach guarantee.
-    // `command -v berth` alone misses our deployed-to-`~/.local/bin/berth`
-    // path on hosts where that dir is only on the *interactive* shell's
-    // PATH (e.g. Ubuntu sources it from `.profile`, which `ssh host cmd`
-    // does not see). Probe both, with the explicit path as the fallback.
+    // Prefer the binary Berth deploys to. PATH may contain an older package
+    // install, and using it can silently restore old attach semantics.
     format!(
         "{base} && \
          berth_bin=; \
-         if command -v berth >/dev/null 2>&1; then \
-           berth_bin=$(command -v berth); \
-         elif [ -x \"$HOME/.local/bin/berth\" ]; then \
+         if [ -x \"$HOME/.local/bin/berth\" ]; then \
            berth_bin=\"$HOME/.local/bin/berth\"; \
+         elif command -v berth >/dev/null 2>&1; then \
+           berth_bin=$(command -v berth); \
          fi; \
          if [ -n \"$berth_bin\" ]; then \
            {attach_env}exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
@@ -387,22 +385,23 @@ fn shell_escape_arg(input: &str) -> String {
 }
 
 /// Turn a user-supplied remote path into a single shell expression that
-/// expands `$HOME` / `~` correctly on the remote and quotes everything
-/// else. POSIX `~` expansion only happens *outside* quotes and only at
-/// the very start of a word, so we treat a leading `~/` (or bare `~`) as
-/// a special token and emit `"$HOME"/...rest...`. Everything else is
-/// double-quoted so values like `$HOME/foo/bar` still expand `$HOME`
-/// while characters like spaces or semicolons are kept literal.
+/// expands safe leading `$HOME` / `~` forms on the remote and quotes
+/// everything else as literal path text. Do not use double quotes for
+/// user/config paths: command substitution still runs inside them.
 fn normalize_remote_path(path: &str) -> String {
     if path == "~" {
         return "\"$HOME\"".to_string();
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        let rest_escaped = rest.replace('"', "\\\"");
-        return format!("\"$HOME\"/\"{rest_escaped}\"");
+        return format!("\"$HOME\"/{}", shell_escape_arg(rest));
     }
-    let escaped = path.replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    if path == "$HOME" {
+        return "\"$HOME\"".to_string();
+    }
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return format!("\"$HOME\"/{}", shell_escape_arg(rest));
+    }
+    shell_escape_arg(path)
 }
 
 #[cfg(test)]
@@ -411,15 +410,16 @@ fn normalize_remote_path_handles_tilde_and_dollar_home() {
     assert_eq!(normalize_remote_path("~"), "\"$HOME\"");
     assert_eq!(
         normalize_remote_path("~/code/org/proj"),
-        "\"$HOME\"/\"code/org/proj\""
+        "\"$HOME\"/'code/org/proj'"
     );
     assert_eq!(
         normalize_remote_path("$HOME/code/proj"),
-        "\"$HOME/code/proj\""
+        "\"$HOME\"/'code/proj'"
     );
+    assert_eq!(normalize_remote_path("/var/work/proj"), "'/var/work/proj'");
     assert_eq!(
-        normalize_remote_path("/var/work/proj"),
-        "\"/var/work/proj\""
+        normalize_remote_path("$(touch pwn)/proj"),
+        "'$(touch pwn)/proj'"
     );
 }
 

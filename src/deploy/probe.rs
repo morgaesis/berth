@@ -14,29 +14,30 @@ pub struct RemoteEnv {
     pub arch: String,
     pub berth_path: Option<String>,
     pub berth_version: Option<String>,
+    pub berth_build: Option<String>,
     pub home: String,
     pub path_env: String,
 }
 
-// `command -v berth` alone is insufficient: `~/.local/bin` is on most
-// users' interactive-shell PATH (Ubuntu's `.profile` adds it) but NOT on
-// the PATH a non-interactive `ssh host cmd` session sees. We deployed to
-// `~/.local/bin/berth`, so we explicitly probe that path as a fallback.
+// Prefer the path Berth deploys to. A PATH-provided binary may exist, but
+// it is not the binary this client controls and may be stale.
 const PROBE_SCRIPT: &str = "\
 printf 'OS=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\"; \
 printf 'ARCH=%s\\n' \"$(uname -m 2>/dev/null || echo unknown)\"; \
 printf 'HOME=%s\\n' \"$HOME\"; \
 printf 'PATH=%s\\n' \"$PATH\"; \
 berth_bin=; \
-if command -v berth >/dev/null 2>&1; then \
-  berth_bin=$(command -v berth); \
-elif [ -x \"$HOME/.local/bin/berth\" ]; then \
+if [ -x \"$HOME/.local/bin/berth\" ]; then \
   berth_bin=\"$HOME/.local/bin/berth\"; \
+elif command -v berth >/dev/null 2>&1; then \
+  berth_bin=$(command -v berth); \
 fi; \
 if [ -n \"$berth_bin\" ]; then \
   printf 'BERTH_PATH=%s\\n' \"$berth_bin\"; \
   v=$(\"$berth_bin\" --version 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {print $i; exit}}'); \
   [ -n \"$v\" ] && printf 'BERTH_VERSION=%s\\n' \"$v\"; \
+  b=$(\"$berth_bin\" version-info 2>/dev/null | awk -F= '$1==\"BUILD\" {print $2; exit}'); \
+  [ -n \"$b\" ] && printf 'BERTH_BUILD=%s\\n' \"$b\"; \
 fi";
 
 /// Run the probe over SSH and parse the result.
@@ -51,6 +52,7 @@ pub async fn probe(host: &str) -> Result<RemoteEnv> {
     tracing::info!(
         os = %env.os, arch = %env.arch,
         existing_berth = ?env.berth_version,
+        existing_build = ?env.berth_build,
         "probe complete"
     );
     Ok(env)
@@ -63,6 +65,7 @@ fn parse(raw: &str) -> Result<RemoteEnv> {
     let mut path_env = None;
     let mut berth_path = None;
     let mut berth_version = None;
+    let mut berth_build = None;
     for line in raw.lines() {
         let line = line.trim();
         let Some((key, value)) = line.split_once('=') else {
@@ -75,6 +78,7 @@ fn parse(raw: &str) -> Result<RemoteEnv> {
             "PATH" => path_env = Some(value.to_string()),
             "BERTH_PATH" => berth_path = Some(value.to_string()),
             "BERTH_VERSION" => berth_version = Some(value.to_string()),
+            "BERTH_BUILD" => berth_build = sanitize_build_id(value),
             _ => {}
         }
     }
@@ -83,9 +87,20 @@ fn parse(raw: &str) -> Result<RemoteEnv> {
         arch: arch.context("probe output missing ARCH=")?,
         berth_path,
         berth_version,
+        berth_build,
         home: home.unwrap_or_default(),
         path_env: path_env.unwrap_or_default(),
     })
+}
+
+fn sanitize_build_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= 80
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    .then(|| value.to_string())
 }
 
 #[cfg(test)]
@@ -101,13 +116,15 @@ mod tests {
         assert_eq!(env.home, "/home/me");
         assert!(env.berth_path.is_none());
         assert!(env.berth_version.is_none());
+        assert!(env.berth_build.is_none());
     }
 
     #[test]
     fn parse_with_existing_berth() {
-        let raw = "OS=Linux\nARCH=aarch64\nHOME=/home/me\nPATH=/usr/bin:/home/me/.local/bin\nBERTH_PATH=/home/me/.local/bin/berth\nBERTH_VERSION=0.1.0\n";
+        let raw = "OS=Linux\nARCH=aarch64\nHOME=/home/me\nPATH=/usr/bin:/home/me/.local/bin\nBERTH_PATH=/home/me/.local/bin/berth\nBERTH_VERSION=0.1.0\nBERTH_BUILD=abc123\n";
         let env = parse(raw).unwrap();
         assert_eq!(env.berth_version.as_deref(), Some("0.1.0"));
+        assert_eq!(env.berth_build.as_deref(), Some("abc123"));
         assert_eq!(env.berth_path.as_deref(), Some("/home/me/.local/bin/berth"));
     }
 

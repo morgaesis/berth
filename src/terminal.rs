@@ -1,9 +1,10 @@
 // Terminal control signals for new-tab auto-entry.
 //
 // Cascade of signals (best to worst), all emitted at enter time:
-//   1. OSC 1337 SetUserVar=BERTH_PROJECT=<b64> — semantic, pane-local in
-//      WezTerm/iTerm2. Doesn't propagate to new tabs in either emulator,
-//      but cheap to emit and future-proof.
+//   1. OSC 1337 SetUserVar=BERTH_PROJECT=<b64> — semantic breadcrumb for
+//      terminals that expose pane metadata. The shell hook deliberately
+//      does not auto-enter from this alone because some fresh terminal
+//      launches can inherit user variables without inheriting cwd.
 //   2. OSC 7 cwd report pointing at a per-workspace marker directory under
 //      $XDG_STATE_HOME/berth/active/. This is the only mechanism that
 //      reliably propagates to new tabs across common emulators (WezTerm,
@@ -89,8 +90,8 @@ fn title_safe(s: &str) -> String {
 /// Inputs the shell hook needs to exactly replicate this `berth enter`
 /// in a new tab: which workspace, which remote dir override (if any),
 /// and which command override (if any). The hook serializes these into
-/// a single `BERTH_SKIP_AUTO=1 command berth enter --new …` line that
-/// it `eval`s on new-tab startup.
+/// a single `BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter …` line that
+/// it passes back to `berth hook-run` on new-tab startup.
 pub struct EnterSignal<'a> {
     pub workspace: &'a str,
     pub dir: Option<&'a str>,
@@ -101,10 +102,10 @@ pub struct EnterSignal<'a> {
 /// `'"'"'` so the result is always one shell word.
 ///
 /// NUL and other ASCII control bytes are dropped — they can't appear in
-/// a shell line (NUL truncates `eval` input on most shells; other
-/// controls would corrupt the invoke file). User input that contains
-/// them was almost certainly a mistake; silently filtering is safer
-/// than letting them through.
+/// a line that is later parsed as shell words, and other controls would
+/// corrupt the invoke file. User input that contains them was almost
+/// certainly a mistake; silently filtering is safer than letting them
+/// through.
 fn shell_quote(s: &str) -> String {
     let cleaned: String = s
         .chars()
@@ -133,9 +134,9 @@ fn write_secure(path: &Path, contents: &[u8]) -> io::Result<()> {
     f.write_all(contents)
 }
 
-/// Build the exact line the new-tab hook should evaluate.
+/// Build the exact line the new-tab hook should replay.
 fn build_invoke_line(signal: &EnterSignal<'_>) -> String {
-    let mut out = String::from("BERTH_SKIP_AUTO=1 command berth enter --new ");
+    let mut out = String::from("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter ");
     out.push_str(&shell_quote(signal.workspace));
     if let Some(d) = signal.dir {
         out.push_str(" --dir ");
@@ -153,11 +154,12 @@ fn build_invoke_line(signal: &EnterSignal<'_>) -> String {
     out
 }
 
-/// Location of the global "last-active workspace" pointer. Single file,
-/// last writer wins. Used by the shell hook as a fallback signal in
-/// environments where OSC 7 cwd inheritance doesn't reach new tabs —
-/// notably Windows Terminal + WSL, where the remote shell's chpwd
-/// emits OSC 7 with remote paths that fail to chdir locally.
+/// Legacy location of the global "last-active workspace" pointer.
+///
+/// New hook code no longer reads or writes this file: it caused fresh
+/// terminal windows to auto-enter a workspace even when they were not
+/// opened from a Berth tab. Keep the path helper so `emit_exit_signals`
+/// can clean up stale files written by older versions.
 pub fn last_active_path() -> PathBuf {
     let base = if let Ok(dir) = std::env::var("XDG_STATE_HOME") {
         PathBuf::from(dir)
@@ -179,19 +181,12 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
     // Canonical workspace name (slash-preserving) for the basename →
     // name fallback path.
     let _ = write_secure(&dir.join(".workspace"), signal.workspace.as_bytes());
-    // Exact re-invocation line. Hook reads + evals this — write with
+    // Exact re-invocation line. Hook reads this via `berth hook-run` —
+    // write with
     // O_NOFOLLOW + mode 0600 so a same-uid process can't redirect the
     // write via a planted symlink or read what we wrote.
     let invoke = build_invoke_line(signal);
     let _ = write_secure(&dir.join(".invoke"), invoke.as_bytes());
-    // Mirror to the global last-active pointer so new tabs that lose
-    // cwd inheritance (WSL+WinTerm) can still find a usable signal.
-    let last = last_active_path();
-    if let Some(parent) = last.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    let _ = write_secure(&last, invoke.as_bytes());
-
     // Record exactly what we're about to put on the wire. When a new
     // tab later fails with a chdir error pointing at *some* path, this
     // log line answers the first question — did berth ask for that
@@ -199,7 +194,6 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
     tracing::info!(
         workspace = signal.workspace,
         osc7_path = %dir.display(),
-        last_active = %last.display(),
         has_dir_override = signal.dir.is_some(),
         has_command_override = signal.command.is_some_and(|c| !c.is_empty()),
         "emit_enter_signals: OSC 7 cwd marker"
@@ -231,7 +225,8 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
 /// Emit signals that clear the workspace breadcrumb so new tabs spawned
 /// after a clean exit do not auto-enter. The marker directory is left in
 /// place: any shell still cwd'd inside it would otherwise lose its $PWD.
-/// The last-active pointer is removed so the fallback signal disappears.
+/// The legacy last-active pointer is removed when it points at this
+/// workspace so old hook installs stop replaying stale state.
 pub fn emit_exit_signals(workspace: &str) {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/".to_string());
     let mut out = io::stdout().lock();
@@ -252,8 +247,9 @@ pub fn emit_exit_signals(workspace: &str) {
     // deleting would silently break its new-tab fallback signal.
     let last = last_active_path();
     if let Ok(contents) = fs::read_to_string(&last) {
-        let token = format!(" enter --new {}", shell_quote(workspace));
-        if contents.contains(&token) {
+        let new_token = format!(" enter --new {}", shell_quote(workspace));
+        let current_token = format!(" enter {}", shell_quote(workspace));
+        if contents.contains(&new_token) || contents.contains(&current_token) {
             let _ = fs::remove_file(&last);
         }
     }
@@ -298,7 +294,7 @@ mod tests {
         };
         assert_eq!(
             build_invoke_line(&s),
-            "BERTH_SKIP_AUTO=1 command berth enter --new 'org/proj'"
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter 'org/proj'"
         );
     }
 
@@ -312,7 +308,7 @@ mod tests {
         };
         assert_eq!(
             build_invoke_line(&s),
-            "BERTH_SKIP_AUTO=1 command berth enter --new 'org/proj' \
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter 'org/proj' \
              --dir '~/code/org/proj.dev' -- 'zsh'"
         );
     }
@@ -337,7 +333,7 @@ mod tests {
 
     #[test]
     fn shell_quote_drops_nul_and_control_chars() {
-        // NUL would truncate eval input on many shells.
+        // NUL would truncate many shell-string parsers.
         assert_eq!(shell_quote("ab\0cd"), "'abcd'");
         // Other ASCII controls would corrupt the invoke line.
         assert_eq!(shell_quote("a\x01b\x07c"), "'abc'");
@@ -355,8 +351,8 @@ mod tests {
             dir: None,
             command: Some(&cmd),
         };
-        // --new is always present; the bare `-- ` command-separator
-        // should NOT be appended when the argv is empty.
+        // The bare `-- ` command-separator should NOT be appended when
+        // the argv is empty.
         let line = build_invoke_line(&s);
         assert!(!line.contains("-- '"), "got: {line}");
         assert!(line.ends_with("'foo'"));

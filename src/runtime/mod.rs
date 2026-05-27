@@ -238,18 +238,9 @@ pub fn path_inside(base: &Path, relative: impl AsRef<Path>) -> PathBuf {
 }
 
 pub fn run_command(spec: &CommandSpec) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(debug_assertions)]
     if let Ok(log_path) = std::env::var("BERTH_FAKE_EXEC_LOG") {
-        let mut line = spec.argv().join("\t");
-        if let Some(cwd) = &spec.cwd {
-            line.push_str("\tcwd=");
-            line.push_str(&cwd.display().to_string());
-        }
-        line.push('\n');
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?
-            .write_all(line.as_bytes())?;
+        write_fake_exec_log(&log_path, spec)?;
         return std::process::Command::new("true").status();
     }
 
@@ -265,18 +256,9 @@ pub fn run_command(spec: &CommandSpec) -> std::io::Result<std::process::ExitStat
 }
 
 pub fn output_command(spec: &CommandSpec) -> std::io::Result<std::process::Output> {
+    #[cfg(debug_assertions)]
     if let Ok(log_path) = std::env::var("BERTH_FAKE_EXEC_LOG") {
-        let mut line = spec.argv().join("\t");
-        if let Some(cwd) = &spec.cwd {
-            line.push_str("\tcwd=");
-            line.push_str(&cwd.display().to_string());
-        }
-        line.push('\n');
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?
-            .write_all(line.as_bytes())?;
+        write_fake_exec_log(&log_path, spec)?;
         return std::process::Command::new("true").output();
     }
 
@@ -289,6 +271,110 @@ pub fn output_command(spec: &CommandSpec) -> std::io::Result<std::process::Outpu
         command.env(key, value);
     }
     command.output()
+}
+
+#[cfg(debug_assertions)]
+fn write_fake_exec_log(log_path: &str, spec: &CommandSpec) -> std::io::Result<()> {
+    let mut line = fake_exec_argv(spec).join("\t");
+    if spec.cwd.is_some() {
+        line.push_str("\tcwd=<redacted>");
+    }
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)?
+        .write_all(line.as_bytes())
+}
+
+#[cfg(debug_assertions)]
+fn fake_exec_argv(spec: &CommandSpec) -> Vec<String> {
+    match spec.program.as_str() {
+        "podman" => fake_exec_podman_argv(spec),
+        "kubectl" => fake_exec_kubectl_argv(spec),
+        program => {
+            let mut argv = vec![program.to_string()];
+            if !spec.args.is_empty() {
+                argv.push("<args-redacted>".to_string());
+            }
+            argv
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn fake_exec_podman_argv(spec: &CommandSpec) -> Vec<String> {
+    let mut argv = vec![spec.program.clone()];
+    let mut args = spec.args.iter();
+    while let Some(arg) = args.next() {
+        argv.push(redact_arg(arg));
+        if sensitive_arg(arg) && !arg.contains('=') {
+            if args.next().is_some() {
+                argv.push("<redacted>".to_string());
+            }
+            continue;
+        }
+        if matches!(
+            arg.as_str(),
+            "--volume" | "-v" | "--workdir" | "--name" | "--userns"
+        ) {
+            if let Some(value) = args.next() {
+                argv.push(redact_arg(value));
+            }
+            continue;
+        }
+        if arg == "stop" {
+            if let Some(container) = args.next() {
+                argv.push(redact_arg(container));
+            }
+            break;
+        }
+        if !arg.starts_with('-') && arg != "run" {
+            argv.push("<command-redacted>".to_string());
+            break;
+        }
+    }
+    argv
+}
+
+#[cfg(debug_assertions)]
+fn fake_exec_kubectl_argv(spec: &CommandSpec) -> Vec<String> {
+    let mut argv = vec![spec.program.clone()];
+    let mut args = spec.args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            argv.push("--".to_string());
+            argv.push("<command-redacted>".to_string());
+            break;
+        }
+        argv.push(redact_arg(arg));
+        if sensitive_arg(arg) && !arg.contains('=') && args.next().is_some() {
+            argv.push("<redacted>".to_string());
+        }
+    }
+    argv
+}
+
+#[cfg(debug_assertions)]
+fn redact_arg(arg: &str) -> String {
+    if sensitive_arg(arg) {
+        "<redacted>".to_string()
+    } else {
+        arg.to_string()
+    }
+}
+
+#[cfg(debug_assertions)]
+fn sensitive_arg(arg: &str) -> bool {
+    let upper = arg.to_ascii_uppercase();
+    upper.contains("KEY")
+        || upper.contains("SECRET")
+        || upper.contains("TOKEN")
+        || upper.contains("PASS")
+        || upper.contains("CRED")
+        || upper.contains("AUTH")
+        || upper.contains("COOKIE")
+        || upper.contains("DATABASE_URL")
 }
 
 #[cfg(test)]
@@ -312,5 +398,33 @@ mod tests {
 
         assert_eq!(mount.target, PathBuf::from("/workspace"));
         assert_eq!(mount.access, MountAccess::ReadWrite);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn fake_exec_log_redacts_secret_flag_values() {
+        let spec = CommandSpec::new("kubectl").with_args([
+            "--token",
+            "supersecret",
+            "run",
+            "pod",
+            "--",
+            "echo",
+            "ok",
+        ]);
+        let argv = fake_exec_argv(&spec);
+        assert_eq!(
+            argv,
+            [
+                "kubectl",
+                "<redacted>",
+                "<redacted>",
+                "run",
+                "pod",
+                "--",
+                "<command-redacted>",
+            ]
+        );
+        assert!(!argv.iter().any(|arg| arg == "supersecret"));
     }
 }

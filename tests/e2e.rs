@@ -1,8 +1,9 @@
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -336,6 +337,46 @@ fn test_config_yaml_format() {
 }
 
 #[test]
+fn test_config_set_path_and_command() {
+    let ctx = TestContext::new();
+    let workspace_path = ctx.temp_dir.join("custom-workspace");
+
+    let output = ctx
+        .berth()
+        .args([
+            "config",
+            "set",
+            "cfgpath",
+            "--path",
+            workspace_path.to_str().unwrap(),
+            "--",
+            "echo",
+            "hi",
+        ])
+        .output()
+        .expect("Failed to run config set");
+    assert!(output.status.success());
+
+    let show = ctx
+        .berth()
+        .args(["config", "show", "cfgpath"])
+        .output()
+        .expect("Failed to run config show");
+    assert!(show.status.success());
+    let stdout = String::from_utf8_lossy(&show.stdout);
+    assert!(stdout.contains(workspace_path.to_str().unwrap()));
+    assert!(stdout.contains("echo hi"));
+
+    let output = ctx
+        .berth()
+        .args(["config", "set", "cfgpath", "--path", "/ignored"])
+        .output()
+        .expect("Failed to run config set existing");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("ambiguous"));
+}
+
+#[test]
 fn test_new_with_remote() {
     let ctx = TestContext::new();
     let project_path = ctx.project_path("remoteproj");
@@ -400,13 +441,15 @@ fn test_shell_init_bash() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("_berth_auto_enter_on_start"));
     assert!(stdout.contains("_berth_detect_project"));
-    assert!(stdout.contains("WEZTERM_USER_VAR_BERTH_PROJECT"));
+    assert!(stdout.contains("BERTH_PROJECT_HINT"));
+    assert!(!stdout.contains("WEZTERM_USER_VAR_BERTH_PROJECT"));
     assert!(stdout.contains("BASH_VERSION"));
     assert!(stdout.contains("command berth enter"));
     // Shell shorthands (`b`, `berth` wrapper) are removed; the hook
     // script must not redefine them anymore.
     assert!(!stdout.contains("\nb() {"));
     assert!(!stdout.contains("\nberth() {"));
+    assert_shell_script_parses("bash", &stdout);
 }
 
 #[test]
@@ -423,6 +466,39 @@ fn test_shell_init_zsh() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("_berth_auto_enter_on_start"));
     assert!(stdout.contains("ZSH_VERSION"));
+    if command_exists("zsh") {
+        assert_shell_script_parses("zsh", &stdout);
+    }
+}
+
+fn assert_shell_script_parses(shell: &str, script: &str) {
+    let mut child = Command::new(shell)
+        .arg("-n")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("failed to run {shell} -n: {e}"));
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin should be piped")
+        .write_all(script.as_bytes())
+        .expect("failed to write shell script to parser");
+    let output = child.wait_with_output().expect("failed to wait for parser");
+    assert!(
+        output.status.success(),
+        "{shell} -n rejected script:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn command_exists(name: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {name} >/dev/null 2>&1"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 #[test]
@@ -439,6 +515,7 @@ fn test_shell_completions_bash() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("_berth()"));
     assert!(stdout.contains("COMPREPLY"));
+    assert_hidden_completion_artifacts_are_absent(&stdout);
 }
 
 #[test]
@@ -454,6 +531,97 @@ fn test_shell_completions_zsh() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("#compdef berth"));
+    assert_hidden_completion_artifacts_are_absent(&stdout);
+}
+
+#[test]
+fn test_shell_completions_fish_hide_internal_surface() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell", "completions", "fish"])
+        .output()
+        .expect("Failed to run shell completions fish");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("complete -c berth"));
+    assert_hidden_completion_artifacts_are_absent(&stdout);
+}
+
+#[test]
+fn test_shell_completions_elvish_hide_internal_surface() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell", "completions", "elvish"])
+        .output()
+        .expect("Failed to run shell completions elvish");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_hidden_completion_artifacts_are_absent(&stdout);
+}
+
+#[test]
+fn test_shell_completions_powershell_hide_internal_surface() {
+    let ctx = TestContext::new();
+
+    let output = ctx
+        .berth()
+        .args(["shell", "completions", "powershell"])
+        .output()
+        .expect("Failed to run shell completions powershell");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_hidden_completion_artifacts_are_absent(&stdout);
+}
+
+fn assert_hidden_completion_artifacts_are_absent(script: &str) {
+    for hidden in ["daemon", "reap", "agent", "version-info", "hook-run"] {
+        let patterns = [
+            format!("-a \"{hidden}\""),
+            format!("'{hidden}:"),
+            format!("__fish_berth_using_subcommand {hidden}"),
+        ];
+        for pattern in patterns {
+            assert!(
+                !script.contains(&pattern),
+                "hidden completion artifact {pattern:?} leaked:\n{script}"
+            );
+        }
+    }
+    for hidden_flag in ["--resume-or-new", "--supervisor", "--session-counts"] {
+        assert!(
+            !script.contains(hidden_flag),
+            "hidden completion flag {hidden_flag:?} leaked:\n{script}"
+        );
+    }
+    for hidden_fish_flag in ["-l resume-or-new", "-l supervisor", "-l session-counts"] {
+        assert!(
+            !script.contains(hidden_fish_flag),
+            "hidden completion flag {hidden_fish_flag:?} leaked:\n{script}"
+        );
+    }
+    for hidden_enter_flag in [
+        "__fish_berth_using_subcommand enter\" -l new",
+        "'--new[Compatibility no-op",
+    ] {
+        assert!(
+            !script.contains(hidden_enter_flag),
+            "hidden enter flag {hidden_enter_flag:?} leaked:\n{script}"
+        );
+    }
+    if let Some(enter_case) = script.split("berth__subcmd__enter)").nth(1) {
+        let enter_case = enter_case.split(";;").next().unwrap_or(enter_case);
+        assert!(
+            !enter_case.contains("--new"),
+            "hidden enter flag leaked in bash enter completion:\n{enter_case}"
+        );
+    }
 }
 
 #[test]
@@ -943,7 +1111,7 @@ workspaces:
         "{}:/home/dev/.gitconfig:ro",
         config_source.display()
     )));
-    assert!(log.contains("docker.io/library/alpine:latest\t/bin/sh"));
+    assert!(log.contains("docker.io/library/alpine:latest\t<command-redacted>"));
 }
 
 #[test]
@@ -980,7 +1148,7 @@ fn test_podman_workspace_run_uses_container_runtime() {
     assert!(log.contains("podman\trun"));
     assert!(log.contains("--userns=keep-id"));
     assert!(log.contains(&format!("{}:/workspace:rw", project_path.display())));
-    assert!(log.contains("docker.io/library/alpine:latest\techo\tok"));
+    assert!(log.contains("docker.io/library/alpine:latest\t<command-redacted>"));
 }
 
 #[test]
@@ -1348,7 +1516,7 @@ fn test_kubernetes_pod_workspace_run_constructs_kubectl_run() {
     assert!(log.contains("--restart\tNever"));
     assert!(log.contains("--attach"));
     assert!(log.contains("--rm"));
-    assert!(log.contains("--command\t--\techo\tok"));
+    assert!(log.contains("--command\t--\t<command-redacted>"));
 }
 
 #[test]

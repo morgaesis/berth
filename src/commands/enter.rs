@@ -51,11 +51,10 @@ pub async fn run(
 ) -> Result<()> {
     let mut config = Config::load()?;
 
-    // Hook-driven entries — the shell hook prefixes its invocation with
-    // BERTH_SKIP_AUTO=1 to break the auto-entry recursion. Same env var
-    // doubles as our marker that this run came from the new-tab hook
-    // rather than a direct user invocation.
-    let from_new_tab_hook = env::var_os("BERTH_SKIP_AUTO").is_some();
+    // Hook-driven entries set BERTH_FROM_HOOK=1. BERTH_SKIP_AUTO remains
+    // the recursion/opt-out guard and is intentionally not treated as a
+    // hook marker by itself.
+    let from_new_tab_hook = env::var_os("BERTH_FROM_HOOK").is_some();
     if from_new_tab_hook {
         if !config.defaults.new_tab_auto_entry {
             tracing::debug!("new_tab_auto_entry disabled; skipping hook-driven entry");
@@ -526,7 +525,8 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     // release; never blocks real work.
     deploy::freshness::warn_if_stale().await;
 
-    let local_version = env!("CARGO_PKG_VERSION").to_string();
+    let local_version = berth::build_info::version().to_string();
+    let local_build = berth::build_info::build_id();
     let env = match deploy::probe(host).await {
         Ok(env) => env,
         Err(err) => {
@@ -537,7 +537,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
         }
     };
 
-    let decision = deploy::decide(&env, &local_version);
+    let decision = deploy::decide(&env, &local_version, local_build);
     let already_trusted = config.trusted_hosts.contains_key(host);
 
     // Only surface the version when there's something noteworthy: a
@@ -546,14 +546,19 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     let remote_ver_str = env
         .berth_version
         .as_deref()
-        .map(|v| format!("berth {v}"))
+        .map(|v| match env.berth_build.as_deref() {
+            Some(build) => format!("berth {v} ({build})"),
+            None => format!("berth {v}"),
+        })
         .unwrap_or_else(|| "no remote berth".to_string());
-    let version_drift = env.berth_version.as_deref() != Some(local_version.as_str());
+    let version_drift = env.berth_version.as_deref() != Some(local_version.as_str())
+        || env.berth_build.as_deref() != Some(local_build);
     if version_drift {
         eprintln!(
-            "{} local v{}  |  {host}: {}",
+            "{} local v{} ({})  |  {host}: {}",
             "·".dimmed(),
             local_version.cyan(),
+            local_build.cyan(),
             remote_ver_str.cyan()
         );
     }
@@ -565,7 +570,10 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             // Trusted but auto-update disabled. Print a clear hint and
             // treat this run as no-deploy so the legacy mux cascade
             // takes over with whatever's on the remote.
-            if matches!(decision, DeployDecision::Deploy { .. }) {
+            if matches!(
+                decision,
+                DeployDecision::Deploy { .. } | DeployDecision::LocalBuildUnsupported { .. }
+            ) {
                 eprintln!(
                     "berth: auto_update_remote is false; remote stays at {remote_ver_str}. \
                      Run `berth deploy --force {host}` to refresh."
@@ -585,7 +593,23 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                  `berth enter --plain --remote {host} <ws>` to skip session-mux."
             );
         }
-        DeployDecision::Deploy { target, reason } => {
+        DeployDecision::LocalBuildUnsupported {
+            target,
+            local_target,
+            reason,
+        } => {
+            eprintln!(
+                "berth: {reason}; local binary target {:?} cannot be deployed to remote target {target}. \
+                 Skipping same-version build refresh to avoid redeploying a stale release artifact.",
+                local_target
+            );
+            Ok(())
+        }
+        DeployDecision::Deploy {
+            target,
+            reason,
+            source,
+        } => {
             if consent == ConsentMode::Ask
                 && !confirm_deploy(host, target, &env, &local_version, &reason)?
             {
@@ -596,10 +620,17 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                 );
                 return Ok(());
             }
-            let tag = format!("v{local_version}");
-            let info = deploy::ensure_deployed(host, &tag, target)
-                .await
-                .with_context_hard_fail(host)?;
+            let info = match source {
+                deploy::DeploySource::Release => {
+                    let tag = format!("v{local_version}");
+                    deploy::ensure_deployed(host, &tag, target)
+                        .await
+                        .with_context_hard_fail(host)?
+                }
+                deploy::DeploySource::LocalBinary => deploy::ensure_deployed_local(host, target)
+                    .await
+                    .with_context_hard_fail(host)?,
+            };
             deploy::record_trust(config, host, &info)?;
             eprintln!(
                 "{} deployed v{} → {}:{}",

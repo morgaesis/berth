@@ -60,8 +60,8 @@ async fn main() {
         None => registry.init(),
     }
     tracing::info!(
-        argv = ?std::env::args().collect::<Vec<_>>(),
-        version = env!("CARGO_PKG_VERSION"),
+        version = berth::build_info::version(),
+        build_id = berth::build_info::build_id(),
         pid = std::process::id(),
         "berth invocation"
     );

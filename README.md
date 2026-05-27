@@ -16,7 +16,7 @@ land in them: `berth enter <name>`.
   sessions side by side in the same environment, set up once.
 - **Same shape, local or remote.** `berth enter my-local` and
   `berth enter my-remote` look identical at the prompt. The host
-  lives on the workspace itself, set once (`berth set --remote …`,
+  lives on the workspace itself, set once (`berth config set --remote …`,
   or inherited from an org). See
   [examples/config.yaml](./examples/config.yaml).
 
@@ -45,13 +45,13 @@ INSTALL.md at the root of that repo. Verify the install by running
 ## Usage
 
 ```bash
-berth list                                    # workspaces + last-used time
-berth show my-project                         # resolved config for one
-berth new my-project ~/code/my-project        # create
+berth config list                             # workspaces + last-used time
+berth config show my-project                  # resolved config for one
+berth config set my-project --path ~/code/my-project  # create/update
 berth enter my-project                        # create-if-needed, then enter
 berth enter my-project -- claude --foo        # override the entry command
-berth set my-project --dir ~/code/my-project  # edit fields without yaml
-berth rm my-project                           # delete the configuration
+berth config set my-project --dir ~/code/my-project   # edit fields without yaml
+berth config rm my-project                    # delete the configuration
 
 berth run my-project -- cargo test            # one-shot command in workspace
 berth tunnel my-project -p 3000,8080          # forward remote ports
@@ -85,7 +85,7 @@ user, and remote-root directory from `berth org set`, so you write
 
 Config lives at `$BERTH_CONFIG_DIR/config.yaml` (or
 `~/.config/berth/config.yaml`). Most fields are edit-via-CLI
-(`berth set`, `berth org set`); hand-editing the yaml is also supported.
+(`berth config set`, `berth org set`); hand-editing the yaml is also supported.
 
 [`examples/config.default.yaml`](./examples/config.default.yaml) is the
 fully-documented reference — every field, every default, with the

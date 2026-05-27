@@ -17,12 +17,44 @@ pub struct SetArgs {
     pub clear_command: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum UnsetField {
+    Remote,
+    Dir,
+    Ports,
+    Command,
+}
+
 pub async fn show(name: String) -> Result<()> {
     let config = Config::load()?;
     let Some(ws) = config.workspaces.get(&name) else {
         bail!("workspace '{name}' not configured; create with `berth new {name}` first");
     };
     print_workspace(&config, &name, ws);
+    Ok(())
+}
+
+pub async fn unset(name: String, fields: Vec<UnsetField>) -> Result<()> {
+    if fields.is_empty() {
+        bail!("nothing to unset; pass one or more of: remote dir ports command");
+    }
+    let mut config = Config::load()?;
+    let Some(ws) = config.workspaces.get_mut(&name) else {
+        bail!("workspace '{name}' not configured; create with `berth config set {name}` first");
+    };
+
+    for field in fields {
+        match field {
+            UnsetField::Remote => ws.remote = None,
+            UnsetField::Dir => ws.remote_dir = None,
+            UnsetField::Ports => ws.ports = None,
+            UnsetField::Command => ws.command = None,
+        }
+    }
+
+    config.save()?;
+    eprintln!("{} updated", "✓".green().bold());
+    print_workspace(&config, &name, &config.workspaces[&name]);
     Ok(())
 }
 

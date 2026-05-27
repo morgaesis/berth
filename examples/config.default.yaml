@@ -69,9 +69,9 @@ defaults:
 
   # Key that detaches the current berth client without stopping the
   # supervised session. Press it while attached to return to the local
-  # shell; the next `berth enter` resumes the same session. Set to
-  # null to disable. Accepted forms include `ctrl-]`, `ctrl-a`, `esc`,
-  # or a single ASCII character.
+  # shell, then use `berth attach <workspace>` to resume that session.
+  # Set to null to disable. Accepted forms include `ctrl-]`, `ctrl-a`,
+  # `esc`, or a single ASCII character.
   detach_key: ctrl-]
 
 # ─── orgs ──────────────────────────────────────────────────────────────
@@ -103,37 +103,42 @@ trusted_hosts: {}
 # ─── workspaces ────────────────────────────────────────────────────────
 #
 # Each entry under `workspaces` is a named workspace. Most fields are
-# editable via `berth set <name> --<field> <value>` or
-# `berth set <name> --clear-<field>`.
+# editable via `berth config set <name> --<field> <value>` or
+# `berth config unset <name> <field>`.
 #
-# CLI: `berth new <name> [path]`, `berth set <name> …`,
-#      `berth rm <name>`, `berth show <name>`, `berth list`.
+# CLI: `berth config set <name> [--path <path>] …`,
+#      `berth config rm <name>`, `berth config show <name>`,
+#      `berth config list`.
 workspaces: {}
 #   myws:
 #     # REQUIRED. Filesystem path where berth keeps the local stash for
 #     # this workspace. Defaults to $XDG_DATA_HOME/berth/projects/<name>
-#     # when `berth new` creates the workspace without an explicit path.
+#     # when `berth config set` creates the workspace without --path.
 #     path: ~/.local/share/berth/projects/myws
 #
 #     # SSH host for remote entry. `null` (default) = local workspace.
 #     # Inherited from `orgs.<org>.remote` for org-scoped names.
-#     # CLI: `berth set <name> --remote <host>` / `--clear-remote`.
+#     # CLI: `berth config set <name> --remote <host>` /
+#     #      `berth config unset <name> remote`.
 #     remote: null
 #
 #     # Ports to forward when entering this workspace (and via
 #     # `berth tunnel`). `null` = no forwarding.
-#     # CLI: `--ports 3000,8080` / `--clear-ports`.
+#     # CLI: `berth config set <name> --ports 3000,8080` /
+#     #      `berth config unset <name> ports`.
 #     ports: null
 #
 #     # Override the working directory inside the session. Allows
 #     # remote-shell expansions (`~`, `$HOME`). `null` = use the
 #     # auto-managed `path`, or org's `<remote_root>/<project>`.
-#     # CLI: `--dir <path>` / `--clear-dir`.
+#     # CLI: `berth config set <name> --dir <path>` /
+#     #      `berth config unset <name> dir`.
 #     remote_dir: null
 #
 #     # Default command for `berth enter`. When unset, the supervisor
 #     # spawns `$SHELL -l`. When set, this argv replaces the shell.
-#     # CLI: `-- <argv…>` / `--clear-command`.
+#     # CLI: `berth config set <name> -- <argv…>` /
+#     #      `berth config unset <name> command`.
 #     command: null
 #     # Example: ["bash", "-c", "cd app && claude"]
 #

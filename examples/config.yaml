@@ -2,7 +2,7 @@
 #
 # Real config lives at $BERTH_CONFIG_DIR/config.yaml or
 # ~/.config/berth/config.yaml. Most fields are edit-via-CLI
-# (`berth set`, `berth org set`, `berth new`); hand-editing the file is
+# (`berth config set`, `berth org set`); hand-editing the file is
 # also supported.
 #
 # This file is illustrative — copy fragments out of it, don't deploy it
