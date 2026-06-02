@@ -166,6 +166,17 @@ fn write_executable(path: &PathBuf, content: &str) {
     }
 }
 
+fn quoted_value_after<'a>(haystack: &'a str, marker: &str) -> &'a str {
+    let start = haystack
+        .find(marker)
+        .unwrap_or_else(|| panic!("missing marker {marker:?} in {haystack}"))
+        + marker.len();
+    haystack[start..]
+        .split('\'')
+        .next()
+        .expect("quoted value after marker")
+}
+
 #[test]
 fn test_new_workspace() {
     let ctx = TestContext::new();
@@ -468,7 +479,35 @@ fn test_shell_init_zsh() {
     assert!(stdout.contains("ZSH_VERSION"));
     if command_exists("zsh") {
         assert_shell_script_parses("zsh", &stdout);
+        assert_zsh_hook_executes(&ctx, &stdout);
     }
+}
+
+fn assert_zsh_hook_executes(ctx: &TestContext, script: &str) {
+    let hook_path = ctx.temp_dir.join("berth-hook.zsh");
+    fs::write(&hook_path, script).expect("failed to write zsh hook test script");
+
+    let output = Command::new("zsh")
+        .arg("-f")
+        .arg("-i")
+        .arg("-c")
+        .arg(format!(
+            "source {}; _berth_auto_enter_on_start",
+            shell_words::quote(&hook_path.display().to_string())
+        ))
+        .env("HOME", &ctx.temp_dir)
+        .env("XDG_STATE_HOME", ctx.temp_dir.join(".local").join("state"))
+        .env_remove("BERTH_SKIP_AUTO")
+        .env_remove("BERTH_WORKSPACE")
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to execute zsh hook");
+
+    assert!(
+        output.status.success(),
+        "zsh hook execution failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_shell_script_parses(shell: &str, script: &str) {
@@ -702,6 +741,60 @@ fn test_attach_rejects_invalid_session_id() {
 }
 
 #[test]
+fn test_remote_attach_new_uses_stable_session_id_in_skip_mode() {
+    let ctx = TestContext::new();
+    let created = ctx
+        .berth()
+        .args(["new", "remote-attach", "--remote", "user@remotehost"])
+        .output()
+        .expect("Failed to create remote workspace");
+    assert!(created.status.success());
+
+    let output = ctx
+        .berth()
+        .args(["attach", "--new", "remote-attach"])
+        .output()
+        .expect("Failed to run remote attach");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would SSH to user@remotehost"));
+    assert!(stdout.contains(" attach --new --session '"));
+}
+
+#[test]
+fn test_logs_remote_workspace_uses_resolved_host_in_skip_mode() {
+    let ctx = TestContext::new();
+    let created = ctx
+        .berth()
+        .args(["new", "remote-logs", "--remote", "user@remotehost"])
+        .output()
+        .expect("Failed to create remote workspace");
+    assert!(created.status.success());
+
+    let output = ctx
+        .berth()
+        .args(["logs", "--remote", "remote-logs", "--sessions", "-n", "40"])
+        .output()
+        .expect("Failed to run remote logs");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("=== remote user@remotehost ==="),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn test_enter_rejects_hostile_workspace_name() {
     let ctx = TestContext::new();
 
@@ -826,6 +919,43 @@ fn test_enter_command_enters_existing() {
 }
 
 #[test]
+fn test_enter_local_runs_command_override() {
+    let ctx = TestContext::new();
+    let project_path = ctx.project_path("localcmd");
+    let marker = project_path.join("command-ran");
+
+    ctx.berth()
+        .args(["new", "localcmd", project_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to create workspace");
+
+    let output = ctx
+        .berth()
+        .args([
+            "enter",
+            "localcmd",
+            "--",
+            "sh",
+            "-c",
+            "printf '%s\\n' \"$BERTH_WORKSPACE:$PWD\" > command-ran",
+        ])
+        .output()
+        .expect("Failed to run berth enter local command");
+
+    assert!(
+        output.status.success(),
+        "Command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let content = fs::read_to_string(&marker).expect("local enter command did not run");
+    assert!(content.contains("localcmd:"), "marker content: {content}");
+    assert!(
+        content.contains(project_path.to_str().unwrap()),
+        "command should run in workspace dir: {content}"
+    );
+}
+
+#[test]
 fn test_enter_command_with_remote() {
     let ctx = TestContext::new();
 
@@ -865,11 +995,78 @@ fn test_enter_remote_prints_resumable_session_command_in_skip_mode() {
     // local tabs don't pile into the same multiplexer session. The prefix
     // is shell-quoted; $$ and $RANDOM are unquoted so the remote shell
     // expands them at runtime.
-    assert!(stdout.contains("tmux new-session -s 'berth-remote-session'-$$-$RANDOM"));
-    assert!(stdout.contains("screen -S 'berth-remote-session'-$$-$RANDOM"));
+    assert!(stdout.contains("tmux attach-session -t"));
+    assert!(stdout.contains("tmux new-session -s"));
+    assert!(stdout.contains("'berth-remote-session-"));
+    assert!(stdout.contains("screen -D -RR 'berth-remote-session-"));
     assert!(!stdout.contains("new-session -A"));
-    assert!(!stdout.contains("screen -D -RR"));
     assert!(stdout.contains("else exec ${SHELL:-/bin/sh}; fi"));
+}
+
+#[test]
+fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
+    let ctx = TestContext::new();
+    let log_path = ctx.temp_dir.join("fake-interactive-ssh.log");
+    let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");
+    let workspace = "morgaesis/dev";
+
+    let output = ctx
+        .berth()
+        .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "255,0")
+        .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+        .env("BERTH_FAKE_INTERACTIVE_SSH_LOG", &log_path)
+        .args([
+            "enter",
+            workspace,
+            "--remote",
+            "fakehost",
+            "--no-deploy",
+            "--",
+            "claude",
+        ])
+        .output()
+        .expect("Failed to run berth enter with fake reconnect");
+
+    assert!(
+        output.status.success(),
+        "reconnect should attach to the same session: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&log_path).expect("missing fake interactive ssh log");
+    let commands = log
+        .lines()
+        .map(|line| {
+            line.splitn(4, '\t')
+                .nth(3)
+                .unwrap_or_else(|| panic!("malformed fake ssh log line: {line}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 2, "fake ssh log:\n{log}");
+
+    let first_session = quoted_value_after(commands[0], "--session '");
+    let second_session = quoted_value_after(commands[1], "--session '");
+    assert_eq!(first_session, second_session, "fake ssh log:\n{log}");
+
+    assert!(
+        commands[0].contains(&format!(
+            "attach --new --session '{first_session}' '{workspace}' -- 'claude'"
+        )),
+        "initial enter may create the remote session:\n{}",
+        commands[0]
+    );
+    assert!(
+        commands[1].contains(&format!(
+            "attach --session '{first_session}' '{workspace}' -- 'claude'"
+        )),
+        "reconnect must attach only to the existing remote session:\n{}",
+        commands[1]
+    );
+    assert!(
+        !commands[1].contains("attach --new --session"),
+        "reconnect must not create a replacement session:\n{}",
+        commands[1]
+    );
 }
 
 #[test]

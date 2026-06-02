@@ -9,6 +9,7 @@
 //!      command's error text ends up).
 
 use anyhow::{Context, Result};
+use berth::config::Config;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -54,6 +55,7 @@ pub async fn run(
     follow: bool,
     sessions: bool,
     level: Option<&str>,
+    remote: Option<&str>,
 ) -> Result<()> {
     let n = lines.unwrap_or(DEFAULT_LINES);
     let min_level = level.and_then(LogLevel::parse);
@@ -93,10 +95,48 @@ pub async fn run(
         }
     }
 
+    if let Some(target) = remote {
+        if follow {
+            eprintln!("berth logs: --remote is fetched once; --follow only follows local logs");
+        }
+        let host = resolve_remote_target(target)?;
+        println!("\n=== remote {host} ===");
+        print!(
+            "{}",
+            berth::ssh::run_remote_command(&host, &remote_logs_command(n, level, sessions)).await?
+        );
+    }
     if follow {
         follow_logs(&follow_paths, min_level).await?;
     }
     Ok(())
+}
+
+fn resolve_remote_target(target: &str) -> Result<String> {
+    let config = Config::load()?;
+    if let Some(ws) = config.workspaces.get(target) {
+        return config
+            .resolved_remote(target, ws)
+            .with_context(|| format!("workspace '{target}' has no remote host"));
+    }
+    berth::validate_ssh_host(target)?;
+    Ok(target.to_string())
+}
+
+fn remote_logs_command(lines: usize, level: Option<&str>, sessions: bool) -> String {
+    let mut remote = String::from(
+        "berth_bin=; if [ -x \"$HOME/.local/bin/berth\" ]; then berth_bin=\"$HOME/.local/bin/berth\"; elif command -v berth >/dev/null 2>&1; then berth_bin=$(command -v berth); else printf 'berth not found on remote\\n' >&2; exit 127; fi; BERTH_ATTACH_LOCAL=1 exec \"$berth_bin\" logs",
+    );
+    remote.push_str(" -n ");
+    remote.push_str(&lines.to_string());
+    if sessions {
+        remote.push_str(" --sessions");
+    }
+    if let Some(level) = level {
+        remote.push_str(" --level ");
+        remote.push_str(&berth::ssh::shell_escape_arg(level));
+    }
+    remote
 }
 
 async fn follow_logs(paths: &[PathBuf], min_level: Option<LogLevel>) -> Result<()> {
@@ -173,7 +213,7 @@ fn line_level(line: &str) -> Option<LogLevel> {
 
 #[cfg(test)]
 mod tests {
-    use super::{include_line, LogLevel};
+    use super::{include_line, remote_logs_command, LogLevel};
 
     #[test]
     fn level_filter_keeps_minimum_and_above() {
@@ -190,5 +230,12 @@ mod tests {
             Some(LogLevel::Warn)
         ));
         assert!(!include_line("plain PTY output", Some(LogLevel::Warn)));
+    }
+
+    #[test]
+    fn remote_logs_command_runs_remote_berth_logs() {
+        let command = remote_logs_command(40, Some("warn"), true);
+        assert!(command.contains("exec \"$berth_bin\" logs -n 40 --sessions --level 'warn'"));
+        assert!(command.contains("BERTH_ATTACH_LOCAL=1"));
     }
 }

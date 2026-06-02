@@ -450,6 +450,7 @@ enum Commands {
                       Use --follow to stream new entries.\n\n\
                       Examples:\n  \
                       berth logs --level warn\n  \
+                      berth logs --remote org/proj --sessions\n  \
                       berth logs --follow --level warn"
     )]
     Logs {
@@ -468,6 +469,12 @@ enum Commands {
             help = "Always include per-session supervisor logs even with -n"
         )]
         sessions: bool,
+        #[arg(
+            long = "remote",
+            value_name = "WORKSPACE_OR_HOST",
+            help = "Also fetch logs from a remote workspace host or explicit SSH host"
+        )]
+        remote: Option<String>,
     },
     #[command(about = "Show shell-integration + local runtime status")]
     Doctor,
@@ -908,7 +915,17 @@ impl Cli {
                     follow,
                     level,
                     sessions,
-                } => commands::logs::run(lines, follow, sessions, level.as_deref()).await,
+                    remote,
+                } => {
+                    commands::logs::run(
+                        lines,
+                        follow,
+                        sessions,
+                        level.as_deref(),
+                        remote.as_deref(),
+                    )
+                    .await
+                }
                 Commands::Doctor => commands::doctor::run().await,
                 Commands::Daemon {
                     interval_seconds,

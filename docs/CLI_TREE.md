@@ -504,6 +504,7 @@ Includes global logs and, with --sessions, session supervisor logs. Use --follow
 
 Examples:
   berth logs --level warn
+  berth logs --remote org/proj --sessions
   berth logs --follow --level warn
 
 Usage: berth logs [OPTIONS]
@@ -528,6 +529,9 @@ Options:
 
       --sessions
           Always include per-session supervisor logs even with -n
+
+      --remote <WORKSPACE_OR_HOST>
+          Also fetch logs from a remote workspace host or explicit SSH host
 
   -h, --help
           Print help (see a summary with '-h')

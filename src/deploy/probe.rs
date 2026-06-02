@@ -21,7 +21,7 @@ pub struct RemoteEnv {
 
 // Prefer the path Berth deploys to. A PATH-provided binary may exist, but
 // it is not the binary this client controls and may be stale.
-const PROBE_SCRIPT: &str = "\
+pub(crate) const PROBE_SCRIPT: &str = "\
 printf 'OS=%s\\n' \"$(uname -s 2>/dev/null || echo unknown)\"; \
 printf 'ARCH=%s\\n' \"$(uname -m 2>/dev/null || echo unknown)\"; \
 printf 'HOME=%s\\n' \"$HOME\"; \
@@ -34,11 +34,12 @@ elif command -v berth >/dev/null 2>&1; then \
 fi; \
 if [ -n \"$berth_bin\" ]; then \
   printf 'BERTH_PATH=%s\\n' \"$berth_bin\"; \
-  v=$(\"$berth_bin\" --version 2>/dev/null | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {print $i; exit}}'); \
+  v=$({ \"$berth_bin\" --version 2>/dev/null || true; } | awk 'NR==1{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\\.[0-9]+\\.[0-9]+/) {print $i; exit}}'); \
   [ -n \"$v\" ] && printf 'BERTH_VERSION=%s\\n' \"$v\"; \
-  b=$(\"$berth_bin\" version-info 2>/dev/null | awk -F= '$1==\"BUILD\" {print $2; exit}'); \
+  b=$({ \"$berth_bin\" version-info 2>/dev/null || true; } | awk -F= '$1==\"BUILD\" {print $2; exit}'); \
   [ -n \"$b\" ] && printf 'BERTH_BUILD=%s\\n' \"$b\"; \
-fi";
+fi; \
+exit 0";
 
 /// Run the probe over SSH and parse the result.
 #[tracing::instrument(level = "debug", skip(host), fields(host = %host))]
@@ -106,6 +107,9 @@ fn sanitize_build_id(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
 
     #[test]
     fn parse_minimal() {
@@ -139,5 +143,43 @@ mod tests {
     fn parse_fails_without_os() {
         let raw = "ARCH=x86_64\nHOME=/x\nPATH=/x\n";
         assert!(parse(raw).is_err());
+    }
+
+    #[test]
+    fn probe_script_tolerates_stale_berth_without_version_info() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bin_dir = temp.path().join(".local").join("bin");
+        fs::create_dir_all(&bin_dir).expect("create fake bin dir");
+        let berth = bin_dir.join("berth");
+        fs::write(
+            &berth,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'berth 0.1.13'; exit 0; fi\nexit 1\n",
+        )
+        .expect("write fake berth");
+        let mut perms = fs::metadata(&berth)
+            .expect("fake berth metadata")
+            .permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&berth, perms).expect("chmod fake berth");
+
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(PROBE_SCRIPT)
+            .env("HOME", temp.path())
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .expect("run probe script");
+
+        assert!(
+            output.status.success(),
+            "probe script failed: stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("BERTH_VERSION=0.1.13"), "{stdout}");
+        assert!(!stdout.contains("BERTH_BUILD="), "{stdout}");
+        let parsed = parse(&stdout).expect("parse probe output");
+        assert_eq!(parsed.berth_version.as_deref(), Some("0.1.13"));
+        assert!(parsed.berth_build.is_none());
     }
 }
