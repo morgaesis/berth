@@ -4,6 +4,7 @@ use berth::session::{self, supervisor};
 use berth::ssh;
 use portable_pty::PtySize;
 use std::collections::BTreeMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,20 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
     if let Some(id) = &opts.session {
         berth::validate_session_id(id)?;
     }
+    tracing::info!(
+        workspace = %workspace,
+        supervisor = opts.supervisor,
+        new = opts.new,
+        resume_or_new = opts.resume_or_new,
+        session_id = opts.session.as_deref().unwrap_or(""),
+        list = opts.list,
+        list_all = opts.list_all,
+        list_long = opts.list_long,
+        session_counts = opts.session_counts,
+        command_len = opts.command.len(),
+        attach_local = std::env::var_os("BERTH_ATTACH_LOCAL").is_some(),
+        "attach command starting"
+    );
     if !opts.supervisor {
         if let Some(code) = maybe_remote_attach(&workspace, &opts).await? {
             return Ok(code);
@@ -69,27 +84,141 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
 
 async fn maybe_remote_attach(workspace: &str, opts: &AttachOptions) -> Result<Option<i32>> {
     if std::env::var_os("BERTH_ATTACH_LOCAL").is_some() {
+        tracing::debug!(
+            workspace,
+            "BERTH_ATTACH_LOCAL set; handling attach on this host"
+        );
         return Ok(None);
     }
     let config = Config::load()?;
     let Some(ws) = config.workspaces.get(workspace) else {
+        tracing::debug!(workspace, "workspace not in config; using local attach");
         return Ok(None);
     };
     let Some(host) = config.resolved_remote(workspace, ws) else {
+        tracing::debug!(
+            workspace,
+            "workspace has no resolved remote; using local attach"
+        );
         return Ok(None);
     };
-    let code = ssh::ssh_attach_remote(
-        &host,
+    tracing::info!(
         workspace,
-        opts.list,
-        opts.list_all,
-        opts.list_long,
-        opts.session.as_deref(),
-        opts.new,
-        &opts.command,
-    )
-    .await?;
+        host = %host,
+        session_id = opts.session.as_deref().unwrap_or(""),
+        new = opts.new,
+        list = opts.list,
+        "delegating attach to remote host"
+    );
+    let code = remote_attach_with_reconnect(&host, workspace, opts).await?;
     Ok(Some(code))
+}
+
+async fn remote_attach_with_reconnect(
+    host: &str,
+    workspace: &str,
+    opts: &AttachOptions,
+) -> Result<i32> {
+    let generated_session = if opts.new && opts.session.is_none() && !opts.list {
+        Some(session::new_session_id())
+    } else {
+        None
+    };
+    let session = opts.session.as_deref().or(generated_session.as_deref());
+    let session_label = session.unwrap_or("-");
+    tracing::info!(
+        host,
+        workspace,
+        requested_session_id = opts.session.as_deref().unwrap_or(""),
+        generated_session_id = generated_session.as_deref().unwrap_or(""),
+        effective_session_id = session_label,
+        new = opts.new,
+        list = opts.list,
+        session_id_reused_on_reconnect = session.is_some() && !opts.list,
+        "remote attach reconnect loop starting"
+    );
+
+    let remote_probe_succeeded = if opts.list {
+        true
+    } else {
+        ssh::run_remote_command_with_timeout(host, "true", Duration::from_secs(5))
+            .await
+            .is_ok()
+    };
+    let mut backoff_ms: u64 = 500;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let code = ssh::ssh_attach_remote(
+            host,
+            workspace,
+            opts.list,
+            opts.list_all,
+            opts.list_long,
+            session,
+            opts.new,
+            &opts.command,
+        )
+        .await?;
+        tracing::info!(
+            code,
+            attempt,
+            host,
+            workspace,
+            session_id = session_label,
+            reused_session_id = attempt > 1 && session.is_some(),
+            "remote attach returned"
+        );
+
+        if code != 255 || opts.list || session.is_none() {
+            tracing::info!(
+                code,
+                attempt,
+                host,
+                workspace,
+                session_id = session_label,
+                exit_reason = if opts.list {
+                    "list-complete"
+                } else if session.is_none() {
+                    "no-stable-session-target"
+                } else {
+                    "remote-command-exit"
+                },
+                "remote attach loop finished"
+            );
+            return Ok(code);
+        }
+
+        if attempt == 1 && !remote_probe_succeeded {
+            tracing::warn!(
+                workspace,
+                host,
+                session_id = session_label,
+                attempt,
+                "remote host was not reachable during preflight; not entering attach reconnect loop"
+            );
+            return Ok(code);
+        }
+
+        tracing::warn!(
+            workspace,
+            host,
+            session_id = session_label,
+            attempt,
+            backoff_ms,
+            reused_session_id_on_next_attempt = session.is_some(),
+            "remote attach transport lost; reconnecting"
+        );
+        if attempt == 1 {
+            eprintln!(
+                "· connection lost; reconnecting remote session {session_label}...  (Ctrl+C to abort)"
+            );
+        } else if attempt.is_multiple_of(4) {
+            eprintln!("· still reconnecting remote session {session_label} (attempt {attempt})...");
+        }
+        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+    }
 }
 
 /// Smart attach: try each live session in turn; the first one whose
@@ -108,6 +237,11 @@ async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
                 .unwrap_or(false)
         })
         .collect();
+    tracing::info!(
+        workspace = %workspace,
+        candidate_sessions = live.len(),
+        "resume-or-new scanning live sessions"
+    );
     live.sort_by(|a, b| {
         session_mtime(&workspace, b)
             .cmp(&session_mtime(&workspace, a))
@@ -116,8 +250,20 @@ async fn resume_or_new(workspace: String, command: Vec<String>) -> Result<i32> {
     for id in &live {
         let socket = session::session_socket(&workspace, id)?;
         if session::client::is_session_free(&socket) {
+            tracing::info!(
+                workspace = %workspace,
+                session_id = %id,
+                socket = %socket.display(),
+                "resume-or-new found existing free socket; attaching"
+            );
             return session::client::attach(&socket).await;
         }
+        tracing::debug!(
+            workspace = %workspace,
+            session_id = %id,
+            socket = %socket.display(),
+            "resume-or-new socket is busy"
+        );
     }
     // No free session — every existing one has a connected client (a
     // sibling tab is attached). Honor the user's intent to be in this
@@ -139,6 +285,14 @@ async fn run_supervisor(
     supervisor::detach_from_terminal().ok();
     let socket_path = session::session_socket(&workspace, &session_id)?;
     let workdir = workspace_path(&workspace);
+    tracing::info!(
+        workspace = %workspace,
+        session_id = %session_id,
+        socket = %socket_path.display(),
+        workdir = workdir.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        command_len = command.len(),
+        "session supervisor starting from attach command"
+    );
     let cfg = supervisor::SupervisorConfig {
         socket_path,
         workspace,
@@ -156,6 +310,11 @@ async fn run_supervisor(
 
 async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
     let id = session::new_session_id();
+    tracing::info!(
+        workspace = %workspace,
+        session_id = %id,
+        "creating fresh session id"
+    );
     start_or_attach_session(workspace, id, command).await
 }
 
@@ -169,27 +328,58 @@ async fn start_or_attach_session(
         .with_context(|| format!("creating sessions dir {}", sessions_dir.display()))?;
     let socket_path = session::session_socket(&workspace, &id)?;
     if socket_path.exists() {
+        tracing::info!(
+            workspace = %workspace,
+            session_id = %id,
+            socket = %socket_path.display(),
+            "existing session socket found; attaching"
+        );
         return session::client::attach(&socket_path).await;
     }
-    let _log_path = supervisor_log_path(&workspace, &id)?;
+    let log_path = supervisor_log_path(&workspace, &id)?;
+    tracing::info!(
+        workspace = %workspace,
+        session_id = %id,
+        socket = %socket_path.display(),
+        log = %log_path.display(),
+        command_len = command.len(),
+        "no existing socket; spawning supervisor"
+    );
     spawn_supervisor(&workspace, &id, &command)?;
     if wait_for_socket(&socket_path, Duration::from_secs(5)).is_err() {
+        tracing::warn!(
+            workspace = %workspace,
+            session_id = %id,
+            socket = %socket_path.display(),
+            "supervisor socket did not appear before attach timeout"
+        );
         // Keep the visible error to one line. The full detail (child
         // stderr + tracing) is in `berth logs`.
-        use colored::Colorize;
-        let hint = command_failure_hint(&command);
-        let hint_suffix = if hint.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", hint.dimmed())
-        };
-        anyhow::bail!(
-            "{} command exited before berth could attach{hint_suffix}  (`{}` for details)",
-            "✗".red().bold(),
-            "berth logs".cyan(),
-        );
+        return Err(command_exited_before_attach_error(&command));
     }
-    session::client::attach(&socket_path).await
+    match session::client::attach(&socket_path).await {
+        Ok(code) => {
+            tracing::info!(
+                workspace = %workspace,
+                session_id = %id,
+                socket = %socket_path.display(),
+                code,
+                "attach client exited"
+            );
+            Ok(code)
+        }
+        Err(err) if has_io_kind(&err, ErrorKind::ConnectionRefused) => {
+            tracing::warn!(
+                workspace = %workspace,
+                session_id = %id,
+                socket = %socket_path.display(),
+                error = ?err,
+                "attach connection refused; supervisor likely exited before attach"
+            );
+            Err(command_exited_before_attach_error(&command))
+        }
+        Err(err) => Err(err),
+    }
 }
 
 /// Short, single-line hint based on the command shape. Empty when we
@@ -208,17 +398,38 @@ fn command_failure_hint(command: &[String]) -> String {
     if command.len() == 1 && first.contains(char::is_whitespace) {
         // Whole thing was passed as one quoted arg.
         return format!(
-            "`{first}` was treated as one binary path; for shell parsing use `-- bash -lc '<cmd>'`"
+            "`{first}` was treated as one binary path; for shell parsing use `-- bash -ic '<cmd>'`"
         );
     }
     format!(
-        "for shell aliases or login profile, wrap: `-- bash -lc '{}'`",
+        "for shell aliases or login profile, wrap: `-- bash -ic '{}'`",
         command.join(" ")
+    )
+}
+
+fn command_exited_before_attach_error(command: &[String]) -> anyhow::Error {
+    use colored::Colorize;
+    let hint = command_failure_hint(command);
+    let hint_suffix = if hint.is_empty() {
+        String::new()
+    } else {
+        format!(" — {}", hint.dimmed())
+    };
+    anyhow::anyhow!(
+        "{} command exited before berth could attach{hint_suffix}  (`{}` for details)",
+        "✗".red().bold(),
+        "berth logs".cyan(),
     )
 }
 
 async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
     let sessions = session::list_sessions(&workspace)?;
+    tracing::info!(
+        workspace = %workspace,
+        requested_session_id = session.as_deref().unwrap_or(""),
+        available_sessions = sessions.len(),
+        "resume attach resolving target"
+    );
     let target = match session {
         Some(id) => {
             if !sessions.iter().any(|s| s == &id) {
@@ -246,11 +457,23 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
     };
     let socket_path = session::session_socket(&workspace, &target)?;
     if !socket_path.exists() {
+        tracing::warn!(
+            workspace = %workspace,
+            session_id = %target,
+            socket = %socket_path.display(),
+            "resume target socket missing"
+        );
         bail!(
             "session socket '{}' missing; the supervisor may have just exited",
             socket_path.display()
         );
     }
+    tracing::info!(
+        workspace = %workspace,
+        session_id = %target,
+        socket = %socket_path.display(),
+        "resume attach found existing socket"
+    );
     session::client::attach(&socket_path).await
 }
 
@@ -420,7 +643,7 @@ fn spawn_supervisor(workspace: &str, session_id: &str, command: &[String]) -> Re
     let log_clone = log
         .try_clone()
         .with_context(|| "duplicating supervisor log fd")?;
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(&exe);
     cmd.arg("attach")
         .arg("--supervisor")
         .arg("--session")
@@ -435,7 +658,21 @@ fn spawn_supervisor(workspace: &str, session_id: &str, command: &[String]) -> Re
             cmd.arg(arg);
         }
     }
-    cmd.spawn().context("spawning session supervisor")?;
+    tracing::info!(
+        workspace,
+        session_id,
+        exe = %exe.display(),
+        log = %log_path.display(),
+        command_len = command.len(),
+        "spawning detached session supervisor"
+    );
+    let child = cmd.spawn().context("spawning session supervisor")?;
+    tracing::info!(
+        workspace,
+        session_id,
+        pid = child.id(),
+        "detached session supervisor spawned"
+    );
     Ok(())
 }
 
@@ -448,6 +685,12 @@ fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
         std::thread::sleep(Duration::from_millis(50));
     }
     anyhow::bail!("timed out waiting for supervisor socket")
+}
+
+fn has_io_kind(err: &anyhow::Error, kind: ErrorKind) -> bool {
+    err.chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == kind)
 }
 
 fn workspace_path(name: &str) -> Option<PathBuf> {

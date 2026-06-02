@@ -17,11 +17,26 @@ pub struct SupervisorConfig {
 }
 
 pub async fn run(config: SupervisorConfig) -> Result<i32> {
+    let session_id = session_id_from_socket(&config.socket_path);
+    tracing::info!(
+        workspace = %config.workspace,
+        session_id = %session_id,
+        socket = %config.socket_path.display(),
+        workdir = config.workdir.as_ref().map(|p| p.display().to_string()).unwrap_or_default(),
+        command_len = config.command.len(),
+        "supervisor starting"
+    );
     if let Some(parent) = config.socket_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating session socket dir {}", parent.display()))?;
     }
     if config.socket_path.exists() {
+        tracing::warn!(
+            workspace = %config.workspace,
+            session_id = %session_id,
+            socket = %config.socket_path.display(),
+            "removing pre-existing supervisor socket before bind"
+        );
         let _ = fs::remove_file(&config.socket_path);
     }
 
@@ -36,24 +51,18 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
     let listener = listener_result
         .with_context(|| format!("binding session socket {}", config.socket_path.display()))?;
     set_socket_perms(&config.socket_path)?;
+    tracing::info!(
+        workspace = %config.workspace,
+        session_id = %session_id,
+        socket = %config.socket_path.display(),
+        "supervisor socket bound"
+    );
 
     let pty = native_pty_system();
     let pair = pty
         .openpty(config.initial_size)
         .context("opening PTY pair")?;
 
-    let mut cmd = if config.command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut c = CommandBuilder::new(shell);
-        c.arg("-l");
-        c
-    } else {
-        let mut c = CommandBuilder::new(&config.command[0]);
-        for arg in &config.command[1..] {
-            c.arg(arg);
-        }
-        c
-    };
     // portable-pty's CommandBuilder does NOT inherit the parent process's
     // cwd when no `cwd()` is set — it defaults to `$HOME`. The SSH cascade
     // does `cd $remote_dir` before exec'ing us, which sets the supervisor
@@ -64,15 +73,51 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         .workdir
         .clone()
         .or_else(|| std::env::current_dir().ok());
-    if let Some(dir) = &effective_cwd {
-        cmd.cwd(dir);
-    }
-    cmd.env("BERTH_WORKSPACE", &config.workspace);
 
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .context("spawning workspace shell under PTY")?;
+    let mut cmd = command_builder(&config.command);
+    configure_workspace_command(&mut cmd, &config.workspace, effective_cwd.as_deref());
+
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(child) => {
+            tracing::info!(
+                workspace = %config.workspace,
+                session_id = %session_id,
+                command_len = config.command.len(),
+                "spawned workspace command under PTY"
+            );
+            child
+        }
+        Err(err) if should_retry_via_interactive_shell(&err, &config.command) => {
+            tracing::warn!(
+                workspace = %config.workspace,
+                session_id = %session_id,
+                error = ?err,
+                "workspace command not found directly; retrying through interactive shell"
+            );
+            let mut fallback = interactive_shell_command_builder(&config.command);
+            configure_workspace_command(&mut fallback, &config.workspace, effective_cwd.as_deref());
+            let child = pair
+                .slave
+                .spawn_command(fallback)
+                .context("spawning workspace command via interactive shell under PTY")?;
+            tracing::info!(
+                workspace = %config.workspace,
+                session_id = %session_id,
+                command_len = config.command.len(),
+                "spawned workspace command via interactive shell under PTY"
+            );
+            child
+        }
+        Err(err) => {
+            tracing::error!(
+                workspace = %config.workspace,
+                session_id = %session_id,
+                error = ?err,
+                "failed to spawn workspace command under PTY"
+            );
+            return Err(err).context("spawning workspace shell under PTY");
+        }
+    };
     drop(pair.slave);
 
     let pty_master = Arc::new(Mutex::new(pair.master));
@@ -104,18 +149,32 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
     let replay_for_reader = replay_buf.clone();
     let pty_for_reader = pty_master.clone();
     let shutdown_for_reader = shutdown_tx.clone();
+    let reader_workspace = config.workspace.clone();
+    let reader_session_id = session_id.clone();
     let pty_reader_handle = tokio::task::spawn_blocking(move || {
         let mut reader = match pty_for_reader.blocking_lock().try_clone_reader() {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!(?e, "could not clone PTY reader");
+                tracing::error!(
+                    workspace = %reader_workspace,
+                    session_id = %reader_session_id,
+                    ?e,
+                    "could not clone PTY reader"
+                );
                 return;
             }
         };
         let mut buf = [0u8; 8192];
         loop {
             match std::io::Read::read(&mut reader, &mut buf) {
-                Ok(0) => break,
+                Ok(0) => {
+                    tracing::info!(
+                        workspace = %reader_workspace,
+                        session_id = %reader_session_id,
+                        "PTY reader reached EOF"
+                    );
+                    break;
+                }
                 Ok(n) => {
                     let chunk = buf[..n].to_vec();
                     // Append to replay buffer, dropping from the front
@@ -131,7 +190,15 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                     let _ = stdout_for_pump.send(chunk);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %reader_workspace,
+                        session_id = %reader_session_id,
+                        ?e,
+                        "PTY reader stopped after read error"
+                    );
+                    break;
+                }
             }
         }
         let _ = shutdown_for_reader.send(0);
@@ -167,9 +234,18 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
 
     let socket_for_cleanup = config.socket_path.clone();
     let shutdown_for_waiter = shutdown_tx.clone();
+    let waiter_workspace = config.workspace.clone();
+    let waiter_session_id = session_id.clone();
     let waiter_handle = tokio::task::spawn_blocking(move || {
         let status = child.wait().ok();
         let code = status.as_ref().map(|s| s.exit_code() as i32).unwrap_or(-1);
+        tracing::info!(
+            workspace = %waiter_workspace,
+            session_id = %waiter_session_id,
+            status = ?status,
+            code,
+            "workspace command exited"
+        );
         let _ = shutdown_for_waiter.send(code);
         code
     });
@@ -186,6 +262,12 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                     Ok((stream, _addr)) => {
                         let stream_id = next_client_id;
                         next_client_id += 1;
+                        tracing::info!(
+                            workspace = %config.workspace,
+                            session_id = %session_id,
+                            client_id = stream_id,
+                            "supervisor accepted client"
+                        );
                         let stdout_rx = stdout_tx.subscribe();
                         let stdin_for_client = stdin_tx.clone();
                         let resize_for_client = resize_tx.clone();
@@ -206,7 +288,12 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                         ));
                     }
                     Err(e) => {
-                        tracing::error!(?e, "accept failed");
+                        tracing::error!(
+                            workspace = %config.workspace,
+                            session_id = %session_id,
+                            ?e,
+                            "accept failed"
+                        );
                         break;
                     }
                 }
@@ -215,6 +302,12 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                 let c = code.unwrap_or(0);
                 pending_exit = Some(c);
                 shutdown_fired.store(c, std::sync::atomic::Ordering::SeqCst);
+                tracing::info!(
+                    workspace = %config.workspace,
+                    session_id = %session_id,
+                    code = c,
+                    "supervisor received shutdown signal"
+                );
                 break;
             }
         }
@@ -232,6 +325,13 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
                 if let Ok((stream, _addr)) = res {
                     let stream_id = next_client_id;
                     next_client_id += 1;
+                    tracing::info!(
+                        workspace = %config.workspace,
+                        session_id = %session_id,
+                        client_id = stream_id,
+                        pending_exit,
+                        "supervisor accepted client during exit grace period"
+                    );
                     let stdout_rx = stdout_tx.subscribe();
                     let stdin_for_client = stdin_tx.clone();
                     let resize_for_client = resize_tx.clone();
@@ -256,27 +356,139 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         }
     }
 
-    tracing::info!("cleanup: awaiting pty_reader_handle");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: awaiting pty_reader_handle");
     let _ = pty_reader_handle.await;
-    tracing::info!("cleanup: dropping stdin_tx");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: dropping stdin_tx");
     drop(stdin_tx);
-    tracing::info!("cleanup: awaiting writer_handle");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: awaiting writer_handle");
     let _ = writer_handle.await;
-    tracing::info!("cleanup: dropping resize_tx");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: dropping resize_tx");
     drop(resize_tx);
-    tracing::info!("cleanup: awaiting resizer_handle");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: awaiting resizer_handle");
     let _ = resizer_handle.await;
-    tracing::info!("cleanup: awaiting waiter_handle");
+    tracing::info!(workspace = %config.workspace, session_id = %session_id, "cleanup: awaiting waiter_handle");
     let final_code = waiter_handle.await.unwrap_or(pending_exit.unwrap_or(0));
-    tracing::info!(?final_code, "cleanup: removing socket");
+    tracing::info!(
+        workspace = %config.workspace,
+        session_id = %session_id,
+        ?final_code,
+        socket = %socket_for_cleanup.display(),
+        "cleanup: removing socket"
+    );
     let _ = fs::remove_file(&socket_for_cleanup);
-    tracing::info!("cleanup: done");
+    tracing::info!(
+        workspace = %config.workspace,
+        session_id = %session_id,
+        final_code,
+        "supervisor cleanup done"
+    );
     Ok(final_code)
+}
+
+fn session_id_from_socket(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_suffix(".sock"))
+        .or_else(|| path.file_stem().and_then(|name| name.to_str()))
+        .unwrap_or("")
+        .to_string()
+}
+
+fn command_builder(command: &[String]) -> CommandBuilder {
+    if command.is_empty() {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+        let mut c = CommandBuilder::new(shell);
+        c.arg("-l");
+        return c;
+    }
+
+    let mut c = CommandBuilder::new(&command[0]);
+    for arg in &command[1..] {
+        c.arg(arg);
+    }
+    c
+}
+
+fn configure_workspace_command(
+    cmd: &mut CommandBuilder,
+    workspace: &str,
+    effective_cwd: Option<&Path>,
+) {
+    if let Some(dir) = effective_cwd {
+        cmd.cwd(dir);
+    }
+    cmd.env("BERTH_WORKSPACE", workspace);
+}
+
+fn should_retry_via_interactive_shell(err: &anyhow::Error, command: &[String]) -> bool {
+    if command.is_empty() || command[0].contains('/') {
+        return false;
+    }
+    if err
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::NotFound)
+    {
+        return true;
+    }
+
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("No viable candidates found in PATH")
+            || message.contains("Unable to spawn")
+            || message.contains("No such file or directory")
+    })
+}
+
+fn interactive_shell_command_builder(command: &[String]) -> CommandBuilder {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell_name = Path::new(&shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    let mut c = CommandBuilder::new(shell.clone());
+    c.arg("-ic");
+    if shell_name == "fish" {
+        c.arg("exec $argv");
+        c.arg("berth-command");
+        for arg in command {
+            c.arg(arg);
+        }
+    } else {
+        c.arg(format!("exec {}", shell_command_line(command)));
+    }
+    c
+}
+
+fn shell_command_line(command: &[String]) -> String {
+    command
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            if idx == 0 && is_shell_bareword(arg) {
+                arg.clone()
+            } else {
+                shell_quote(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_shell_bareword(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.' | '/'))
+}
+
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
-    _client_id: u64,
+    client_id: u64,
     stream: UnixStream,
     mut stdout_rx: broadcast::Receiver<Vec<u8>>,
     stdin_tx: mpsc::Sender<Vec<u8>>,
@@ -286,6 +498,7 @@ async fn handle_client(
     replay: Arc<std::sync::Mutex<Vec<u8>>>,
     shutdown_fired: Arc<std::sync::atomic::AtomicI32>,
 ) {
+    tracing::info!(client_id, "supervisor client task starting");
     let mut shutdown_rx = shutdown_tx.subscribe();
     let mut shutdown_rx_for_read = shutdown_tx.subscribe();
     let (mut read_half, mut write_half) = stream.into_split();
@@ -296,6 +509,11 @@ async fn handle_client(
     // subscribe to the broadcast channel.
     let replay_snapshot: Vec<u8> = replay.lock().map(|b| b.clone()).unwrap_or_default();
     if !replay_snapshot.is_empty() {
+        tracing::debug!(
+            client_id,
+            replay_bytes = replay_snapshot.len(),
+            "replaying buffered PTY output to client"
+        );
         let _ = write_frame(&mut write_half, &Frame::Stdout(replay_snapshot)).await;
     }
 
@@ -307,10 +525,16 @@ async fn handle_client(
     // writer_handle.await can drain.
     let pending = shutdown_fired.load(std::sync::atomic::Ordering::SeqCst);
     if pending != i32::MIN {
+        tracing::info!(
+            client_id,
+            code = pending,
+            "client attached after shutdown; sending pending exit"
+        );
         let _ = write_frame(&mut write_half, &Frame::Exit { code: pending }).await;
         return;
     }
 
+    let writer_client_id = client_id;
     let writer_task = tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -318,36 +542,63 @@ async fn handle_client(
                     match msg {
                         Ok(bytes) => {
                             if write_frame(&mut write_half, &Frame::Stdout(bytes)).await.is_err() {
+                                tracing::info!(
+                                    client_id = writer_client_id,
+                                    "client writer stopped because stdout frame write failed"
+                                );
                                 break;
                             }
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!(
+                                client_id = writer_client_id,
+                                "client writer stopped because stdout channel closed"
+                            );
+                            break;
+                        }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     }
                 }
                 code = shutdown_rx.recv() => {
                     let code = code.unwrap_or(0);
                     let _ = write_frame(&mut write_half, &Frame::Exit { code }).await;
+                    tracing::info!(
+                        client_id = writer_client_id,
+                        code,
+                        "client writer sent exit frame"
+                    );
                     break;
                 }
             }
         }
     });
 
-    loop {
+    let exit_reason = loop {
         tokio::select! {
             frame = read_frame(&mut read_half) => {
                 match frame {
                     Ok(Some(Frame::Stdin(bytes))) => {
                         if stdin_tx.send(bytes).await.is_err() {
-                            break;
+                            break "stdin-channel-closed";
                         }
                     }
                     Ok(Some(Frame::Resize { cols, rows })) => {
                         let _ = resize_tx.send((cols, rows)).await;
                     }
-                    Ok(Some(_)) | Ok(None) => break,
-                    Err(_) => break,
+                    Ok(Some(_)) => {
+                        break "unexpected-client-frame";
+                    }
+                    Ok(None) => {
+                        break "client-socket-eof";
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            client_id,
+                            ?err,
+                            "client read failed"
+                        );
+                        break "client-read-error";
+                    }
                 }
             }
             // Crucial for supervisor cleanup: if the supervisor's main
@@ -357,10 +608,18 @@ async fn handle_client(
             // Without this break, writer_handle's mpsc receiver never
             // returns None and the supervisor hangs forever in its
             // cleanup `await`.
-            _ = shutdown_rx_for_read.recv() => break,
+            _ = shutdown_rx_for_read.recv() => {
+                break "supervisor-shutdown";
+            }
         }
-    }
+    };
+    tracing::info!(
+        client_id,
+        exit_reason,
+        "supervisor client read loop exiting"
+    );
     let _ = writer_task.await;
+    tracing::info!(client_id, exit_reason, "supervisor client task done");
 }
 
 #[cfg(unix)]
@@ -465,6 +724,25 @@ mod tests {
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    #[test]
+    fn shell_command_line_leaves_simple_command_resolvable_by_shell() {
+        let command = vec!["claude".to_string(), "--resume".to_string()];
+        assert_eq!(shell_command_line(&command), "claude '--resume'");
+    }
+
+    #[test]
+    fn shell_command_line_quotes_arguments_safely() {
+        let command = vec![
+            "my tool".to_string(),
+            "it's fine".to_string(),
+            "$(nope)".to_string(),
+        ];
+        assert_eq!(
+            shell_command_line(&command),
+            "'my tool' 'it'\"'\"'s fine' '$(nope)'"
+        );
     }
 
     async fn wait_for_socket(path: &std::path::Path) {
