@@ -1,9 +1,10 @@
 use crate::config::{Config, Mount, Runtime};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::env;
 use std::process;
+use std::time::Duration;
 use tokio::process::Command;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::tunnel::TunnelState;
 
@@ -16,6 +17,51 @@ fn skip_ssh() -> bool {
 
 fn hook_auto_entry() -> bool {
     env::var_os("BERTH_FROM_HOOK").is_some()
+}
+
+fn fake_interactive_ssh_result(
+    host: &str,
+    workspace_name: &str,
+    command: &str,
+) -> Result<Option<i32>> {
+    let Ok(codes) = env::var("BERTH_FAKE_INTERACTIVE_SSH_CODES") else {
+        return Ok(None);
+    };
+    let parsed = codes
+        .split(',')
+        .filter_map(|raw| {
+            let trimmed = raw.trim();
+            (!trimmed.is_empty()).then(|| trimmed.parse::<i32>())
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("parsing BERTH_FAKE_INTERACTIVE_SSH_CODES={codes:?}"))?;
+    if parsed.is_empty() {
+        return Ok(None);
+    }
+
+    let state_path = env::var("BERTH_FAKE_INTERACTIVE_SSH_STATE")
+        .context("BERTH_FAKE_INTERACTIVE_SSH_STATE is required with fake ssh codes")?;
+    let prior = std::fs::read_to_string(&state_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    let attempt = prior + 1;
+    std::fs::write(&state_path, attempt.to_string())
+        .with_context(|| format!("writing fake ssh state {state_path}"))?;
+
+    if let Ok(log_path) = env::var("BERTH_FAKE_INTERACTIVE_SSH_LOG") {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("opening fake ssh log {log_path}"))?;
+        writeln!(f, "{attempt}\t{host}\t{workspace_name}\t{command}")
+            .with_context(|| format!("writing fake ssh log {log_path}"))?;
+    }
+
+    let idx = attempt.saturating_sub(1).min(parsed.len() - 1);
+    Ok(Some(parsed[idx]))
 }
 
 fn remote_projects_path() -> &'static str {
@@ -90,6 +136,18 @@ pub struct RemoteEnterOverrides<'a> {
     /// `berth attach` cascade arm as trailing `-- <argv...>`.
     pub command: Option<&'a [String]>,
     pub session_id: Option<&'a str>,
+    pub session_mode: RemoteSessionMode,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RemoteSessionMode {
+    /// Initial enter: create the named remote supervisor if it does not
+    /// already exist, otherwise attach to it.
+    #[default]
+    CreateOrAttach,
+    /// Reconnect after transport loss: attach only to the exact session
+    /// that was already started. Never create a replacement implicitly.
+    AttachOnly,
 }
 
 pub async fn ssh_interactive_runtime(
@@ -130,8 +188,17 @@ pub async fn ssh_interactive_runtime_with(
         mounts,
         overrides.command,
         overrides.session_id,
+        overrides.session_mode,
         Some(config.detach_key_env_value().as_str()),
     );
+
+    if let Some(code) =
+        fake_interactive_ssh_result(host, workspace_name, &enter_cmd).with_context(|| {
+            format!("recording fake interactive ssh enter for {host}/{workspace_name}")
+        })?
+    {
+        return Ok(code);
+    }
 
     if skip_ssh() {
         println!(
@@ -156,6 +223,15 @@ pub async fn ssh_interactive_runtime_with(
     args.push(enter_cmd);
     // The proxy is sync (portable-pty's APIs are sync); shove it onto
     // a blocking pool so the tokio scheduler doesn't park.
+    tracing::info!(
+        host = %host,
+        workspace = %workspace_name,
+        session_id = overrides.session_id.unwrap_or(""),
+        has_remote_dir_override = overrides.remote_dir.is_some(),
+        has_command_override = overrides.command.is_some(),
+        session_id_reused_by_reconnect = overrides.session_id.is_some(),
+        "remote runtime ssh command prepared"
+    );
     let code = tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
         .await
         .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))??;
@@ -208,8 +284,23 @@ pub async fn ssh_attach_remote(
     }
 
     if list {
+        tracing::info!(
+            host = %host,
+            workspace = %workspace_name,
+            session_id = session.unwrap_or(""),
+            list_all,
+            list_long,
+            "running remote attach list command"
+        );
         print!("{}", run_remote_command(host, &remote).await?);
         return Ok(0);
+    }
+    if let Some(code) =
+        fake_interactive_ssh_result(host, workspace_name, &remote).with_context(|| {
+            format!("recording fake interactive ssh attach for {host}/{workspace_name}")
+        })?
+    {
+        return Ok(code);
     }
     if skip_ssh() {
         println!(
@@ -222,9 +313,25 @@ pub async fn ssh_attach_remote(
     push_interactive_ssh_options(&mut args, hook_auto_entry());
     args.push(host.to_string());
     args.push(remote);
-    tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
+    tracing::info!(
+        host = %host,
+        workspace = %workspace_name,
+        session_id = session.unwrap_or(""),
+        new,
+        command_len = command.len(),
+        "remote attach ssh command prepared"
+    );
+    let code = tokio::task::spawn_blocking(move || pty_proxy::ssh_through_filter(&args))
         .await
-        .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))?
+        .map_err(|e| anyhow::anyhow!("ssh proxy task: {e:#}"))??;
+    tracing::info!(
+        host = %host,
+        workspace = %workspace_name,
+        session_id = session.unwrap_or(""),
+        code,
+        "remote attach ssh exited"
+    );
+    Ok(code)
 }
 
 fn push_interactive_ssh_options(args: &mut Vec<String>, noninteractive: bool) {
@@ -232,6 +339,7 @@ fn push_interactive_ssh_options(args: &mut Vec<String>, noninteractive: bool) {
     // motd banners). Errors still print.
     args.extend(["-o".into(), "LogLevel=ERROR".into()]);
     // Make transport loss visible to the reconnect loop promptly.
+    args.extend(["-o".into(), "ConnectTimeout=10".into()]);
     args.extend(["-o".into(), "ServerAliveInterval=5".into()]);
     args.extend(["-o".into(), "ServerAliveCountMax=2".into()]);
     // New-tab auto-entry is best-effort. If the SSH agent/key is not
@@ -264,6 +372,7 @@ fn remote_enter_command(
         mounts,
         None,
         None,
+        RemoteSessionMode::CreateOrAttach,
         None,
     )
 }
@@ -281,6 +390,7 @@ fn remote_enter_command_with(
     mounts: &[Mount],
     workspace_command: Option<&[String]>,
     session_id: Option<&str>,
+    session_mode: RemoteSessionMode,
     detach_key: Option<&str>,
 ) -> String {
     let base = format!("mkdir -p {remote_path} && cd {remote_path}");
@@ -330,7 +440,10 @@ fn remote_enter_command_with(
     // shell's `$$` and `$RANDOM` left UNquoted so they expand on the far
     // side. Concatenation of a quoted and unquoted segment yields a
     // single shell word.
-    let unique_session = format!("{}-$$-$RANDOM", shell_escape_arg(&session));
+    let stable_fallback_session = session_id
+        .map(|id| format!("{session}-{id}"))
+        .unwrap_or_else(|| format!("{session}-$$-$RANDOM"));
+    let unique_session = shell_escape_arg(&stable_fallback_session);
 
     // Trailing `-- <argv...>` for the `berth attach --new` cascade arm,
     // so a per-workspace command (set in config) lands as the session's
@@ -338,7 +451,12 @@ fn remote_enter_command_with(
     // independently. Empty / None means "no override; supervisor runs
     // $SHELL -l".
     let attach_verb = if let Some(id) = session_id {
-        format!("--new --session {}", shell_escape_arg(id))
+        match session_mode {
+            RemoteSessionMode::CreateOrAttach => {
+                format!("--new --session {}", shell_escape_arg(id))
+            }
+            RemoteSessionMode::AttachOnly => format!("--session {}", shell_escape_arg(id)),
+        }
     } else {
         "--new".to_string()
     };
@@ -368,6 +486,39 @@ fn remote_enter_command_with(
     //   4. plain shell: last resort, no reattach guarantee.
     // Prefer the binary Berth deploys to. PATH may contain an older package
     // install, and using it can silently restore old attach semantics.
+    let legacy_tmux = match session_mode {
+        RemoteSessionMode::CreateOrAttach => {
+            format!(
+                "exec sh -lc 'tmux attach-session -t \"$1\" || exec tmux new-session -s \"$1\" \"$2\"' sh {unique_session} {escaped_inner}"
+            )
+        }
+        RemoteSessionMode::AttachOnly => {
+            format!("exec tmux attach-session -t {unique_session}")
+        }
+    };
+    let legacy_screen = match session_mode {
+        RemoteSessionMode::CreateOrAttach => {
+            format!("exec screen -D -RR {unique_session} sh -lc {escaped_inner}")
+        }
+        RemoteSessionMode::AttachOnly => format!("exec screen -r {unique_session}"),
+    };
+    let no_session_fallback = match session_mode {
+        RemoteSessionMode::CreateOrAttach => format!(
+            "elif command -v mosh-server >/dev/null 2>&1; then \
+               exec mosh-server new -- sh -lc {escaped_inner}; \
+             else \
+               {inner}; \
+             fi"
+        ),
+        RemoteSessionMode::AttachOnly => {
+            "else \
+               printf 'berth: remote session not found; waiting for reconnect to same session\\n' >&2; \
+               exit 75; \
+             fi"
+                .to_string()
+        }
+    };
+
     format!(
         "{base} && \
          berth_bin=; \
@@ -378,19 +529,15 @@ fn remote_enter_command_with(
          fi; \
          if [ -n \"$berth_bin\" ]; then \
            {attach_env}exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
-         elif command -v mosh-server >/dev/null 2>&1; then \
-           exec mosh-server new -- sh -lc {escaped_inner}; \
          elif command -v tmux >/dev/null 2>&1; then \
-           exec tmux new-session -s {unique_session} {escaped_inner}; \
+           {legacy_tmux}; \
          elif command -v screen >/dev/null 2>&1; then \
-           exec screen -S {unique_session} sh -lc {escaped_inner}; \
-         else \
-           {inner}; \
-         fi"
+           {legacy_screen}; \
+         {no_session_fallback}"
     )
 }
 
-fn shell_escape_arg(input: &str) -> String {
+pub fn shell_escape_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
@@ -538,14 +685,48 @@ fn is_port_in_use(port: u16) -> bool {
     TcpListener::bind(format!("127.0.0.1:{}", port)).is_err()
 }
 
+const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {
+    run_remote_command_with_timeout(host, command, REMOTE_COMMAND_TIMEOUT).await
+}
+
+pub async fn run_remote_command_with_timeout(
+    host: &str,
+    command: &str,
+    timeout_after: Duration,
+) -> Result<String> {
     if skip_ssh() {
         return Ok(format!("[TEST MODE] Would run on {}: {}", host, command));
     }
 
-    tracing::debug!(host = %host, cmd_len = command.len(), "ssh exec");
-    let output = Command::new("ssh").arg(host).arg(command).output().await?;
-    tracing::debug!(
+    tracing::info!(
+        host = %host,
+        cmd_len = command.len(),
+        timeout_ms = timeout_after.as_millis(),
+        "ssh exec starting"
+    );
+    let child = Command::new("ssh")
+        .args(noninteractive_ssh_args(host, command))
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let output = match timeout(timeout_after, child.wait_with_output()).await {
+        Ok(output) => output?,
+        Err(_) => {
+            tracing::warn!(
+                host = %host,
+                timeout_ms = timeout_after.as_millis(),
+                "ssh exec timed out"
+            );
+            anyhow::bail!(
+                "Remote command timed out after {}s talking to {host}",
+                timeout_after.as_secs()
+            );
+        }
+    };
+    tracing::info!(
         host = %host,
         status = ?output.status,
         stdout_len = output.stdout.len(),
@@ -554,13 +735,33 @@ pub async fn run_remote_command(host: &str, command: &str) -> Result<String> {
     );
 
     if !output.status.success() {
-        anyhow::bail!(
-            "Remote command failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = if stderr.trim().is_empty() {
+            format!("status {} with empty stderr", output.status)
+        } else {
+            stderr.trim_end().to_string()
+        };
+        anyhow::bail!("Remote command failed: {detail}");
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn noninteractive_ssh_args(host: &str, command: &str) -> Vec<String> {
+    vec![
+        "-o".to_string(),
+        "LogLevel=ERROR".to_string(),
+        "-o".to_string(),
+        "BatchMode=yes".to_string(),
+        "-o".to_string(),
+        "ConnectTimeout=10".to_string(),
+        "-o".to_string(),
+        "ServerAliveInterval=5".to_string(),
+        "-o".to_string(),
+        "ServerAliveCountMax=2".to_string(),
+        host.to_string(),
+        command.to_string(),
+    ]
 }
 
 #[cfg(test)]
@@ -584,8 +785,8 @@ mod tests {
             .find("command -v screen")
             .expect("screen probe present");
         assert!(
-            attach_idx < mosh_idx && mosh_idx < tmux_idx && tmux_idx < screen_idx,
-            "cascade order is berth > mosh > tmux > screen"
+            attach_idx < tmux_idx && tmux_idx < screen_idx && screen_idx < mosh_idx,
+            "cascade order is berth > tmux > screen > mosh"
         );
 
         // The exec is now via the resolved `$berth_bin` (either `command -v`
@@ -599,12 +800,56 @@ mod tests {
         // multiple terminal tabs don't pile into one shared session.
         // The prefix is shell-quoted; $$ and $RANDOM are deliberately
         // left unquoted so the remote shell expands them at runtime.
-        assert!(command.contains("tmux new-session -s 'berth-work'-$$-$RANDOM"));
-        assert!(command.contains("screen -S 'berth-work'-$$-$RANDOM"));
-        // No attach-or-create flags: each invocation must be a fresh session.
-        assert!(!command.contains("new-session -A"));
-        assert!(!command.contains("screen -D -RR"));
+        assert!(command.contains("tmux attach-session -t"));
+        assert!(command.contains("tmux new-session -s"));
+        assert!(command.contains("'berth-work-$$-$RANDOM'"));
+        assert!(command.contains("screen -D -RR 'berth-work-$$-$RANDOM'"));
         assert!(command.contains("else exec ${SHELL:-/bin/sh}; fi"));
+    }
+
+    #[test]
+    fn remote_entry_legacy_fallback_uses_stable_generated_session_id() {
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            None,
+            Some("abc123def456"),
+            RemoteSessionMode::CreateOrAttach,
+            None,
+        );
+
+        assert!(command.contains("'berth-work-abc123def456'"));
+        assert!(!command.contains("$$-$RANDOM"));
+        assert!(command.contains("tmux attach-session -t"));
+        assert!(command.contains("screen -D -RR 'berth-work-abc123def456'"));
+    }
+
+    #[test]
+    fn remote_entry_reconnect_attach_only_never_creates_replacement_session() {
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            None,
+            Some("abc123def456"),
+            RemoteSessionMode::AttachOnly,
+            None,
+        );
+
+        assert!(command.contains("exec \"$berth_bin\" attach --session 'abc123def456' 'work'"));
+        assert!(!command.contains("attach --new --session 'abc123def456'"));
+        assert!(command.contains("exec tmux attach-session -t 'berth-work-abc123def456'"));
+        assert!(!command.contains("tmux new-session"));
+        assert!(command.contains("exec screen -r 'berth-work-abc123def456'"));
+        assert!(!command.contains("screen -D -RR"));
+        assert!(!command.contains("mosh-server new"));
+        assert!(!command.contains("else exec ${SHELL:-/bin/sh}; fi"));
+        assert!(command.contains("remote session not found"));
     }
 
     #[test]
@@ -655,9 +900,23 @@ mod tests {
         let command = remote_enter_command("team/work", &path_expr, &Runtime::Bare, &[]);
 
         // Session name is workspace-derived with a per-invocation suffix
-        // so multi-tab tmux/screen sessions don't collide. The prefix is
-        // quoted; $$ and $RANDOM are not, so the remote shell expands them.
-        assert!(command.contains("'berth-team-work'-$$-$RANDOM"));
+        // so multi-tab tmux/screen sessions don't collide.
+        assert!(command.contains("'berth-team-work-$$-$RANDOM'"));
+    }
+
+    #[test]
+    fn noninteractive_ssh_args_are_bounded_and_batch_mode() {
+        let args = noninteractive_ssh_args("dev-box", "true");
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(args.windows(2).any(|w| w == ["-o", "ConnectTimeout=10"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-o", "ServerAliveInterval=5"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-o", "ServerAliveCountMax=2"]));
+        assert_eq!(args[args.len() - 2], "dev-box");
+        assert_eq!(args[args.len() - 1], "true");
     }
 
     #[test]
@@ -665,6 +924,7 @@ mod tests {
         let mut args = Vec::new();
         push_interactive_ssh_options(&mut args, true);
 
+        assert!(args.windows(2).any(|w| w == ["-o", "ConnectTimeout=10"]));
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
     }
 
@@ -673,6 +933,7 @@ mod tests {
         let mut args = Vec::new();
         push_interactive_ssh_options(&mut args, false);
 
+        assert!(args.windows(2).any(|w| w == ["-o", "ConnectTimeout=10"]));
         assert!(!args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
     }
 

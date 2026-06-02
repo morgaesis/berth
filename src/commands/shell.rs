@@ -286,8 +286,8 @@ fn hook_argv(line: &str) -> Result<Vec<String>> {
             Vec::new()
         };
         argv.extend(tokens[4..].iter().cloned());
-        if argv.first().map(|s| s.as_str()) != Some("enter") {
-            bail!("hook invoke file must run `berth enter`");
+        if !matches!(argv.first().map(|s| s.as_str()), Some("enter" | "attach")) {
+            bail!("hook invoke file must run `berth enter` or `berth attach`");
         }
         return Ok(argv);
     }
@@ -475,7 +475,7 @@ _berth_auto_enter_on_start() {
         *) return 0 ;;
     esac
 
-    local state_dir invoke_file invoke_line proj status
+    local state_dir invoke_file invoke_line proj berth_status
     state_dir="$(_berth_state_dir)"
 
     # 1. Cwd-inheritance path: detect workspace from $PWD if it's inside
@@ -488,27 +488,29 @@ _berth_auto_enter_on_start() {
         esac
         invoke_file="$state_dir/$(printf '%s' "$proj" | sed 's|/|_|g')/.invoke"
         if [ -r "$invoke_file" ]; then
-            # Run the exact `berth enter <ws> [--dir D] [-- argv]`
-            # line written by the parent tab. Replays workspace + dir +
-            # command override verbatim. Parsing is delegated back to
-            # berth so this hook does not eval file contents as shell.
+            # Run the exact berth line written by the parent tab.
+            # Remote sessions replay as `berth attach --session <id>`;
+            # local/legacy entries replay as `berth enter ...`.
+            # Parsing is delegated back to berth so this hook does not
+            # eval file contents as shell.
             invoke_line="$(cat "$invoke_file" 2>/dev/null)"
             case "$invoke_line" in
-                "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter "*)
+                "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter "*|\
+                "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach "*)
                     command berth hook-run "$invoke_file"
-                    status=$?
-                    if [ "$status" -ne 0 ]; then
+                    berth_status=$?
+                    if [ "$berth_status" -ne 0 ]; then
                         printf 'berth: auto-enter failed. Skipping.\n' >&2
                     fi
-                    return "$status"
+                    return "$berth_status"
                     ;;
                 "BERTH_SKIP_AUTO=1 command berth enter --new "*)
                     command berth hook-run "$invoke_file"
-                    status=$?
-                    if [ "$status" -ne 0 ]; then
+                    berth_status=$?
+                    if [ "$berth_status" -ne 0 ]; then
                         printf 'berth: auto-enter failed. Skipping.\n' >&2
                     fi
-                    return "$status"
+                    return "$berth_status"
                     ;;
                 ?*)
                     printf 'berth: ignoring malformed .invoke (%s)\n' "$invoke_file" >&2
@@ -566,6 +568,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(argv, ["enter", "org/proj", "--", "echo", "a && b"]);
+    }
+
+    #[test]
+    fn hook_argv_accepts_attach_session_replay() {
+        let argv = hook_argv(
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session 'abc123def456' 'org/proj'",
+        )
+        .unwrap();
+        assert_eq!(argv, ["attach", "--session", "abc123def456", "org/proj"]);
     }
 
     #[test]

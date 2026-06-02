@@ -2,13 +2,14 @@ use anyhow::Result;
 use berth::config::{Config, Runtime, Workspace};
 use berth::deploy::{self, ConsentMode, DeployDecision};
 use berth::runtime::{self, CommandSpec};
-use berth::ssh;
+use berth::ssh::{self, RemoteSessionMode};
 use colored::Colorize;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::time::Duration;
 
 /// User-controllable knobs for `berth enter`.
 #[derive(Debug, Clone, Default)]
@@ -117,6 +118,11 @@ pub async fn run(
     let runtime_config = config.merged_runtime_for(&workspace, remote.is_some());
     let mounts = config.merged_mounts(&workspace);
     let idle = config.merged_idle(&workspace);
+    let command: Option<Vec<String>> = if !opts.command.is_empty() {
+        Some(opts.command.clone())
+    } else {
+        workspace.command.clone()
+    };
 
     // Effective working directory: CLI override > workspace.remote_dir >
     // org root > workspace.path. Shared by local and remote entry; the
@@ -147,11 +153,6 @@ pub async fn run(
 
     if let Some(host) = remote {
         let host = host.clone();
-        let command: Option<Vec<String>> = if !opts.command.is_empty() {
-            Some(opts.command.clone())
-        } else {
-            workspace.command.clone()
-        };
         let _ = berth::lifecycle_state::touch(
             &name,
             Some(&host),
@@ -161,7 +162,7 @@ pub async fn run(
         if !from_new_tab_hook {
             refresh_remote_session_statuses(&config, &host).await;
         }
-        ensure_remote_ready(&mut config, &host, &opts).await?;
+        let remote_probe_succeeded = ensure_remote_ready(&mut config, &host, &opts).await?;
         let result = enter_remote(
             name,
             &host,
@@ -172,6 +173,7 @@ pub async fn run(
             &opts,
             effective_dir.as_deref(),
             command.as_deref(),
+            remote_probe_succeeded,
         )
         .await;
         if !from_new_tab_hook {
@@ -192,7 +194,13 @@ pub async fn run(
         if !local_cwd.exists() {
             fs::create_dir_all(&local_cwd)?;
         }
-        let result = enter_local(&name, &local_cwd, &runtime_config, &mounts);
+        let result = enter_local(
+            &name,
+            &local_cwd,
+            &runtime_config,
+            &mounts,
+            command.as_deref(),
+        );
         let _ = berth::lifecycle_state::remove(&name, None);
         result
     }
@@ -315,35 +323,50 @@ fn enter_local(
     path: &Path,
     runtime_config: &Runtime,
     mounts: &[berth::config::Mount],
+    command: Option<&[String]>,
 ) -> Result<()> {
     let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
 
     berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
         workspace: name,
         dir: None,
-        command: None,
+        command,
+        session_id: None,
     });
 
     match runtime_config {
         Runtime::Bare => {
-            let mut child = std::process::Command::new(&shell)
-                .current_dir(path)
-                .env("BERTH_WORKSPACE", name)
-                .env("BERTH_PATH", path.to_string_lossy().as_ref())
-                .spawn()?;
+            let mut child = match command {
+                Some(argv) if !argv.is_empty() => {
+                    let mut cmd = std::process::Command::new(&argv[0]);
+                    cmd.args(&argv[1..]);
+                    cmd.current_dir(path)
+                        .env("BERTH_WORKSPACE", name)
+                        .env("BERTH_PATH", path.to_string_lossy().as_ref())
+                        .spawn()?
+                }
+                _ => std::process::Command::new(&shell)
+                    .current_dir(path)
+                    .env("BERTH_WORKSPACE", name)
+                    .env("BERTH_PATH", path.to_string_lossy().as_ref())
+                    .spawn()?,
+            };
 
-            child.wait()?;
+            let status = child.wait()?;
+            if !status.success() {
+                anyhow::bail!("local workspace command exited with error");
+            }
         }
         Runtime::Podman(podman) => {
             runtime::validate_configured_mounts(mounts)?;
-            let spec = podman_enter_spec(name, path, &shell, podman, mounts)?;
+            let spec = podman_enter_spec(name, path, &shell, podman, mounts, command)?;
             let status = runtime::run_command(&spec)?;
             if !status.success() {
                 anyhow::bail!("Podman environment exited with error");
             }
         }
         Runtime::KubernetesPod(kubernetes) => {
-            let spec = kubernetes_enter_spec(name, &shell, kubernetes)?;
+            let spec = kubernetes_enter_spec(name, &shell, kubernetes, command)?;
             let status = runtime::run_command(&spec)?;
             if !status.success() {
                 anyhow::bail!("Kubernetes pod environment exited with error");
@@ -366,20 +389,30 @@ async fn enter_remote(
     opts: &EnterOptions,
     remote_dir: Option<&str>,
     command: Option<&[String]>,
+    remote_probe_succeeded: bool,
 ) -> Result<()> {
     if let Some(ports) = ports {
         let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
     }
 
-    // Capture the exact invocation for the new-tab hook to replicate.
+    let session_id = berth::session::new_session_id();
+
+    // Capture the exact remote supervisor identity for hook replay.
+    // Command shape still matters for the first connection, but once a
+    // remote supervisor exists the durable thing to recover is its
+    // session id, regardless of whether PID 1 is a shell, sudo, or an
+    // interactive command such as Claude.
     berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
         workspace: &name,
         dir: remote_dir,
         command,
+        session_id: Some(&session_id),
     });
 
     tracing::info!(
         plain = opts.plain,
+        session_id = %session_id,
+        session_id_reused_on_reconnect = !opts.plain,
         has_dir = remote_dir.is_some(),
         has_cmd = command.is_some(),
         no_reconnect = opts.no_reconnect,
@@ -396,9 +429,9 @@ async fn enter_remote(
     // id, while a future `berth enter` starts a different session.
     let mut backoff_ms: u64 = 500;
     let mut attempt: u32 = 0;
-    let session_id = berth::session::new_session_id();
     let final_code = loop {
         attempt += 1;
+        let reconnect_attach_only = attempt > 1 && !opts.plain;
         let result = if opts.plain {
             ssh::ssh_interactive(host, &name, true).await
         } else {
@@ -406,45 +439,147 @@ async fn enter_remote(
                 remote_dir,
                 command,
                 session_id: Some(&session_id),
+                session_mode: if reconnect_attach_only {
+                    RemoteSessionMode::AttachOnly
+                } else {
+                    RemoteSessionMode::CreateOrAttach
+                },
             };
             ssh::ssh_interactive_runtime_with(host, &name, runtime_config, mounts, overrides).await
         };
         let code = result?;
-        tracing::info!(code, attempt, "remote ssh session returned");
-        match (code, opts.no_reconnect) {
-            (255, false) => {
+        tracing::info!(
+            code,
+            attempt,
+            session_id = %session_id,
+            reused_session_id = reconnect_attach_only,
+            reconnect_attach_only,
+            "remote ssh session returned"
+        );
+        match (code, opts.no_reconnect, reconnect_attach_only) {
+            (255, false, false) => {
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    remote_probe_succeeded,
+                    "initial remote ssh transport failed"
+                );
+                if !remote_probe_succeeded {
+                    tracing::warn!(
+                        workspace = %name,
+                        host,
+                        session_id = %session_id,
+                        attempt,
+                        "remote host was not reachable during preflight; not entering reconnect loop"
+                    );
+                    break code;
+                }
+                restore_terminal_modes_for_status();
+                eprintln!(
+                    "{} connection lost while starting session {}; reconnecting to the same session…  (Ctrl+C to abort)",
+                    "·".dimmed(),
+                    session_id.cyan()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                continue;
+            }
+            (255, false, true) => {
                 // Connection lost. Quiet first retry (covers the common
                 // case of a brief blip — back in <1s), louder if it
                 // takes longer.
                 tracing::warn!(
                     workspace = %name,
                     host,
+                    session_id = %session_id,
                     attempt,
                     backoff_ms,
+                    reused_session_id_on_next_attempt = !opts.plain,
                     "remote ssh transport lost; reconnecting"
                 );
                 restore_terminal_modes_for_status();
-                if attempt == 1 {
+                if attempt == 2 {
                     eprintln!(
-                        "{} connection lost; reconnecting…  (Ctrl+C to abort)",
-                        "·".dimmed()
+                        "{} connection lost; reconnecting session {}…  (Ctrl+C to abort)",
+                        "·".dimmed(),
+                        session_id.cyan()
                     );
                 } else if attempt.is_multiple_of(4) {
-                    eprintln!("{} still reconnecting (attempt {attempt})…", "·".dimmed());
+                    eprintln!(
+                        "{} still reconnecting session {} (attempt {attempt})…",
+                        "·".dimmed(),
+                        session_id.cyan()
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                 continue;
             }
-            _ => break code,
+            (255, true, _) => {
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    "remote ssh transport lost; reconnect disabled"
+                );
+                break code;
+            }
+            (0, _, _) => break code,
+            (_, false, true) => {
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    code,
+                    backoff_ms,
+                    "remote session unavailable during attach-only reconnect; retrying same session"
+                );
+                restore_terminal_modes_for_status();
+                if attempt == 2 {
+                    eprintln!(
+                        "{} session {} not reachable yet; waiting for the same remote session…  (Ctrl+C to abort)",
+                        "·".dimmed(),
+                        session_id.cyan()
+                    );
+                } else if attempt.is_multiple_of(4) {
+                    eprintln!(
+                        "{} still waiting for the same remote session {} (last status {code}, attempt {attempt})…",
+                        "·".dimmed(),
+                        session_id.cyan()
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                continue;
+            }
+            _ => {
+                tracing::info!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    final_code = code,
+                    "remote ssh session finished without reconnect"
+                );
+                break code;
+            }
         }
     };
 
     berth::terminal::emit_exit_signals(&name);
-    tracing::info!("emitted exit signals");
+    tracing::info!(
+        workspace = %name,
+        host,
+        session_id = %session_id,
+        final_code,
+        "emitted exit signals"
+    );
 
     if final_code != 0 {
-        tracing::error!(workspace = %name, host, final_code, "remote session exited with error");
+        tracing::error!(workspace = %name, host, session_id = %session_id, final_code, "remote session exited with error");
         anyhow::bail!("remote exited with status {final_code}");
     }
     Ok(())
@@ -472,6 +607,7 @@ fn podman_enter_spec(
     shell: &str,
     podman: &berth::config::PodmanRuntime,
     mounts: &[berth::config::Mount],
+    command: Option<&[String]>,
 ) -> Result<CommandSpec> {
     let runtime_mounts = mounts
         .iter()
@@ -484,8 +620,12 @@ fn podman_enter_spec(
         })
         .collect::<Vec<_>>();
 
+    let entry_command = command
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| argv.to_vec())
+        .unwrap_or_else(|| vec![shell.to_string()]);
     let mut config =
-        berth::runtime::podman::PodmanRunConfig::new(&podman.image, path, [shell.to_string()])
+        berth::runtime::podman::PodmanRunConfig::new(&podman.image, path, entry_command)
             .with_mounts(runtime_mounts);
     config.project = config
         .project
@@ -515,9 +655,18 @@ fn kubernetes_enter_spec(
     name: &str,
     shell: &str,
     kubernetes: &berth::config::KubernetesPodRuntime,
+    command: Option<&[String]>,
 ) -> Result<CommandSpec> {
+    let entry_command = command
+        .filter(|argv| !argv.is_empty())
+        .map(|argv| argv.to_vec())
+        .unwrap_or_else(|| vec![shell.to_string()]);
     Ok(berth::runtime::kubernetes::build_run_command(
-        &berth::runtime::kubernetes::KubernetesRunConfig::new(name, kubernetes.clone(), [shell]),
+        &berth::runtime::kubernetes::KubernetesRunConfig::new(
+            name,
+            kubernetes.clone(),
+            entry_command,
+        ),
     )?)
 }
 
@@ -530,13 +679,13 @@ fn kubernetes_enter_spec(
 ///   --auto-deploy            → deploy without prompt
 ///   default                  → probe; if remote needs work, prompt the user
 ///                              (TTY only); on accept, deploy and trust
-async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOptions) -> Result<()> {
+async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOptions) -> Result<bool> {
     if opts.plain {
         eprintln!("berth: --plain set; opening a plain SSH shell with no resumable session");
-        return Ok(());
+        return Ok(remote_reachability_probe(host).await);
     }
     if opts.no_deploy {
-        return Ok(());
+        return Ok(remote_reachability_probe(host).await);
     }
 
     // Best-effort nag if the local binary is behind the latest GitHub
@@ -551,7 +700,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             eprintln!(
                 "berth: probe of {host} failed ({err:#}); falling through to the SSH cascade"
             );
-            return Ok(());
+            return Ok(false);
         }
     };
 
@@ -597,13 +746,13 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                      Run `berth deploy --force {host}` to refresh."
                 );
             }
-            return Ok(());
+            return Ok(true);
         }
         _ => ConsentMode::Ask,
     };
 
     match decision {
-        DeployDecision::UpToDate => Ok(()),
+        DeployDecision::UpToDate => Ok(true),
         DeployDecision::UnsupportedArch { os, arch } => {
             anyhow::bail!(
                 "berth has no pre-built binary for {os}/{arch} on {host}. \
@@ -621,7 +770,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                  Skipping same-version build refresh to avoid redeploying a stale release artifact.",
                 local_target
             );
-            Ok(())
+            Ok(true)
         }
         DeployDecision::Deploy {
             target,
@@ -636,7 +785,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                      Use `--plain` to skip session-mux entirely, or \
                      `berth deploy {host}` later to opt in."
                 );
-                return Ok(());
+                return Ok(true);
             }
             let info = match source {
                 deploy::DeploySource::Release => {
@@ -657,9 +806,15 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                 host,
                 info.remote_path.display()
             );
-            Ok(())
+            Ok(true)
         }
     }
+}
+
+async fn remote_reachability_probe(host: &str) -> bool {
+    ssh::run_remote_command_with_timeout(host, "true", Duration::from_secs(5))
+        .await
+        .is_ok()
 }
 
 fn confirm_deploy(

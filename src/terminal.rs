@@ -96,6 +96,7 @@ pub struct EnterSignal<'a> {
     pub workspace: &'a str,
     pub dir: Option<&'a str>,
     pub command: Option<&'a [String]>,
+    pub session_id: Option<&'a str>,
 }
 
 /// POSIX-safe single-quote escape. Each embedded `'` is broken out as
@@ -136,6 +137,15 @@ fn write_secure(path: &Path, contents: &[u8]) -> io::Result<()> {
 
 /// Build the exact line the new-tab hook should replay.
 fn build_invoke_line(signal: &EnterSignal<'_>) -> String {
+    if let Some(session_id) = signal.session_id {
+        let mut out =
+            String::from("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session ");
+        out.push_str(&shell_quote(session_id));
+        out.push(' ');
+        out.push_str(&shell_quote(signal.workspace));
+        return out;
+    }
+
     let mut out = String::from("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter ");
     out.push_str(&shell_quote(signal.workspace));
     if let Some(d) = signal.dir {
@@ -193,6 +203,7 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
     // path, or did the terminal emulator come up with it on its own?
     tracing::info!(
         workspace = signal.workspace,
+        session_id = signal.session_id.unwrap_or(""),
         osc7_path = %dir.display(),
         has_dir_override = signal.dir.is_some(),
         has_command_override = signal.command.is_some_and(|c| !c.is_empty()),
@@ -201,6 +212,10 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
 
     let mut out = io::stdout().lock();
     let safe = title_safe(signal.workspace);
+    let title = match signal.session_id {
+        Some(session_id) => format!("{safe} [{session_id}]"),
+        None => safe.clone(),
+    };
 
     // 1. Pane-scoped user variable (WezTerm/iTerm2). Cheap; harmless on
     //    emulators that ignore it.
@@ -217,8 +232,8 @@ pub fn emit_enter_signals(signal: &EnterSignal<'_>) {
     );
 
     // 3. Title — human breadcrumb.
-    let _ = write!(out, "\x1b]2;berth: {safe}\x07");
-    let _ = write!(out, "\x1b]1;berth: {safe}\x07");
+    let _ = write!(out, "\x1b]2;berth: {title}\x07");
+    let _ = write!(out, "\x1b]1;berth: {title}\x07");
     let _ = out.flush();
 }
 
@@ -291,6 +306,7 @@ mod tests {
             workspace: "org/proj",
             dir: None,
             command: None,
+            session_id: None,
         };
         assert_eq!(
             build_invoke_line(&s),
@@ -305,6 +321,7 @@ mod tests {
             workspace: "org/proj",
             dir: Some("~/code/org/proj.dev"),
             command: Some(&cmd),
+            session_id: None,
         };
         assert_eq!(
             build_invoke_line(&s),
@@ -324,6 +341,7 @@ mod tests {
             workspace: "org/proj",
             dir: None,
             command: Some(&cmd),
+            session_id: None,
         };
         let line = build_invoke_line(&s);
         // The whole shell-injection-shaped argv element must be a
@@ -350,11 +368,31 @@ mod tests {
             workspace: "foo",
             dir: None,
             command: Some(&cmd),
+            session_id: None,
         };
         // The bare `-- ` command-separator should NOT be appended when
         // the argv is empty.
         let line = build_invoke_line(&s);
         assert!(!line.contains("-- '"), "got: {line}");
         assert!(line.ends_with("'foo'"));
+    }
+
+    #[test]
+    fn build_invoke_with_session_replays_attach() {
+        let cmd = vec![
+            "bash".to_string(),
+            "-ic".to_string(),
+            "sudo -u ubuntu bash".to_string(),
+        ];
+        let s = EnterSignal {
+            workspace: "org/proj",
+            dir: Some("~/ignored-on-reattach"),
+            command: Some(&cmd),
+            session_id: Some("abc123def456"),
+        };
+        assert_eq!(
+            build_invoke_line(&s),
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session 'abc123def456' 'org/proj'"
+        );
     }
 }
