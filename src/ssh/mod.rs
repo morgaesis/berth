@@ -186,10 +186,12 @@ pub async fn ssh_interactive_runtime_with(
         &remote_path,
         runtime,
         mounts,
-        overrides.command,
-        overrides.session_id,
-        overrides.session_mode,
-        Some(config.detach_key_env_value().as_str()),
+        RemoteEnterCommandOptions {
+            workspace_command: overrides.command,
+            session_id: overrides.session_id,
+            session_mode: overrides.session_mode,
+            detach_key: Some(config.detach_key_env_value().as_str()),
+        },
     );
 
     if let Some(code) =
@@ -370,11 +372,16 @@ fn remote_enter_command(
         remote_path,
         runtime,
         mounts,
-        None,
-        None,
-        RemoteSessionMode::CreateOrAttach,
-        None,
+        RemoteEnterCommandOptions::default(),
     )
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RemoteEnterCommandOptions<'a> {
+    workspace_command: Option<&'a [String]>,
+    session_id: Option<&'a str>,
+    session_mode: RemoteSessionMode,
+    detach_key: Option<&'a str>,
 }
 
 /// `remote_path` is a shell *expression* (already quoted/composed by
@@ -388,11 +395,14 @@ fn remote_enter_command_with(
     remote_path: &str,
     runtime: &Runtime,
     mounts: &[Mount],
-    workspace_command: Option<&[String]>,
-    session_id: Option<&str>,
-    session_mode: RemoteSessionMode,
-    detach_key: Option<&str>,
+    options: RemoteEnterCommandOptions<'_>,
 ) -> String {
+    let RemoteEnterCommandOptions {
+        workspace_command,
+        session_id,
+        session_mode,
+        detach_key,
+    } = options;
     let base = format!("mkdir -p {remote_path} && cd {remote_path}");
     let shell = "${SHELL:-/bin/sh}";
     let session = format!("berth-{}", workspace_name.replace('/', "-"));
@@ -815,10 +825,10 @@ mod tests {
             &path_expr,
             &Runtime::Bare,
             &[],
-            None,
-            Some("abc123def456"),
-            RemoteSessionMode::CreateOrAttach,
-            None,
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                ..RemoteEnterCommandOptions::default()
+            },
         );
 
         assert!(command.contains("'berth-work-abc123def456'"));
@@ -835,10 +845,11 @@ mod tests {
             &path_expr,
             &Runtime::Bare,
             &[],
-            None,
-            Some("abc123def456"),
-            RemoteSessionMode::AttachOnly,
-            None,
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                session_mode: RemoteSessionMode::AttachOnly,
+                ..RemoteEnterCommandOptions::default()
+            },
         );
 
         assert!(command.contains("exec \"$berth_bin\" attach --session 'abc123def456' 'work'"));
