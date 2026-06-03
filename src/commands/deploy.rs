@@ -12,6 +12,7 @@ pub async fn run(host: String, tag: Option<String>, force: bool) -> Result<()> {
     let local_build = berth::build_info::build_id();
     let local_os = std::env::consts::OS;
     let local_arch = std::env::consts::ARCH;
+    let quoted_host = berth::ssh::shell_escape_arg(&host);
 
     let probe_spinner = phase_spinner(&format!("probing {host}"));
     let env = deploy::probe(&host).await?;
@@ -44,7 +45,7 @@ pub async fn run(host: String, tag: Option<String>, force: bool) -> Result<()> {
         DeployDecision::UnsupportedArch { os, arch } => {
             bail!(
                 "no pre-built berth for {os}/{arch}; install tmux or screen on {host} \
-                 and use `berth enter --plain --remote {host} <ws>` for non-resumable shells"
+                 and use `berth enter --plain --remote {quoted_host} <ws>` for non-resumable shells"
             );
         }
         DeployDecision::UpToDate => {

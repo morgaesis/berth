@@ -457,6 +457,16 @@ async fn enter_remote(
             "remote ssh session returned"
         );
         match (code, opts.no_reconnect, reconnect_attach_only) {
+            (255, _, _) if opts.plain => {
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    "plain remote ssh returned status 255; not entering reconnect loop"
+                );
+                break code;
+            }
             (255, false, false) => {
                 tracing::warn!(
                     workspace = %name,
@@ -635,11 +645,13 @@ fn remote_exit_diagnostic(
         };
     }
 
+    let quoted_host = ssh::shell_escape_arg(host);
+
     if plain {
         return RemoteExitDiagnostic {
             phase: "plain-ssh-status-255",
             message: format!(
-                "plain SSH to {host} exited with status 255. SSH reserves 255 for transport/setup failures, but a remote shell command can also return 255. Run `ssh -tt {host}` to inspect SSH errors, or rerun without `--plain` for berth's resumable attach diagnostics."
+                "plain SSH to {host} exited with status 255. SSH reserves 255 for transport/setup failures, but a remote shell command can also return 255. Run `ssh -tt {quoted_host}` to inspect SSH errors, or rerun without `--plain` for berth's resumable attach diagnostics."
             ),
         };
     }
@@ -647,10 +659,13 @@ fn remote_exit_diagnostic(
     if reconnect_attach_only {
         let quoted_session_id = ssh::shell_escape_arg(session_id);
         let quoted_workspace = ssh::shell_escape_arg(workspace);
+        let quoted_remote_attach = ssh::shell_escape_arg(&format!(
+            "berth attach --session {quoted_session_id} {quoted_workspace}"
+        ));
         return RemoteExitDiagnostic {
             phase: "reconnect-attach-status-255",
             message: format!(
-                "remote SSH/attach returned status 255 while reconnecting to session {session_id} for workspace '{workspace}' on {host} after {attempts} attempts. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh {host} 'berth attach --session {quoted_session_id} {quoted_workspace}'` to inspect the remote attach path."
+                "remote SSH/attach returned status 255 while reconnecting to session {session_id} for workspace '{workspace}' on {host} after {attempts} attempts. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh {quoted_host} {quoted_remote_attach}` to inspect the remote attach path."
             ),
         };
     }
@@ -659,16 +674,17 @@ fn remote_exit_diagnostic(
         return RemoteExitDiagnostic {
             phase: "initial-status-255-no-reconnect",
             message: format!(
-                "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport/setup failures, but a remote attach command can also return 255; `--no-reconnect` is set, so berth did not retry. Retry without `--no-reconnect`, or run `ssh -tt {host}` to inspect SSH errors."
+                "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport/setup failures, but a remote attach command can also return 255; `--no-reconnect` is set, so berth did not retry. Retry without `--no-reconnect`, or run `ssh -tt {quoted_host}` to inspect SSH errors."
             ),
         };
     }
 
     if !remote_probe_succeeded {
+        let quoted_workspace = ssh::shell_escape_arg(workspace);
         return RemoteExitDiagnostic {
             phase: "initial-transport-status-255-preflight-failed",
             message: format!(
-                "remote SSH returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. The reachability preflight also failed, so this is most likely an SSH transport/setup failure and berth did not enter the reconnect loop. Check connectivity with `ssh {host}`, then retry `berth enter --remote {host} {workspace}`."
+                "remote SSH returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. The reachability preflight also failed, so this is most likely an SSH transport/setup failure and berth did not enter the reconnect loop. Check connectivity with `ssh {quoted_host}`, then retry `berth enter --remote {quoted_host} {quoted_workspace}`."
             ),
         };
     }
@@ -676,7 +692,7 @@ fn remote_exit_diagnostic(
     RemoteExitDiagnostic {
         phase: "initial-status-255",
         message: format!(
-            "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh -tt {host}` to inspect SSH errors."
+            "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh -tt {quoted_host}` to inspect SSH errors."
         ),
     }
 }
@@ -783,6 +799,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
     if opts.no_deploy {
         return Ok(remote_reachability_probe(host).await);
     }
+    let quoted_host = ssh::shell_escape_arg(host);
 
     // Best-effort nag if the local binary is behind the latest GitHub
     // release; never blocks real work.
@@ -839,7 +856,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             ) {
                 eprintln!(
                     "berth: auto_update_remote is false; remote stays at {remote_ver_str}. \
-                     Run `berth deploy --force {host}` to refresh."
+                     Run `berth deploy --force {quoted_host}` to refresh."
                 );
             }
             return Ok(true);
@@ -853,7 +870,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             anyhow::bail!(
                 "berth has no pre-built binary for {os}/{arch} on {host}. \
                  Install tmux/screen on the remote, or rerun with \
-                 `berth enter --plain --remote {host} <ws>` to skip session-mux."
+                 `berth enter --plain --remote {quoted_host} <ws>` to skip session-mux."
             );
         }
         DeployDecision::LocalBuildUnsupported {
@@ -879,7 +896,7 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                 eprintln!(
                     "berth: deploy declined; falling through to the SSH cascade. \
                      Use `--plain` to skip session-mux entirely, or \
-                     `berth deploy {host}` later to opt in."
+                     `berth deploy {quoted_host}` later to opt in."
                 );
                 return Ok(true);
             }
@@ -991,13 +1008,14 @@ trait ContextHardFail<T> {
 
 impl<T> ContextHardFail<T> for Result<T> {
     fn with_context_hard_fail(self, host: &str) -> Result<T> {
+        let quoted_host = ssh::shell_escape_arg(host);
         self.map_err(|e| {
             anyhow::anyhow!(
                 "deploy to {host} failed: {e:#}\n\
                  Workarounds:\n  \
-                 • `berth enter --plain --remote {host} <ws>` opens a plain SSH session (no resume)\n  \
+                 • `berth enter --plain --remote {quoted_host} <ws>` opens a plain SSH session (no resume)\n  \
                  • install tmux or mosh on {host} and rerun without --no-deploy\n  \
-                 • run `berth deploy {host}` interactively to inspect the failure"
+                 • run `berth deploy {quoted_host}` interactively to inspect the failure"
             )
         })
     }
@@ -1006,6 +1024,7 @@ impl<T> ContextHardFail<T> for Result<T> {
 #[cfg(test)]
 mod tests {
     use super::{remote_exit_diagnostic, terminal_status_restore_sequence};
+    use berth::ssh;
 
     #[test]
     fn reconnect_status_restore_does_not_clear_scrollback() {
@@ -1039,5 +1058,53 @@ mod tests {
         assert!(diagnostic.message.contains("workspace 'atlas/atlas-docs'"));
         assert!(diagnostic.message.contains("SSH uses 255"));
         assert!(diagnostic.message.contains("--no-reconnect"));
+    }
+
+    #[test]
+    fn status_255_diagnostic_names_plain_phase_and_quotes_host_command() {
+        let diagnostic = remote_exit_diagnostic(
+            "atlas/atlas-docs",
+            "deploy'host",
+            "84af72336e7f",
+            255,
+            1,
+            false,
+            false,
+            true,
+            true,
+        );
+
+        assert_eq!(diagnostic.phase, "plain-ssh-status-255");
+        assert!(diagnostic.message.contains("plain SSH to deploy'host"));
+        assert!(diagnostic
+            .message
+            .contains("Run `ssh -tt 'deploy'\\''host'`"));
+    }
+
+    #[test]
+    fn status_255_reconnect_diagnostic_quotes_pasteable_ssh_command() {
+        let quoted_host = ssh::shell_escape_arg("deploy'host");
+        let quoted_remote_attach = ssh::shell_escape_arg(&format!(
+            "berth attach --session {} {}",
+            ssh::shell_escape_arg("session'42"),
+            ssh::shell_escape_arg("atlas/atlas-docs")
+        ));
+        let expected_command = format!("run `ssh {quoted_host} {quoted_remote_attach}`");
+
+        let diagnostic = remote_exit_diagnostic(
+            "atlas/atlas-docs",
+            "deploy'host",
+            "session'42",
+            255,
+            2,
+            true,
+            false,
+            true,
+            false,
+        );
+
+        assert_eq!(diagnostic.phase, "reconnect-attach-status-255");
+        assert!(diagnostic.message.contains(&expected_command));
+        assert!(diagnostic.message.contains("atlas/atlas-docs"));
     }
 }
