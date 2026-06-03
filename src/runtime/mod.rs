@@ -97,8 +97,8 @@ impl BindMount {
     pub fn podman_volume_arg(&self) -> String {
         format!(
             "{}:{}:{}",
-            self.source.display(),
-            self.target.display(),
+            podman_path_arg(&self.source),
+            podman_path_arg(&self.target),
             self.access.podman_suffix()
         )
     }
@@ -188,7 +188,7 @@ pub fn validate_bind_mount(mount: &BindMount) -> Result<(), RuntimeCommandError>
     if mount.source.as_os_str().is_empty() {
         return Err(RuntimeCommandError::EmptyMountSource);
     }
-    if !mount.target.is_absolute() {
+    if !is_container_absolute(&mount.target) {
         return Err(RuntimeCommandError::RelativeMountTarget(
             mount.target.clone(),
         ));
@@ -198,7 +198,7 @@ pub fn validate_bind_mount(mount: &BindMount) -> Result<(), RuntimeCommandError>
 
 pub fn validate_configured_mounts(mounts: &[crate::config::Mount]) -> anyhow::Result<()> {
     for mount in mounts {
-        if !Path::new(&mount.target).is_absolute() {
+        if !is_container_absolute_str(&mount.target) {
             anyhow::bail!("Mount target must be absolute: {}", mount.target);
         }
         if mount.required {
@@ -209,6 +209,18 @@ pub fn validate_configured_mounts(mounts: &[crate::config::Mount]) -> anyhow::Re
         }
     }
     Ok(())
+}
+
+fn is_container_absolute(path: &Path) -> bool {
+    is_container_absolute_str(&path.to_string_lossy())
+}
+
+fn is_container_absolute_str(path: &str) -> bool {
+    path.starts_with('/') || path.starts_with('\\')
+}
+
+fn podman_path_arg(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -242,7 +254,7 @@ pub fn run_command(spec: &CommandSpec) -> std::io::Result<std::process::ExitStat
     #[cfg(debug_assertions)]
     if let Ok(log_path) = std::env::var("BERTH_FAKE_EXEC_LOG") {
         write_fake_exec_log(&log_path, spec)?;
-        return std::process::Command::new("true").status();
+        return success_command().status();
     }
 
     let mut command = std::process::Command::new(&spec.program);
@@ -260,7 +272,7 @@ pub fn output_command(spec: &CommandSpec) -> std::io::Result<std::process::Outpu
     #[cfg(debug_assertions)]
     if let Ok(log_path) = std::env::var("BERTH_FAKE_EXEC_LOG") {
         write_fake_exec_log(&log_path, spec)?;
-        return std::process::Command::new("true").output();
+        return success_command().output();
     }
 
     let mut command = std::process::Command::new(&spec.program);
@@ -286,6 +298,18 @@ fn write_fake_exec_log(log_path: &str, spec: &CommandSpec) -> std::io::Result<()
         .append(true)
         .open(log_path)?
         .write_all(line.as_bytes())
+}
+
+#[cfg(all(debug_assertions, unix))]
+fn success_command() -> std::process::Command {
+    std::process::Command::new("true")
+}
+
+#[cfg(all(debug_assertions, windows))]
+fn success_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("cmd");
+    cmd.args(["/C", "exit", "0"]);
+    cmd
 }
 
 #[cfg(debug_assertions)]

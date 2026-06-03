@@ -289,9 +289,21 @@ fn hook_argv(line: &str) -> Result<Vec<String>> {
         if !matches!(argv.first().map(|s| s.as_str()), Some("enter" | "attach")) {
             bail!("hook invoke file must run `berth enter` or `berth attach`");
         }
+        if let Some(workspace) = legacy_attach_session_workspace(&argv) {
+            return Ok(vec!["enter".to_string(), workspace.to_string()]);
+        }
         return Ok(argv);
     }
     bail!("malformed hook invoke file");
+}
+
+fn legacy_attach_session_workspace(argv: &[String]) -> Option<&str> {
+    match argv {
+        [cmd, flag, _session, workspace] if cmd == "attach" && flag == "--session" => {
+            Some(workspace)
+        }
+        _ => None,
+    }
 }
 
 /// zsh: clap emits the workspace-name positional as `:_default`. Swap it
@@ -489,8 +501,8 @@ _berth_auto_enter_on_start() {
         invoke_file="$state_dir/$(printf '%s' "$proj" | sed 's|/|_|g')/.invoke"
         if [ -r "$invoke_file" ]; then
             # Run the exact berth line written by the parent tab.
-            # Remote sessions replay as `berth attach --session <id>`;
-            # local/legacy entries replay as `berth enter ...`.
+            # Newer entries replay as `berth enter ...`; older remote
+            # entries may still contain `berth attach --session <id>`.
             # Parsing is delegated back to berth so this hook does not
             # eval file contents as shell.
             invoke_line="$(cat "$invoke_file" 2>/dev/null)"
@@ -571,12 +583,12 @@ mod tests {
     }
 
     #[test]
-    fn hook_argv_accepts_attach_session_replay() {
+    fn hook_argv_rewrites_legacy_attach_session_replay_to_enter() {
         let argv = hook_argv(
             "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session 'abc123def456' 'org/proj'",
         )
         .unwrap();
-        assert_eq!(argv, ["attach", "--session", "abc123def456", "org/proj"]);
+        assert_eq!(argv, ["enter", "org/proj"]);
     }
 
     #[test]

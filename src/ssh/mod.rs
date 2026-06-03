@@ -8,6 +8,7 @@ use tokio::time::{sleep, timeout};
 
 use crate::tunnel::TunnelState;
 
+#[cfg(any(unix, test))]
 mod osc7_filter;
 mod pty_proxy;
 

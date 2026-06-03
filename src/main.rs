@@ -87,5 +87,15 @@ async fn main() {
     // no atexit, no flush, no thread-join. We've already user-visibly
     // finished by this point (the trace lines above made it out before
     // we got here), so dropping pending stdio is safe.
+    process_exit(code)
+}
+
+#[cfg(unix)]
+fn process_exit(code: i32) -> ! {
     unsafe { libc::_exit(code) }
+}
+
+#[cfg(windows)]
+fn process_exit(code: i32) -> ! {
+    std::process::exit(code)
 }

@@ -1,5 +1,6 @@
 use crate::config::{KubernetesPodRuntime, PodmanRuntime, Runtime};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::process::Command;
 
 const DEFAULT_IDLE_SHUTDOWN_SECONDS: u64 = 3600;
@@ -157,16 +158,7 @@ fn auto_discovery_disabled() -> bool {
 }
 
 fn discover_podman() -> ToolStatus {
-    if which::which("podman").is_err() {
-        return ToolStatus {
-            binary: "podman".to_string(),
-            available: false,
-            healthy: false,
-            detail: "not found on PATH".to_string(),
-        };
-    }
-
-    match Command::new("podman")
+    match command_for("podman")
         .args(["info", "--format", "{{.Host.Security.Rootless}}"])
         .output()
     {
@@ -194,6 +186,12 @@ fn discover_podman() -> ToolStatus {
                 output.status
             ),
         },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ToolStatus {
+            binary: "podman".to_string(),
+            available: false,
+            healthy: false,
+            detail: "not found on PATH".to_string(),
+        },
         Err(error) => ToolStatus {
             binary: "podman".to_string(),
             available: true,
@@ -204,7 +202,7 @@ fn discover_podman() -> ToolStatus {
 }
 
 fn podman_keep_id_works(binary: &str) -> bool {
-    Command::new(binary)
+    command_for(binary)
         .args([
             "run",
             "--rm",
@@ -239,34 +237,30 @@ fn discover_kubernetes() -> KubernetesStatus {
 }
 
 fn discover_simple_tool(binary: &str) -> ToolStatus {
-    if which::which(binary).is_err() {
-        return ToolStatus {
+    match command_for(binary).arg("--version").output() {
+        Ok(_) => ToolStatus {
+            binary: binary.to_string(),
+            available: true,
+            healthy: true,
+            detail: "available".to_string(),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ToolStatus {
             binary: binary.to_string(),
             available: false,
             healthy: false,
             detail: "not found on PATH".to_string(),
-        };
-    }
-
-    ToolStatus {
-        binary: binary.to_string(),
-        available: true,
-        healthy: true,
-        detail: "available".to_string(),
+        },
+        Err(error) => ToolStatus {
+            binary: binary.to_string(),
+            available: true,
+            healthy: false,
+            detail: format!("available, probe failed: {error}"),
+        },
     }
 }
 
 fn discover_minikube() -> ToolStatus {
-    if which::which("minikube").is_err() {
-        return ToolStatus {
-            binary: "minikube".to_string(),
-            available: false,
-            healthy: false,
-            detail: "not found on PATH".to_string(),
-        };
-    }
-
-    match Command::new("minikube")
+    match command_for("minikube")
         .args(["profile", "list", "-o", "json"])
         .output()
     {
@@ -294,6 +288,12 @@ fn discover_minikube() -> ToolStatus {
                 output.status
             ),
         },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ToolStatus {
+            binary: "minikube".to_string(),
+            available: false,
+            healthy: false,
+            detail: "not found on PATH".to_string(),
+        },
         Err(error) => ToolStatus {
             binary: "minikube".to_string(),
             available: true,
@@ -317,7 +317,7 @@ fn minikube_configured_for_rootless_podman() -> bool {
 }
 
 fn minikube_config_value_is(property: &str, expected: &str) -> bool {
-    let Ok(output) = Command::new("minikube")
+    let Ok(output) = command_for("minikube")
         .args(["config", "get", property])
         .output()
     else {
@@ -358,6 +358,39 @@ fn json_has_text(value: &Value, needle: &str) -> bool {
 
 fn default_namespace() -> String {
     "berth".to_string()
+}
+
+fn command_for(binary: &str) -> Command {
+    Command::new(resolve_command(binary).unwrap_or_else(|| PathBuf::from(binary)))
+}
+
+#[cfg(windows)]
+fn resolve_command(binary: &str) -> Option<PathBuf> {
+    let path = std::path::Path::new(binary);
+    if path.components().count() > 1 || path.extension().is_some() {
+        return path.exists().then(|| path.to_path_buf());
+    }
+    let path_env = std::env::var_os("PATH")?;
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    let extensions = pathext
+        .split(';')
+        .filter(|ext| !ext.is_empty())
+        .map(|ext| ext.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for dir in std::env::split_paths(&path_env) {
+        for ext in &extensions {
+            let candidate = dir.join(format!("{binary}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn resolve_command(binary: &str) -> Option<PathBuf> {
+    which::which(binary).ok()
 }
 
 #[cfg(test)]

@@ -107,8 +107,11 @@ fn sanitize_build_id(value: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
     use std::process::Command;
 
     #[test]
@@ -145,6 +148,7 @@ mod tests {
         assert!(parse(raw).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn probe_script_tolerates_stale_berth_without_version_info() {
         let temp = tempfile::tempdir().expect("tempdir");

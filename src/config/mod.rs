@@ -439,9 +439,11 @@ impl Config {
 
     /// Resolve the effective remote directory for a workspace, in order:
     ///   1. workspace.remote_dir (explicit override on the workspace)
-    ///   2. `<orgs[<org>].remote_root>/<project>` if the workspace name
+    ///   2. `orgs[<org>].remote_root` if the workspace name is exactly
+    ///      a configured org name
+    ///   3. `<orgs[<org>].remote_root>/<project>` if the workspace name
     ///      is `<org>/<project>` and that org has a `remote_root`
-    ///   3. None — the caller should fall back to the auto-managed path
+    ///   4. None — the caller should fall back to the auto-managed path
     ///      under `$HOME/.local/share/berth/projects/<name>`.
     pub fn resolved_remote_dir(
         &self,
@@ -450,6 +452,9 @@ impl Config {
     ) -> Option<String> {
         if let Some(dir) = &workspace.remote_dir {
             return Some(dir.clone());
+        }
+        if let Some(org_cfg) = self.orgs.get(workspace_name) {
+            return org_cfg.remote_root.clone();
         }
         let (org, project) = workspace_name.split_once('/')?;
         let org_cfg = self.orgs.get(org)?;
@@ -461,12 +466,11 @@ impl Config {
     /// Resolve the effective remote host for a workspace, in order:
     ///   1. CLI `--remote` (handled by the caller)
     ///   2. workspace.remote
-    ///   3. orgs[<org>].remote if the workspace name is `<org>/<project>`
+    ///   3. orgs[<org>].remote if the workspace name is exactly `<org>`
+    ///      or is `<org>/<project>`
     ///   4. orgs[<org>].remote_user if the host has no explicit user
     pub fn resolved_remote(&self, workspace_name: &str, workspace: &Workspace) -> Option<String> {
-        let org_cfg = workspace_name
-            .split_once('/')
-            .and_then(|(org, _project)| self.orgs.get(org));
+        let org_cfg = self.org_for_workspace_name(workspace_name);
         let host = workspace
             .remote
             .as_ref()
@@ -475,6 +479,15 @@ impl Config {
             host,
             org_cfg.and_then(|org| org.remote_user.as_deref()),
         ))
+    }
+
+    fn org_for_workspace_name(&self, workspace_name: &str) -> Option<&Org> {
+        if let Some(org) = self.orgs.get(workspace_name) {
+            return Some(org);
+        }
+        workspace_name
+            .split_once('/')
+            .and_then(|(org, _project)| self.orgs.get(org))
     }
 
     pub fn config_dir() -> Result<PathBuf> {
@@ -605,6 +618,16 @@ mod tests {
     }
 
     #[test]
+    fn resolved_remote_dir_uses_org_root_for_bare_org_name() {
+        let cfg = cfg_with_org("org", Some("~/code/org"), None);
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(
+            cfg.resolved_remote_dir("org", &ws),
+            Some("~/code/org".into())
+        );
+    }
+
+    #[test]
     fn resolved_remote_dir_trims_trailing_slash_on_root() {
         let cfg = cfg_with_org("org", Some("~/code/org/"), None);
         let ws = Workspace::new("/tmp/x");
@@ -638,6 +661,13 @@ mod tests {
             cfg.resolved_remote("org/proj", &ws),
             Some("personal-box".into())
         );
+    }
+
+    #[test]
+    fn resolved_remote_uses_org_host_for_bare_org_name() {
+        let cfg = cfg_with_org("org", Some("~/code/org"), Some("dev-box"));
+        let ws = Workspace::new("/tmp/x");
+        assert_eq!(cfg.resolved_remote("org", &ws), Some("dev-box".into()));
     }
 
     #[test]

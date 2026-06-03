@@ -20,6 +20,7 @@
 
 use std::fs;
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
@@ -126,26 +127,16 @@ fn write_secure(path: &Path, contents: &[u8]) -> io::Result<()> {
     // O_NOFOLLOW + O_CREAT succeeds on the next open. `remove_file`
     // does not follow symlinks, so this only unlinks the link itself.
     let _ = fs::remove_file(path);
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    let mut f = options.open(path)?;
     f.write_all(contents)
 }
 
 /// Build the exact line the new-tab hook should replay.
 fn build_invoke_line(signal: &EnterSignal<'_>) -> String {
-    if let Some(session_id) = signal.session_id {
-        let mut out =
-            String::from("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session ");
-        out.push_str(&shell_quote(session_id));
-        out.push(' ');
-        out.push_str(&shell_quote(signal.workspace));
-        return out;
-    }
-
     let mut out = String::from("BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter ");
     out.push_str(&shell_quote(signal.workspace));
     if let Some(d) = signal.dir {
@@ -378,7 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn build_invoke_with_session_replays_attach() {
+    fn build_invoke_with_session_replays_enter() {
         let cmd = vec![
             "bash".to_string(),
             "-ic".to_string(),
@@ -392,7 +383,8 @@ mod tests {
         };
         assert_eq!(
             build_invoke_line(&s),
-            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth attach --session 'abc123def456' 'org/proj'"
+            "BERTH_FROM_HOOK=1 BERTH_SKIP_AUTO=1 command berth enter 'org/proj' \
+             --dir '~/ignored-on-reattach' -- 'bash' '-ic' 'sudo -u ubuntu bash'"
         );
     }
 }

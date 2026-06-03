@@ -6,7 +6,10 @@ use berth::ssh::{self, RemoteSessionMode};
 use colored::Colorize;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::io::Read;
+use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
@@ -325,7 +328,7 @@ fn enter_local(
     mounts: &[berth::config::Mount],
     command: Option<&[String]>,
 ) -> Result<()> {
-    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+    let shell = default_shell();
 
     berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
         workspace: name,
@@ -376,6 +379,18 @@ fn enter_local(
     }
     berth::terminal::emit_exit_signals(name);
     Ok(())
+}
+
+fn default_shell() -> String {
+    env::var("SHELL")
+        .or_else(|_| env::var("COMSPEC"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/bash".to_string()
+            }
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -972,32 +987,42 @@ fn confirm_deploy(
 /// Y/y/Enter, false otherwise. Restores the original termios state on
 /// every exit path including panics, via a Drop guard.
 fn read_yes_no_default_yes() -> Result<bool> {
-    use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg, Termios};
-
-    struct RawModeGuard {
-        original: Termios,
+    #[cfg(windows)]
+    {
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        let answer = line.trim();
+        return Ok(answer.is_empty() || matches!(answer, "y" | "Y" | "yes" | "YES" | "Yes"));
     }
-    impl Drop for RawModeGuard {
-        fn drop(&mut self) {
-            let stdin = io::stdin();
-            let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
+    #[cfg(unix)]
+    {
+        use nix::sys::termios::{tcgetattr, tcsetattr, LocalFlags, SetArg, Termios};
+
+        struct RawModeGuard {
+            original: Termios,
         }
-    }
+        impl Drop for RawModeGuard {
+            fn drop(&mut self) {
+                let stdin = io::stdin();
+                let _ = tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &self.original);
+            }
+        }
 
-    let stdin = io::stdin();
-    let original = tcgetattr(stdin.as_fd())?;
-    let mut raw = original.clone();
-    raw.local_flags
-        .remove(LocalFlags::ICANON | LocalFlags::ECHO);
-    tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
-    let _guard = RawModeGuard { original };
+        let stdin = io::stdin();
+        let original = tcgetattr(stdin.as_fd())?;
+        let mut raw = original.clone();
+        raw.local_flags
+            .remove(LocalFlags::ICANON | LocalFlags::ECHO);
+        tcsetattr(stdin.as_fd(), SetArg::TCSANOW, &raw)?;
+        let _guard = RawModeGuard { original };
 
-    let mut byte = [0u8; 1];
-    let n = stdin.lock().read(&mut byte)?;
-    if n == 0 {
-        return Ok(true); // EOF — fall to the default
+        let mut byte = [0u8; 1];
+        let n = stdin.lock().read(&mut byte)?;
+        if n == 0 {
+            return Ok(true); // EOF — fall to the default
+        }
+        Ok(matches!(byte[0], b'y' | b'Y' | b'\r' | b'\n'))
     }
-    Ok(matches!(byte[0], b'y' | b'Y' | b'\r' | b'\n'))
 }
 
 /// Extension trait that converts a deploy failure into a clear hard-fail
@@ -1076,9 +1101,8 @@ mod tests {
 
         assert_eq!(diagnostic.phase, "plain-ssh-status-255");
         assert!(diagnostic.message.contains("plain SSH to deploy'host"));
-        assert!(diagnostic
-            .message
-            .contains("Run `ssh -tt 'deploy'\\''host'`"));
+        let expected_command = format!("Run `ssh -tt {}`", ssh::shell_escape_arg("deploy'host"));
+        assert!(diagnostic.message.contains(&expected_command));
     }
 
     #[test]

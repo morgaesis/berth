@@ -13,10 +13,13 @@ pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir).join("berth"));
     }
-    let uid = unsafe { libc::getuid() };
-    let candidate = PathBuf::from(format!("/run/user/{}", uid));
-    if candidate.is_dir() {
-        return Ok(candidate.join("berth"));
+    #[cfg(unix)]
+    {
+        let uid = unsafe { libc::getuid() };
+        let candidate = PathBuf::from(format!("/run/user/{}", uid));
+        if candidate.is_dir() {
+            return Ok(candidate.join("berth"));
+        }
     }
     let home = dirs::home_dir().context("no home directory")?;
     Ok(home.join(".local").join("state").join("berth"))
@@ -141,7 +144,10 @@ mod tests {
     fn tempdir() -> String {
         let pid = std::process::id();
         let nonce = new_session_id();
-        let path = format!("/tmp/berth-test-{}-{}", pid, nonce);
+        let path = std::env::temp_dir()
+            .join(format!("berth-test-{}-{}", pid, nonce))
+            .to_string_lossy()
+            .to_string();
         fs::create_dir_all(&path).unwrap();
         path
     }

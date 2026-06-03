@@ -5,7 +5,10 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use tokio::net::{TcpListener as SessionListener, TcpStream as SessionStream};
+#[cfg(unix)]
+use tokio::net::{UnixListener as SessionListener, UnixStream as SessionStream};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
 pub struct SupervisorConfig {
@@ -40,17 +43,7 @@ pub async fn run(config: SupervisorConfig) -> Result<i32> {
         let _ = fs::remove_file(&config.socket_path);
     }
 
-    // Bind under a restrictive umask so the socket is created with mode 0600
-    // atomically; without this, the kernel applies the inherited umask (often
-    // 0022) and there's a TOCTOU window between bind and the explicit chmod.
-    let prev_umask = unsafe { libc::umask(0o077) };
-    let listener_result = UnixListener::bind(&config.socket_path);
-    unsafe {
-        libc::umask(prev_umask);
-    }
-    let listener = listener_result
-        .with_context(|| format!("binding session socket {}", config.socket_path.display()))?;
-    set_socket_perms(&config.socket_path)?;
+    let listener = bind_session_listener(&config.socket_path).await?;
     tracing::info!(
         workspace = %config.workspace,
         session_id = %session_id,
@@ -396,10 +389,18 @@ fn session_id_from_socket(path: &Path) -> String {
 
 fn command_builder(command: &[String]) -> CommandBuilder {
     if command.is_empty() {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-        let mut c = CommandBuilder::new(shell);
-        c.arg("-l");
-        return c;
+        let shell = default_shell();
+        #[cfg(unix)]
+        {
+            let mut c = CommandBuilder::new(shell);
+            c.arg("-l");
+            return c;
+        }
+        #[cfg(windows)]
+        {
+            let c = CommandBuilder::new(shell);
+            return c;
+        }
     }
 
     let mut c = CommandBuilder::new(&command[0]);
@@ -441,7 +442,7 @@ fn should_retry_via_interactive_shell(err: &anyhow::Error, command: &[String]) -
 }
 
 fn interactive_shell_command_builder(command: &[String]) -> CommandBuilder {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let shell = default_shell();
     let shell_name = Path::new(&shell)
         .file_name()
         .and_then(|name| name.to_str())
@@ -458,6 +459,18 @@ fn interactive_shell_command_builder(command: &[String]) -> CommandBuilder {
         c.arg(format!("exec {}", shell_command_line(command)));
     }
     c
+}
+
+fn default_shell() -> String {
+    std::env::var("SHELL")
+        .or_else(|_| std::env::var("COMSPEC"))
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "cmd.exe".to_string()
+            } else {
+                "/bin/sh".to_string()
+            }
+        })
 }
 
 fn shell_command_line(command: &[String]) -> String {
@@ -489,7 +502,7 @@ fn shell_quote(arg: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn handle_client(
     client_id: u64,
-    stream: UnixStream,
+    stream: SessionStream,
     mut stdout_rx: broadcast::Receiver<Vec<u8>>,
     stdin_tx: mpsc::Sender<Vec<u8>>,
     resize_tx: mpsc::Sender<(u16, u16)>,
@@ -631,11 +644,36 @@ fn set_socket_perms(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn set_socket_perms(_path: &Path) -> Result<()> {
-    Ok(())
+#[cfg(unix)]
+async fn bind_session_listener(socket_path: &Path) -> Result<SessionListener> {
+    // Bind under a restrictive umask so the socket is created with mode 0600
+    // atomically; without this, the kernel applies the inherited umask (often
+    // 0022) and there's a TOCTOU window between bind and the explicit chmod.
+    let prev_umask = unsafe { libc::umask(0o077) };
+    let listener_result = SessionListener::bind(socket_path);
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    let listener = listener_result
+        .with_context(|| format!("binding session socket {}", socket_path.display()))?;
+    set_socket_perms(socket_path)?;
+    Ok(listener)
 }
 
+#[cfg(windows)]
+async fn bind_session_listener(socket_path: &Path) -> Result<SessionListener> {
+    let listener = SessionListener::bind("127.0.0.1:0")
+        .await
+        .context("binding loopback session listener")?;
+    let addr = listener
+        .local_addr()
+        .context("reading loopback session listener address")?;
+    std::fs::write(socket_path, addr.to_string())
+        .with_context(|| format!("writing session endpoint {}", socket_path.display()))?;
+    Ok(listener)
+}
+
+#[cfg(unix)]
 pub fn detach_from_terminal() -> Result<()> {
     use nix::unistd;
     unistd::setsid().ok();
@@ -653,11 +691,18 @@ pub fn detach_from_terminal() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+pub fn detach_from_terminal() -> Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::session::protocol::{read_frame, write_frame, Frame};
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn supervisor_round_trip_with_cat_subprocess() {
         let dir = tempdir();
@@ -679,7 +724,7 @@ mod tests {
 
         wait_for_socket(&socket).await;
 
-        let mut client = UnixStream::connect(&socket).await.expect("connect");
+        let mut client = SessionStream::connect(&socket).await.expect("connect");
         let (mut read_half, mut write_half) = client.split();
 
         write_frame(&mut write_half, &Frame::Stdin(b"hello\n".to_vec()))
@@ -722,6 +767,7 @@ mod tests {
         assert!(!socket.exists(), "supervisor should remove its socket");
     }
 
+    #[cfg(unix)]
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
@@ -745,6 +791,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     async fn wait_for_socket(path: &std::path::Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
@@ -756,6 +803,7 @@ mod tests {
         panic!("supervisor never created socket {}", path.display());
     }
 
+    #[cfg(unix)]
     fn tempdir() -> PathBuf {
         // Unix sockets cap at 108 chars total; the project's
         // .cache/session-tests path exceeds that when run from a

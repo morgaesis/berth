@@ -185,6 +185,7 @@ impl<W: Write> Osc7Filter<W> {
     }
 
     /// Flush the inner writer's buffer.
+    #[allow(dead_code)]
     pub fn flush(&mut self) -> std::io::Result<()> {
         self.out.flush()
     }

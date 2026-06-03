@@ -90,7 +90,7 @@ pub fn build_command(config: &PodmanRunConfig) -> Result<CommandSpec, RuntimeCom
         args.push("--tty".to_string());
     }
     args.push("--workdir".to_string());
-    args.push(config.project.target.display().to_string());
+    args.push(crate::runtime::podman_path_arg(&config.project.target));
 
     for mount in mounts {
         args.push("--volume".to_string());

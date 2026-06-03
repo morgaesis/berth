@@ -1,9 +1,13 @@
 use super::protocol::{read_frame, write_frame, Frame};
 use crate::config::Config;
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(windows)]
+use tokio::net::TcpStream;
+#[cfg(unix)]
 use tokio::net::UnixStream;
 
 /// Error returned by `attach` when another client already holds the
@@ -52,80 +56,90 @@ pub fn session_activity_time(socket_path: &Path) -> Option<std::time::SystemTime
 /// it. Returns true if no client holds the flock; false if held.
 /// Used by `attach --resume-or-new` to skip busy sessions.
 pub fn is_session_free(socket_path: &Path) -> bool {
-    use nix::fcntl::{Flock, FlockArg};
-    let lock_path = lock_path_for(socket_path);
-    let f = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
+    #[cfg(windows)]
     {
-        Ok(f) => f,
-        Err(_) => return true, // can't even open the lock file; assume free
-    };
-    // `Flock::lock` consumes the file and returns an RAII handle; when
-    // it drops at the end of this scope, the lock is released. So just
-    // attempting the lock is the probe.
-    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
-        Ok(_lock) => true,
-        Err(_) => false,
+        let _ = socket_path;
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{Flock, FlockArg};
+        let lock_path = lock_path_for(socket_path);
+        let f = match std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(f) => f,
+            Err(_) => return true, // can't even open the lock file; assume free
+        };
+        // `Flock::lock` consumes the file and returns an RAII handle; when
+        // it drops at the end of this scope, the lock is released. So just
+        // attempting the lock is the probe.
+        match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+            Ok(_lock) => true,
+            Err(_) => false,
+        }
     }
 }
 
 pub fn is_session_attached(socket_path: &Path) -> Option<bool> {
-    use nix::fcntl::{Flock, FlockArg};
-    let lock_path = lock_path_for(socket_path);
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&lock_path)
-        .ok()?;
-    match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
-        Ok(_lock) => Some(false),
-        Err(_) => Some(true),
+    #[cfg(windows)]
+    {
+        let _ = socket_path;
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use nix::fcntl::{Flock, FlockArg};
+        let lock_path = lock_path_for(socket_path);
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lock_path)
+            .ok()?;
+        match Flock::lock(f, FlockArg::LockExclusiveNonblock) {
+            Ok(_lock) => Some(false),
+            Err(_) => Some(true),
+        }
     }
 }
 
 pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     let detach_key = Config::load()?.detach_key_bytes()?;
-    // Take an exclusive flock on a sibling lock file. The lock handle
-    // is leaked so it stays alive for the lifetime of this process;
-    // the kernel releases the lock automatically when the process dies
-    // (including via SSH-drop / hibernation), so any subsequent
-    // `resume-or-new` will find this session free again.
-    use nix::fcntl::{Flock, FlockArg};
-    let lock_path = lock_path_for(socket_path.as_ref());
-    let lock_file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening session lock {}", lock_path.display()))?;
-    match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
-        Ok(mut lock) => {
-            let _ = lock.set_len(0);
-            let _ = std::io::Write::write_all(
-                &mut *lock,
-                format!("pid={} attached\n", std::process::id()).as_bytes(),
-            );
-            // Leak into a heap allocation so it stays alive (and the
-            // kernel keeps holding the flock) until process exit.
-            Box::leak(Box::new(lock));
-        }
-        Err((_, nix::errno::Errno::EWOULDBLOCK)) => return Err(SessionBusy.into()),
-        Err((_, e)) => return Err(anyhow::Error::new(e).context("acquiring session lock")),
-    }
+    let _lock = acquire_session_lock(socket_path.as_ref())?;
 
+    #[cfg(unix)]
     let stream = UnixStream::connect(&socket_path).await.with_context(|| {
         format!(
             "connecting to session socket {}",
             socket_path.as_ref().display()
         )
     })?;
+    #[cfg(windows)]
+    let stream = {
+        let addr = std::fs::read_to_string(socket_path.as_ref()).with_context(|| {
+            format!(
+                "reading session endpoint {}",
+                socket_path.as_ref().display()
+            )
+        })?;
+        TcpStream::connect(addr.trim()).await.with_context(|| {
+            format!(
+                "connecting to session endpoint {} from {}",
+                addr.trim(),
+                socket_path.as_ref().display()
+            )
+        })?
+    };
     let (mut read_half, mut write_half) = stream.into_split();
 
+    #[cfg(unix)]
     let stdin_fd = std::io::stdin().as_raw_fd();
-    let stdout_fd = std::io::stdout().as_raw_fd();
+    #[cfg(unix)]
     let raw_guard = RawTtyGuard::new(stdin_fd)?;
+    #[cfg(windows)]
+    let raw_guard = RawTtyGuard::new()?;
 
     // Multiplex outgoing frames (initial resize + stdin chunks + SIGWINCH
     // resize updates) through one mpsc → one writer task. Without this
@@ -134,7 +148,7 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Frame>(64);
 
     // Initial size handshake.
-    let (cols, rows) = current_size(stdout_fd);
+    let (cols, rows) = current_size();
     out_tx.send(Frame::Resize { cols, rows }).await.ok();
 
     let writer_task = tokio::spawn(async move {
@@ -148,20 +162,26 @@ pub async fn attach<P: AsRef<Path>>(socket_path: P) -> Result<i32> {
     // SIGWINCH propagation: on every terminal resize, query the new
     // size and send a Resize frame. Without this, claude / vim / less
     // never re-wrap when the user resizes their window.
-    let resize_tx = out_tx.clone();
-    let winch_task = tokio::spawn(async move {
-        let mut signal =
-            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change()) {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-        while signal.recv().await.is_some() {
-            let (cols, rows) = current_size(stdout_fd);
-            if resize_tx.send(Frame::Resize { cols, rows }).await.is_err() {
-                break;
+    #[cfg(unix)]
+    let winch_task = {
+        let resize_tx = out_tx.clone();
+        tokio::spawn(async move {
+            let mut signal =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+            while signal.recv().await.is_some() {
+                let (cols, rows) = current_size();
+                if resize_tx.send(Frame::Resize { cols, rows }).await.is_err() {
+                    break;
+                }
             }
-        }
-    });
+        })
+    };
+    #[cfg(windows)]
+    let winch_task = tokio::spawn(async {});
 
     let stdin_tx = out_tx.clone();
     let (detach_tx, mut detach_rx) = tokio::sync::oneshot::channel::<()>();
@@ -266,7 +286,9 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn current_size(fd: i32) -> (u16, u16) {
+#[cfg(unix)]
+fn current_size() -> (u16, u16) {
+    let fd = std::io::stdout().as_raw_fd();
     let mut ws = libc::winsize {
         ws_row: 24,
         ws_col: 80,
@@ -281,11 +303,18 @@ fn current_size(fd: i32) -> (u16, u16) {
     (80, 24)
 }
 
+#[cfg(windows)]
+fn current_size() -> (u16, u16) {
+    (80, 24)
+}
+
+#[cfg(unix)]
 struct RawTtyGuard {
     fd: i32,
     saved: Option<libc::termios>,
 }
 
+#[cfg(unix)]
 impl RawTtyGuard {
     fn new(fd: i32) -> Result<Self> {
         let mut termios: libc::termios = unsafe { std::mem::zeroed() };
@@ -302,6 +331,7 @@ impl RawTtyGuard {
     }
 }
 
+#[cfg(unix)]
 impl Drop for RawTtyGuard {
     fn drop(&mut self) {
         if let Some(saved) = self.saved.take() {
@@ -310,6 +340,47 @@ impl Drop for RawTtyGuard {
             }
         }
     }
+}
+
+#[cfg(windows)]
+struct RawTtyGuard;
+
+#[cfg(windows)]
+impl RawTtyGuard {
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+}
+
+#[cfg(unix)]
+fn acquire_session_lock(socket_path: &Path) -> Result<nix::fcntl::Flock<std::fs::File>> {
+    // Take an exclusive flock on a sibling lock file. The kernel releases
+    // the lock automatically when the process dies.
+    use nix::fcntl::{Flock, FlockArg};
+    let lock_path = lock_path_for(socket_path);
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("opening session lock {}", lock_path.display()))?;
+    match Flock::lock(lock_file, FlockArg::LockExclusiveNonblock) {
+        Ok(mut lock) => {
+            let _ = lock.set_len(0);
+            let _ = std::io::Write::write_all(
+                &mut *lock,
+                format!("pid={} attached\n", std::process::id()).as_bytes(),
+            );
+            Ok(lock)
+        }
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => Err(SessionBusy.into()),
+        Err((_, e)) => Err(anyhow::Error::new(e).context("acquiring session lock")),
+    }
+}
+
+#[cfg(windows)]
+fn acquire_session_lock(_socket_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]

@@ -120,12 +120,28 @@ fn ensure_dotenv_loaded() {
 
 fn real_podman_e2e_enabled() -> bool {
     ensure_dotenv_loaded();
+    if cfg!(windows) {
+        return is_enabled_env("BERTH_E2E_PODMAN_ENABLED");
+    }
     !is_disabled_env("BERTH_E2E_PODMAN_ENABLED")
 }
 
 fn real_k8s_e2e_enabled() -> bool {
     ensure_dotenv_loaded();
+    if cfg!(windows) {
+        return is_enabled_env("BERTH_E2E_K8S_ENABLED");
+    }
     !is_disabled_env("BERTH_E2E_K8S_ENABLED")
+}
+
+fn is_enabled_env(var: &str) -> bool {
+    match std::env::var(var) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        ),
+        Err(_) => false,
+    }
 }
 
 fn is_disabled_env(var: &str) -> bool {
@@ -155,15 +171,52 @@ fn kubectl_is_available() -> bool {
 }
 
 fn write_executable(path: &PathBuf, content: &str) {
-    fs::write(path, content).expect("Failed to write executable test fixture");
+    #[cfg(windows)]
+    {
+        let cmd_path = path.with_extension("cmd");
+        fs::write(&cmd_path, windows_cmd_fixture(path, content))
+            .expect("Failed to write Windows executable test fixture");
+    }
     #[cfg(unix)]
     {
+        fs::write(path, content).expect("Failed to write executable test fixture");
         let mut permissions = fs::metadata(path)
             .expect("Failed to stat executable test fixture")
             .permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(path, permissions).expect("Failed to chmod executable test fixture");
     }
+}
+
+#[cfg(windows)]
+fn windows_cmd_fixture(path: &std::path::Path, content: &str) -> String {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    match name {
+        "podman" => {
+            let fallback = if content.contains("exit 42") { "42" } else { "0" };
+            format!(
+                "@echo off\r\nif /I \"%~1\"==\"info\" (\r\n  echo true\r\n  exit /b 0\r\n)\r\nexit /b {fallback}\r\n"
+            )
+        }
+        "kubectl" => "@echo off\r\nexit /b 0\r\n".to_string(),
+        "minikube" => "@echo off\r\nif /I \"%~1\"==\"profile\" if /I \"%~2\"==\"list\" (\r\n  echo {^\"valid^\": [{^\"Name^\": ^\"minikube^\", ^\"Config^\": {^\"Driver^\": ^\"podman^\", ^\"Rootless^\": true}}]}\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"config\" if /I \"%~2\"==\"get\" if /I \"%~3\"==\"driver\" (\r\n  echo podman\r\n  exit /b 0\r\n)\r\nif /I \"%~1\"==\"config\" if /I \"%~2\"==\"get\" if /I \"%~3\"==\"rootless\" (\r\n  echo true\r\n  exit /b 0\r\n)\r\nexit /b 0\r\n".to_string(),
+        _ => "@echo off\r\nexit /b 0\r\n".to_string(),
+    }
+}
+
+fn pwd_command_args() -> Vec<&'static str> {
+    if cfg!(windows) {
+        vec!["cmd", "/C", "cd"]
+    } else {
+        vec!["sh", "-c", "pwd"]
+    }
+}
+
+fn podman_path(path: &std::path::Path) -> String {
+    path.display().to_string().replace('\\', "/")
 }
 
 fn quoted_value_after<'a>(haystack: &'a str, marker: &str) -> &'a str {
@@ -929,16 +982,28 @@ fn test_enter_local_runs_command_override() {
         .output()
         .expect("Failed to create workspace");
 
-    let output = ctx
-        .berth()
-        .args([
+    let command = if cfg!(windows) {
+        vec![
+            "enter",
+            "localcmd",
+            "--",
+            "cmd",
+            "/C",
+            "echo %BERTH_WORKSPACE%:%CD%> command-ran",
+        ]
+    } else {
+        vec![
             "enter",
             "localcmd",
             "--",
             "sh",
             "-c",
             "printf '%s\\n' \"$BERTH_WORKSPACE:$PWD\" > command-ran",
-        ])
+        ]
+    };
+    let output = ctx
+        .berth()
+        .args(command)
         .output()
         .expect("Failed to run berth enter local command");
 
@@ -1347,10 +1412,10 @@ workspaces:
     let log = fs::read_to_string(exec_log).expect("Missing fake exec log");
     assert!(log.contains("podman\trun"));
     assert!(log.contains("--userns=keep-id"));
-    assert!(log.contains(&format!("{}:/workspace:rw", project_path.display())));
+    assert!(log.contains(&format!("{}:/workspace:rw", podman_path(&project_path))));
     assert!(log.contains(&format!(
         "{}:/home/dev/.gitconfig:ro",
-        config_source.display()
+        podman_path(&config_source)
     )));
     assert!(log.contains("docker.io/library/alpine:latest\t<command-redacted>"));
 }
@@ -1388,7 +1453,7 @@ fn test_podman_workspace_run_uses_container_runtime() {
     let log = fs::read_to_string(exec_log).expect("Missing fake exec log");
     assert!(log.contains("podman\trun"));
     assert!(log.contains("--userns=keep-id"));
-    assert!(log.contains(&format!("{}:/workspace:rw", project_path.display())));
+    assert!(log.contains(&format!("{}:/workspace:rw", podman_path(&project_path))));
     assert!(log.contains("docker.io/library/alpine:latest\t<command-redacted>"));
 }
 
@@ -1416,7 +1481,8 @@ workspaces:
 
     let output = ctx
         .berth()
-        .args(["run", "bareoverride", "sh", "-c", "pwd"])
+        .args(["run", "bareoverride"])
+        .args(pwd_command_args())
         .output()
         .expect("Failed to run berth run");
 
@@ -1466,7 +1532,7 @@ fn test_auto_discovery_defaults_local_workspace_to_podman() {
     let log = fs::read_to_string(exec_log).expect("Missing fake exec log");
     assert!(log.contains("podman\trun"));
     assert!(log.contains("--userns=keep-id"));
-    assert!(log.contains(&format!("{}:/workspace:rw", project_path.display())));
+    assert!(log.contains(&format!("{}:/workspace:rw", podman_path(&project_path))));
 }
 
 #[test]
@@ -1492,7 +1558,8 @@ fn test_config_bare_default_opts_out_of_auto_podman() {
 
     let output = ctx
         .berth_with_auto_discovery(&fake_bin)
-        .args(["run", "bareauto", "sh", "-c", "pwd"])
+        .args(["run", "bareauto"])
+        .args(pwd_command_args())
         .output()
         .expect("Failed to run berth run");
 
