@@ -579,10 +579,106 @@ async fn enter_remote(
     );
 
     if final_code != 0 {
-        tracing::error!(workspace = %name, host, session_id = %session_id, final_code, "remote session exited with error");
-        anyhow::bail!("remote exited with status {final_code}");
+        let final_reconnect_attach_only = attempt > 1 && !opts.plain;
+        let diagnostic = remote_exit_diagnostic(
+            &name,
+            host,
+            &session_id,
+            final_code,
+            attempt,
+            final_reconnect_attach_only,
+            opts.no_reconnect,
+            remote_probe_succeeded,
+            opts.plain,
+        );
+        tracing::error!(
+            workspace = %name,
+            host,
+            session_id = %session_id,
+            final_code,
+            attempts = attempt,
+            reconnect_attach_only = final_reconnect_attach_only,
+            remote_probe_succeeded,
+            no_reconnect = opts.no_reconnect,
+            plain = opts.plain,
+            exit_phase = diagnostic.phase,
+            ssh_status_255_ambiguous = final_code == 255,
+            "remote session exited with error: {}",
+            diagnostic.message
+        );
+        anyhow::bail!("{}", diagnostic.message);
     }
     Ok(())
+}
+
+struct RemoteExitDiagnostic {
+    phase: &'static str,
+    message: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remote_exit_diagnostic(
+    workspace: &str,
+    host: &str,
+    session_id: &str,
+    code: i32,
+    attempts: u32,
+    reconnect_attach_only: bool,
+    no_reconnect: bool,
+    remote_probe_succeeded: bool,
+    plain: bool,
+) -> RemoteExitDiagnostic {
+    if code != 255 {
+        return RemoteExitDiagnostic {
+            phase: "remote-command-exit",
+            message: format!("remote exited with status {code}"),
+        };
+    }
+
+    if plain {
+        return RemoteExitDiagnostic {
+            phase: "plain-ssh-status-255",
+            message: format!(
+                "plain SSH to {host} exited with status 255. SSH reserves 255 for transport/setup failures, but a remote shell command can also return 255. Run `ssh -tt {host}` to inspect SSH errors, or rerun without `--plain` for berth's resumable attach diagnostics."
+            ),
+        };
+    }
+
+    if reconnect_attach_only {
+        let quoted_session_id = ssh::shell_escape_arg(session_id);
+        let quoted_workspace = ssh::shell_escape_arg(workspace);
+        return RemoteExitDiagnostic {
+            phase: "reconnect-attach-status-255",
+            message: format!(
+                "remote SSH/attach returned status 255 while reconnecting to session {session_id} for workspace '{workspace}' on {host} after {attempts} attempts. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh {host} 'berth attach --session {quoted_session_id} {quoted_workspace}'` to inspect the remote attach path."
+            ),
+        };
+    }
+
+    if no_reconnect {
+        return RemoteExitDiagnostic {
+            phase: "initial-status-255-no-reconnect",
+            message: format!(
+                "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport/setup failures, but a remote attach command can also return 255; `--no-reconnect` is set, so berth did not retry. Retry without `--no-reconnect`, or run `ssh -tt {host}` to inspect SSH errors."
+            ),
+        };
+    }
+
+    if !remote_probe_succeeded {
+        return RemoteExitDiagnostic {
+            phase: "initial-transport-status-255-preflight-failed",
+            message: format!(
+                "remote SSH returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. The reachability preflight also failed, so this is most likely an SSH transport/setup failure and berth did not enter the reconnect loop. Check connectivity with `ssh {host}`, then retry `berth enter --remote {host} {workspace}`."
+            ),
+        };
+    }
+
+    RemoteExitDiagnostic {
+        phase: "initial-status-255",
+        message: format!(
+            "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh -tt {host}` to inspect SSH errors."
+        ),
+    }
 }
 
 fn restore_terminal_modes_for_status() {
@@ -909,7 +1005,7 @@ impl<T> ContextHardFail<T> for Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::terminal_status_restore_sequence;
+    use super::{remote_exit_diagnostic, terminal_status_restore_sequence};
 
     #[test]
     fn reconnect_status_restore_does_not_clear_scrollback() {
@@ -920,5 +1016,28 @@ mod tests {
         assert!(seq.contains("\x1b[?2004l"));
         assert!(!seq.contains("\x1b[2J"));
         assert!(!seq.contains("\x1b[!p"));
+    }
+
+    #[test]
+    fn status_255_diagnostic_names_initial_no_reconnect_phase() {
+        let diagnostic = remote_exit_diagnostic(
+            "atlas/atlas-docs",
+            "agents-k",
+            "84af72336e7f",
+            255,
+            1,
+            false,
+            true,
+            true,
+            false,
+        );
+
+        assert_eq!(diagnostic.phase, "initial-status-255-no-reconnect");
+        assert!(diagnostic
+            .message
+            .contains("while starting session 84af72336e7f"));
+        assert!(diagnostic.message.contains("workspace 'atlas/atlas-docs'"));
+        assert!(diagnostic.message.contains("SSH uses 255"));
+        assert!(diagnostic.message.contains("--no-reconnect"));
     }
 }

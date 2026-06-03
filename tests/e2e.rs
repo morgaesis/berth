@@ -1070,6 +1070,49 @@ fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
 }
 
 #[test]
+fn test_enter_remote_status_255_no_reconnect_explains_start_phase() {
+    let ctx = TestContext::new();
+    let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");
+    let workspace = "atlas/atlas-docs";
+
+    let output = ctx
+        .berth()
+        .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "255")
+        .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+        .args([
+            "enter",
+            workspace,
+            "--remote",
+            "agents-k",
+            "--no-deploy",
+            "--no-reconnect",
+        ])
+        .output()
+        .expect("Failed to run berth enter with fake status 255");
+
+    assert!(!output.status.success(), "status 255 should fail");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("remote SSH/attach returned status 255 while starting session"),
+        "stderr should identify the initial start phase:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("workspace 'atlas/atlas-docs' on agents-k"),
+        "stderr should include workspace and host:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("SSH uses 255 for transport/setup failures")
+            && stderr.contains("a remote attach command can also return 255"),
+        "stderr should explain the ambiguity:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("`--no-reconnect` is set, so berth did not retry"),
+        "stderr should explain why no reconnect happened:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_enter_remote_plain_flag_prints_note() {
     let ctx = TestContext::new();
     let output = ctx
