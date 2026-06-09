@@ -477,6 +477,11 @@ fn remote_enter_command_with(
     // PID 1 instead of `$SHELL -l`. Each argv element is shell-quoted
     // independently. Empty / None means "no override; supervisor runs
     // $SHELL -l".
+    // AttachOnly (reconnect) resumes an existing supervisor, which already
+    // has its original PID-1 command — `berth attach --session <id>` takes
+    // NO `-- <argv>` and rejects one ("command override is only valid with
+    // --new"). Only the creating verbs (`--new …`) may carry the command.
+    let resume_only = session_id.is_some() && matches!(session_mode, RemoteSessionMode::AttachOnly);
     let attach_verb = if let Some(id) = session_id {
         match session_mode {
             RemoteSessionMode::CreateOrAttach => {
@@ -488,7 +493,7 @@ fn remote_enter_command_with(
         "--new".to_string()
     };
     let attach_cmd_suffix = match workspace_command {
-        Some(argv) if !argv.is_empty() => {
+        Some(argv) if !argv.is_empty() && !resume_only => {
             let mut s = String::from(" --");
             for a in argv {
                 s.push(' ');
@@ -913,6 +918,54 @@ mod tests {
         assert!(
             command.contains(&format!("exit {}", crate::session::SESSION_NOT_FOUND_EXIT)),
             "attach-only fallback must exit with the session-not-found code: {command}"
+        );
+    }
+
+    #[test]
+    fn remote_entry_attach_only_drops_command_override() {
+        // `berth attach --session <id>` resumes and inherits the session's
+        // original command; passing `-- <argv>` makes the remote bail with
+        // "command override is only valid with --new". AttachOnly reconnects
+        // must therefore omit the workspace command suffix.
+        let path_expr = remote_workspace_path_expr("work");
+        let cmd = vec!["claude".to_string()];
+        let attach_only = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                session_mode: RemoteSessionMode::AttachOnly,
+                workspace_command: Some(&cmd),
+                ..RemoteEnterCommandOptions::default()
+            },
+        );
+        assert!(
+            attach_only.contains("attach --session 'abc123def456' 'work'"),
+            "attach-only resumes the session: {attach_only}"
+        );
+        assert!(
+            !attach_only.contains("-- 'claude'"),
+            "attach-only must not carry a command override: {attach_only}"
+        );
+
+        // The creating verb still carries the command.
+        let create = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                session_mode: RemoteSessionMode::CreateOrAttach,
+                workspace_command: Some(&cmd),
+                ..RemoteEnterCommandOptions::default()
+            },
+        );
+        assert!(
+            create.contains("attach --new --session 'abc123def456' 'work' -- 'claude'"),
+            "create-or-attach carries the command: {create}"
         );
     }
 

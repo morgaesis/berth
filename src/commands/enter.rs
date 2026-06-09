@@ -685,6 +685,9 @@ async fn enter_remote(
 
     if final_code != 0 {
         let final_reconnect_attach_only = last_reconnect_attach_only;
+        // The full ambiguity breakdown is verbose and only useful when
+        // debugging; keep it in the log file (captured at warn) rather than
+        // dumping a paragraph on the user's terminal on every failed enter.
         let diagnostic = remote_exit_diagnostic(
             &name,
             host,
@@ -696,7 +699,7 @@ async fn enter_remote(
             remote_probe_succeeded,
             opts.plain,
         );
-        tracing::error!(
+        tracing::warn!(
             workspace = %name,
             host,
             session_id = %session_id,
@@ -711,9 +714,44 @@ async fn enter_remote(
             "remote session exited with error: {}",
             diagnostic.message
         );
-        anyhow::bail!("{}", diagnostic.message);
+        let from_hook = env::var_os("BERTH_FROM_HOOK").is_some();
+        anyhow::bail!(
+            "{}",
+            concise_remote_failure_message(&name, host, final_code, from_hook)
+        );
     }
     Ok(())
+}
+
+/// Short, actionable failure shown to the user when a remote enter can't be
+/// established. The exhaustive 255-is-ambiguous explanation goes to
+/// `berth logs`; here we point at the two commands worth copy-pasting plus
+/// where to read the detail. Hook-driven (new-tab) entries get a single line
+/// since the shell hook already appends its own "Skipping" note.
+fn concise_remote_failure_message(workspace: &str, host: &str, code: i32, from_hook: bool) -> String {
+    let reason = if code == 255 {
+        "ssh exited 255 (transport or remote setup)".to_string()
+    } else {
+        format!("remote exited {code}")
+    };
+    let attach = format!("berth attach {workspace}");
+    let logs = "berth logs";
+    if from_hook {
+        format!(
+            "{} couldn't enter '{workspace}' on {host} ({reason}) — try `{}`, details in `{logs}`",
+            "✗".red().bold(),
+            attach.cyan(),
+        )
+    } else {
+        format!(
+            "{} couldn't start the remote session for '{workspace}' on {host} ({reason})\n    \
+             reconnect:  {}\n    retry:      {}\n    details:    {}",
+            "✗".red().bold(),
+            attach.cyan(),
+            format!("berth enter {workspace}").cyan(),
+            logs.cyan(),
+        )
+    }
 }
 
 struct RemoteExitDiagnostic {

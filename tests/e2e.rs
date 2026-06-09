@@ -1121,15 +1121,21 @@ fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
         commands[0]
     );
     assert!(
-        commands[1].contains(&format!(
-            "attach --session '{first_session}' '{workspace}' -- 'claude'"
-        )),
+        commands[1].contains(&format!("attach --session '{first_session}' '{workspace}'")),
         "reconnect must attach only to the existing remote session:\n{}",
         commands[1]
     );
     assert!(
         !commands[1].contains("attach --new --session"),
         "reconnect must not create a replacement session:\n{}",
+        commands[1]
+    );
+    // Resuming inherits the session's original command — the reconnect must
+    // NOT pass `-- claude`, or the remote `berth attach --session` rejects it
+    // with "command override is only valid with --new".
+    assert!(
+        !commands[1].contains(" -- 'claude'"),
+        "reconnect must not carry a command override:\n{}",
         commands[1]
     );
 }
@@ -1288,7 +1294,7 @@ fn test_enter_remote_new_tabs_get_distinct_sessions() {
 }
 
 #[test]
-fn test_enter_remote_status_255_no_reconnect_explains_start_phase() {
+fn test_enter_remote_status_255_failure_is_concise_and_actionable() {
     let ctx = TestContext::new();
     let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");
     let workspace = "atlas/atlas-docs";
@@ -1311,22 +1317,28 @@ fn test_enter_remote_status_255_no_reconnect_explains_start_phase() {
     assert!(!output.status.success(), "status 255 should fail");
 
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The user-facing failure must be the short, actionable form — not the
+    // verbose 255-is-ambiguous paragraph (that now lives in `berth logs`).
     assert!(
-        stderr.contains("remote SSH/attach returned status 255 while starting session"),
-        "stderr should identify the initial start phase:\n{stderr}"
+        stderr.contains("couldn't start the remote session for 'atlas/atlas-docs' on agents-k"),
+        "stderr should name workspace and host concisely:\n{stderr}"
     );
     assert!(
-        stderr.contains("workspace 'atlas/atlas-docs' on agents-k"),
-        "stderr should include workspace and host:\n{stderr}"
+        stderr.contains("berth attach atlas/atlas-docs"),
+        "stderr should offer a copy-pasteable attach command:\n{stderr}"
     );
     assert!(
-        stderr.contains("SSH uses 255 for transport/setup failures")
-            && stderr.contains("a remote attach command can also return 255"),
-        "stderr should explain the ambiguity:\n{stderr}"
+        stderr.contains("berth enter atlas/atlas-docs"),
+        "stderr should offer a retry command:\n{stderr}"
     );
     assert!(
-        stderr.contains("`--no-reconnect` is set, so berth did not retry"),
-        "stderr should explain why no reconnect happened:\n{stderr}"
+        stderr.contains("berth logs"),
+        "stderr should point at the logs for detail:\n{stderr}"
+    );
+    // The verbose ambiguity explanation must NOT be dumped on the terminal.
+    assert!(
+        !stderr.contains("SSH uses 255 for transport/setup failures"),
+        "verbose 255 explanation should stay out of stderr:\n{stderr}"
     );
 }
 
