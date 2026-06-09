@@ -410,7 +410,7 @@ async fn enter_remote(
         let _tunnel = ssh::start_tunnel(host, &name, ports).await?;
     }
 
-    let session_id = berth::session::new_session_id();
+    let mut session_id = berth::session::new_session_id();
 
     // Capture the exact remote supervisor identity for hook replay.
     // Command shape still matters for the first connection, but once a
@@ -434,19 +434,48 @@ async fn enter_remote(
         "starting remote ssh session"
     );
 
-    // Auto-reconnect loop. SSH exit status 255 = connection lost (not
-    // a remote-command exit), so we silently re-run ssh+attach until
-    // either the network comes back and the remote command exits
-    // cleanly (0) or the user Ctrl+Cs out of the wait.
+    // Auto-reconnect / session-recovery loop.
     //
-    // On the remote side, this invocation uses a generated session id.
-    // The first SSH creates it; later retries attach back to that same
-    // id, while a future `berth enter` starts a different session.
-    let mut backoff_ms: u64 = 500;
+    // Two failure modes are handled, and they are deliberately NOT the
+    // same:
+    //
+    //   * SSH exit status 255 = transport loss (the network dropped, the
+    //     laptop slept). The remote supervisor is presumably still alive,
+    //     so we re-run ssh+attach against the SAME session id until the
+    //     link returns and the command exits cleanly, or the user Ctrl+Cs.
+    //     This can wait indefinitely — that is the point of a resumable
+    //     session.
+    //
+    //   * SESSION_NOT_FOUND_EXIT from an attach-only reconnect = the exact
+    //     supervisor we were attaching to is GONE (idle-shutdown, reboot,
+    //     OOM while we were away overnight). Retrying that dead id forever
+    //     is useless — the previous behaviour spun on "still waiting for
+    //     the same remote session" without end. Instead we retry a small,
+    //     bounded number of times to absorb a supervisor-mid-restart race,
+    //     then give up on the id, mint a FRESH session, and create it so
+    //     the user lands back in a working workspace.
+    //
+    // The first SSH creates the session; once it exists every reconnect is
+    // attach-only so a blip never forks a duplicate. A future `berth enter`
+    // (a new tab) always starts from a brand-new id, giving a distinct but
+    // identical session.
+    const MAX_SESSION_GONE_RETRIES: u32 = 3;
+    const MAX_FRESH_RESTARTS: u32 = 3;
+    let (backoff_start, backoff_cap) = reconnect_backoff_params();
+    let mut backoff_ms: u64 = backoff_start;
     let mut attempt: u32 = 0;
+    // False until a session has (probably) been created remotely; once set,
+    // reconnects attach-only and never implicitly create a replacement.
+    let mut attach_only = false;
+    let mut session_gone_retries: u32 = 0;
+    let mut fresh_restarts: u32 = 0;
+    // Assigned at the top of every iteration before any `break`, so the
+    // post-loop diagnostic always reads a real value.
+    let mut last_reconnect_attach_only;
     let final_code = loop {
         attempt += 1;
-        let reconnect_attach_only = attempt > 1 && !opts.plain;
+        let reconnect_attach_only = attach_only && !opts.plain;
+        last_reconnect_attach_only = reconnect_attach_only;
         let result = if opts.plain {
             ssh::ssh_interactive(host, &name, true).await
         } else {
@@ -471,127 +500,178 @@ async fn enter_remote(
             reconnect_attach_only,
             "remote ssh session returned"
         );
-        match (code, opts.no_reconnect, reconnect_attach_only) {
-            (255, _, _) if opts.plain => {
+
+        // Clean exit, or the user opted out of reconnect / is in --plain
+        // mode (no resumable session to recover): nothing more to do.
+        if code == 0 {
+            break code;
+        }
+        if opts.plain {
+            tracing::warn!(
+                workspace = %name,
+                host,
+                session_id = %session_id,
+                attempt,
+                code,
+                "plain remote ssh returned non-zero; not entering reconnect loop"
+            );
+            break code;
+        }
+        if opts.no_reconnect {
+            tracing::warn!(
+                workspace = %name,
+                host,
+                session_id = %session_id,
+                attempt,
+                code,
+                "remote ssh returned non-zero; reconnect disabled"
+            );
+            break code;
+        }
+
+        if code == 255 {
+            // Transport loss. On the very first attempt, if the preflight
+            // reachability probe also failed, this is an SSH transport/setup
+            // problem rather than a mid-session blip — don't spin on it.
+            if !attach_only && !remote_probe_succeeded {
                 tracing::warn!(
                     workspace = %name,
                     host,
                     session_id = %session_id,
                     attempt,
-                    "plain remote ssh returned status 255; not entering reconnect loop"
+                    "remote host was not reachable during preflight; not entering reconnect loop"
                 );
                 break code;
             }
-            (255, false, false) => {
-                tracing::warn!(
-                    workspace = %name,
-                    host,
-                    session_id = %session_id,
-                    attempt,
-                    remote_probe_succeeded,
-                    "initial remote ssh transport failed"
-                );
-                if !remote_probe_succeeded {
-                    tracing::warn!(
-                        workspace = %name,
-                        host,
-                        session_id = %session_id,
-                        attempt,
-                        "remote host was not reachable during preflight; not entering reconnect loop"
-                    );
-                    break code;
-                }
-                restore_terminal_modes_for_status();
+            let was_attach_only = attach_only;
+            // A session may now exist remotely; future attempts attach to
+            // it instead of creating a duplicate. Transport loss is
+            // unrelated to a missing session, so reset that counter.
+            attach_only = true;
+            session_gone_retries = 0;
+            tracing::warn!(
+                workspace = %name,
+                host,
+                session_id = %session_id,
+                attempt,
+                backoff_ms,
+                "remote ssh transport lost; reconnecting to the same session"
+            );
+            restore_terminal_modes_for_status();
+            if !was_attach_only {
                 eprintln!(
                     "{} connection lost while starting session {}; reconnecting to the same session…  (Ctrl+C to abort)",
                     "·".dimmed(),
                     session_id.cyan()
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                continue;
-            }
-            (255, false, true) => {
-                // Connection lost. Quiet first retry (covers the common
-                // case of a brief blip — back in <1s), louder if it
-                // takes longer.
-                tracing::warn!(
-                    workspace = %name,
-                    host,
-                    session_id = %session_id,
-                    attempt,
-                    backoff_ms,
-                    reused_session_id_on_next_attempt = !opts.plain,
-                    "remote ssh transport lost; reconnecting"
+            } else if attempt.is_multiple_of(4) {
+                eprintln!(
+                    "{} still reconnecting session {} (attempt {attempt})…",
+                    "·".dimmed(),
+                    session_id.cyan()
                 );
-                restore_terminal_modes_for_status();
-                if attempt == 2 {
-                    eprintln!(
-                        "{} connection lost; reconnecting session {}…  (Ctrl+C to abort)",
-                        "·".dimmed(),
-                        session_id.cyan()
-                    );
-                } else if attempt.is_multiple_of(4) {
-                    eprintln!(
-                        "{} still reconnecting session {} (attempt {attempt})…",
-                        "·".dimmed(),
-                        session_id.cyan()
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                continue;
-            }
-            (255, true, _) => {
-                tracing::warn!(
-                    workspace = %name,
-                    host,
-                    session_id = %session_id,
-                    attempt,
-                    "remote ssh transport lost; reconnect disabled"
+            } else {
+                eprintln!(
+                    "{} connection lost; reconnecting session {}…  (Ctrl+C to abort)",
+                    "·".dimmed(),
+                    session_id.cyan()
                 );
-                break code;
             }
-            (0, _, _) => break code,
-            (_, false, true) => {
-                tracing::warn!(
-                    workspace = %name,
-                    host,
-                    session_id = %session_id,
-                    attempt,
-                    code,
-                    backoff_ms,
-                    "remote session unavailable during attach-only reconnect; retrying same session"
-                );
-                restore_terminal_modes_for_status();
-                if attempt == 2 {
-                    eprintln!(
-                        "{} session {} not reachable yet; waiting for the same remote session…  (Ctrl+C to abort)",
-                        "·".dimmed(),
-                        session_id.cyan()
-                    );
-                } else if attempt.is_multiple_of(4) {
-                    eprintln!(
-                        "{} still waiting for the same remote session {} (last status {code}, attempt {attempt})…",
-                        "·".dimmed(),
-                        session_id.cyan()
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
-                continue;
-            }
-            _ => {
-                tracing::info!(
-                    workspace = %name,
-                    host,
-                    session_id = %session_id,
-                    final_code = code,
-                    "remote ssh session finished without reconnect"
-                );
-                break code;
-            }
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+            continue;
         }
+
+        // Non-zero, non-255: the remote command actually ran. The only case
+        // we recover from is "the session I was attaching to is gone";
+        // anything else (the attached program exited non-zero, a genuine
+        // failure) is propagated.
+        if reconnect_attach_only && code == berth::session::SESSION_NOT_FOUND_EXIT {
+            session_gone_retries += 1;
+            if session_gone_retries <= MAX_SESSION_GONE_RETRIES {
+                // Brief flakiness window — a supervisor may be restarting.
+                tracing::warn!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    session_gone_retries,
+                    backoff_ms,
+                    "remote session not found; retrying briefly before giving up on this id"
+                );
+                restore_terminal_modes_for_status();
+                eprintln!(
+                    "{} session {} not found on remote; retrying ({}/{})…  (Ctrl+C to abort)",
+                    "·".dimmed(),
+                    session_id.cyan(),
+                    session_gone_retries,
+                    MAX_SESSION_GONE_RETRIES
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+                backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+                continue;
+            }
+
+            // The session is genuinely gone. Give up on the dead id and
+            // start fresh — but bound how many times we'll do this so an
+            // unstable remote can't trap us in a create→die→create cycle.
+            fresh_restarts += 1;
+            if fresh_restarts > MAX_FRESH_RESTARTS {
+                tracing::error!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    fresh_restarts,
+                    "remote session repeatedly lost after restart; giving up"
+                );
+                restore_terminal_modes_for_status();
+                eprintln!(
+                    "{} remote session keeps disappearing after {} fresh starts; giving up",
+                    "✗".red().bold(),
+                    MAX_FRESH_RESTARTS
+                );
+                break code;
+            }
+            let gone = std::mem::replace(&mut session_id, berth::session::new_session_id());
+            attach_only = false;
+            session_gone_retries = 0;
+            backoff_ms = backoff_start;
+            tracing::warn!(
+                workspace = %name,
+                host,
+                old_session = %gone,
+                new_session = %session_id,
+                attempt,
+                fresh_restarts,
+                "remote session gone; minting a fresh session"
+            );
+            restore_terminal_modes_for_status();
+            eprintln!(
+                "{} remote session {} is gone; starting a fresh session {}",
+                "·".dimmed(),
+                gone.cyan(),
+                session_id.cyan()
+            );
+            // Refresh the new-tab breadcrumb + title so they reflect the
+            // session the user is actually in now.
+            berth::terminal::emit_enter_signals(&berth::terminal::EnterSignal {
+                workspace: &name,
+                dir: remote_dir,
+                command,
+                session_id: Some(&session_id),
+            });
+            continue;
+        }
+
+        tracing::info!(
+            workspace = %name,
+            host,
+            session_id = %session_id,
+            final_code = code,
+            "remote ssh session finished without reconnect"
+        );
+        break code;
     };
 
     berth::terminal::emit_exit_signals(&name);
@@ -604,7 +684,7 @@ async fn enter_remote(
     );
 
     if final_code != 0 {
-        let final_reconnect_attach_only = attempt > 1 && !opts.plain;
+        let final_reconnect_attach_only = last_reconnect_attach_only;
         let diagnostic = remote_exit_diagnostic(
             &name,
             host,
@@ -710,6 +790,25 @@ fn remote_exit_diagnostic(
             "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh -tt {quoted_host}` to inspect SSH errors."
         ),
     }
+}
+
+/// Initial and capped backoff (ms) for the reconnect / session-recovery
+/// loop. Defaults to 500ms → 10s, overridable via `BERTH_RECONNECT_BACKOFF_MS`
+/// and `BERTH_RECONNECT_BACKOFF_CAP_MS` (operators who want a snappier or
+/// gentler retry cadence, and the test suite to keep its sleeps tiny). The
+/// cap is floored to the start so a misconfiguration can't invert them.
+fn reconnect_backoff_params() -> (u64, u64) {
+    let start = env::var("BERTH_RECONNECT_BACKOFF_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(500);
+    let cap = env::var("BERTH_RECONNECT_BACKOFF_CAP_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(10_000)
+        .max(start);
+    (start, cap)
 }
 
 fn restore_terminal_modes_for_status() {

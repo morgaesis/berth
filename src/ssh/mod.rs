@@ -337,10 +337,26 @@ pub async fn ssh_attach_remote(
     Ok(code)
 }
 
+/// On Windows, OpenSSH's connection multiplexing (`ControlMaster` /
+/// `ControlPath`) rides over a named pipe whose handle is not a real socket;
+/// `ssh` then fails `getsockname()` with "Not a socket" and aborts the read
+/// (`Read from remote host …: Unknown error`, exit 255). A user `~/.ssh/config`
+/// with `Host * → ControlMaster auto` is enough to break every berth
+/// connection. berth opens and manages its own connections and gains nothing
+/// from the user's shared masters, so force multiplexing off to sidestep the
+/// bug. No-op on Unix, where multiplexing works fine.
+fn push_disable_multiplexing_on_windows(args: &mut Vec<String>) {
+    if cfg!(windows) {
+        args.extend(["-o".into(), "ControlMaster=no".into()]);
+        args.extend(["-o".into(), "ControlPath=none".into()]);
+    }
+}
+
 fn push_interactive_ssh_options(args: &mut Vec<String>, noninteractive: bool) {
     // Suppress ssh's own status lines ("Shared connection closed",
     // motd banners). Errors still print.
     args.extend(["-o".into(), "LogLevel=ERROR".into()]);
+    push_disable_multiplexing_on_windows(args);
     // Make transport loss visible to the reconnect loop promptly.
     args.extend(["-o".into(), "ConnectTimeout=10".into()]);
     args.extend(["-o".into(), "ServerAliveInterval=5".into()]);
@@ -482,9 +498,20 @@ fn remote_enter_command_with(
         }
         _ => String::new(),
     };
-    let attach_env = detach_key
-        .map(|key| format!("BERTH_DETACH_KEY={} ", shell_escape_arg(key)))
-        .unwrap_or_default();
+    // `BERTH_ATTACH_LOCAL=1` pins the attach to THIS host. Without it the
+    // remote `berth attach` would re-run its own remote-delegation check and,
+    // if the remote's config also names this workspace with a resolved host,
+    // bounce the attach elsewhere (or back onto itself) instead of
+    // creating/attaching the session locally. We have already SSHed to the
+    // final host; this is where the session must live. `ssh_attach_remote`
+    // sets the same guard — keep the two attach paths consistent.
+    let attach_env = match detach_key {
+        Some(key) => format!(
+            "BERTH_ATTACH_LOCAL=1 BERTH_DETACH_KEY={} ",
+            shell_escape_arg(key)
+        ),
+        None => "BERTH_ATTACH_LOCAL=1 ".to_string(),
+    };
 
     // Resumability cascade. Best to worst:
     //   1. berth attach --new: PTY-multiplexing supervisor managed by berth
@@ -522,11 +549,17 @@ fn remote_enter_command_with(
              fi"
         ),
         RemoteSessionMode::AttachOnly => {
-            "else \
-               printf 'berth: remote session not found; waiting for reconnect to same session\\n' >&2; \
-               exit 75; \
-             fi"
-                .to_string()
+            // No berth/tmux/screen on the remote and the legacy multiplexer
+            // session is gone. Exit with the dedicated session-not-found
+            // code so the local reconnect loop gives up on this id and
+            // starts fresh rather than retrying a dead session forever.
+            format!(
+                "else \
+                   printf 'berth: remote session not found\\n' >&2; \
+                   exit {}; \
+                 fi",
+                crate::session::SESSION_NOT_FOUND_EXIT
+            )
         }
     };
 
@@ -656,6 +689,7 @@ fn tunnel_ssh_args(host: &str, ports: &[u16], noninteractive: bool) -> Vec<Strin
     if noninteractive {
         args.extend(["-o".to_string(), "BatchMode=yes".to_string()]);
     }
+    push_disable_multiplexing_on_windows(&mut args);
 
     for port in ports {
         args.push(format!("-L {}:localhost:{}", port, port));
@@ -759,7 +793,7 @@ pub async fn run_remote_command_with_timeout(
 }
 
 fn noninteractive_ssh_args(host: &str, command: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-o".to_string(),
         "LogLevel=ERROR".to_string(),
         "-o".to_string(),
@@ -770,9 +804,11 @@ fn noninteractive_ssh_args(host: &str, command: &str) -> Vec<String> {
         "ServerAliveInterval=5".to_string(),
         "-o".to_string(),
         "ServerAliveCountMax=2".to_string(),
-        host.to_string(),
-        command.to_string(),
-    ]
+    ];
+    push_disable_multiplexing_on_windows(&mut args);
+    args.push(host.to_string());
+    args.push(command.to_string());
+    args
 }
 
 #[cfg(test)]
@@ -816,6 +852,68 @@ mod tests {
         assert!(command.contains("'berth-work-$$-$RANDOM'"));
         assert!(command.contains("screen -D -RR 'berth-work-$$-$RANDOM'"));
         assert!(command.contains("else exec ${SHELL:-/bin/sh}; fi"));
+    }
+
+    #[test]
+    fn remote_entry_pins_attach_to_local_host() {
+        // The remote `berth attach` must run with BERTH_ATTACH_LOCAL=1 so it
+        // creates/attaches the session on the host we SSHed into rather than
+        // re-resolving a remote and bouncing the attach elsewhere.
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                detach_key: Some("ctrl-x"),
+                ..RemoteEnterCommandOptions::default()
+            },
+        );
+        assert!(
+            command.contains("BERTH_ATTACH_LOCAL=1 "),
+            "remote attach must be pinned local: {command}"
+        );
+        // The env prefix must sit immediately before the berth exec.
+        assert!(
+            command.contains(
+                "BERTH_ATTACH_LOCAL=1 BERTH_DETACH_KEY='ctrl-x' exec \"$berth_bin\" attach"
+            ),
+            "env prefix must precede the berth attach exec: {command}"
+        );
+    }
+
+    #[test]
+    fn remote_entry_pins_attach_to_local_host_without_detach_key() {
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command("work", &path_expr, &Runtime::Bare, &[]);
+        assert!(
+            command.contains("BERTH_ATTACH_LOCAL=1 exec \"$berth_bin\" attach"),
+            "attach must be pinned local even with no detach key: {command}"
+        );
+    }
+
+    #[test]
+    fn remote_entry_attach_only_fallback_exits_with_session_not_found_code() {
+        // The no-multiplexer fallback in attach-only mode must surface the
+        // dedicated session-not-found code so the local loop recovers.
+        let path_expr = remote_workspace_path_expr("work");
+        let command = remote_enter_command_with(
+            "work",
+            &path_expr,
+            &Runtime::Bare,
+            &[],
+            RemoteEnterCommandOptions {
+                session_id: Some("abc123def456"),
+                session_mode: RemoteSessionMode::AttachOnly,
+                ..RemoteEnterCommandOptions::default()
+            },
+        );
+        assert!(
+            command.contains(&format!("exit {}", crate::session::SESSION_NOT_FOUND_EXIT)),
+            "attach-only fallback must exit with the session-not-found code: {command}"
+        );
     }
 
     #[test]
@@ -938,6 +1036,34 @@ mod tests {
 
         assert!(args.windows(2).any(|w| w == ["-o", "ConnectTimeout=10"]));
         assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+    }
+
+    #[test]
+    fn ssh_option_sets_disable_multiplexing_on_windows_only() {
+        // Win32-OpenSSH's ControlMaster handle is not a real socket, so a
+        // user `Host * → ControlMaster auto` breaks every berth connection
+        // with "getsockname failed: Not a socket". Every ssh invocation
+        // berth builds must force multiplexing off on Windows; on Unix the
+        // flags must stay absent so the user's masters keep working.
+        let has_mux_off = |args: &[String]| -> bool {
+            args.windows(2).any(|w| w == ["-o", "ControlMaster=no"])
+                && args.windows(2).any(|w| w == ["-o", "ControlPath=none"])
+        };
+
+        let mut interactive = Vec::new();
+        push_interactive_ssh_options(&mut interactive, false);
+        let noninteractive = noninteractive_ssh_args("dev-box", "true");
+        let tunnel = tunnel_ssh_args("dev-box", &[8080], false);
+
+        if cfg!(windows) {
+            assert!(has_mux_off(&interactive), "interactive: {interactive:?}");
+            assert!(has_mux_off(&noninteractive), "probe: {noninteractive:?}");
+            assert!(has_mux_off(&tunnel), "tunnel: {tunnel:?}");
+        } else {
+            assert!(!has_mux_off(&interactive), "interactive: {interactive:?}");
+            assert!(!has_mux_off(&noninteractive), "probe: {noninteractive:?}");
+            assert!(!has_mux_off(&tunnel), "tunnel: {tunnel:?}");
+        }
     }
 
     #[test]

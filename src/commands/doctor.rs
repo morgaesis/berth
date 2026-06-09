@@ -165,6 +165,20 @@ fn which(name: &str) -> Option<PathBuf> {
         {
             return Some(cand);
         }
+        #[cfg(windows)]
+        {
+            let pathext =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            for ext in pathext.split(';').filter(|ext| !ext.is_empty()) {
+                let cand = dir.join(format!("{name}{ext}"));
+                if std::fs::metadata(&cand)
+                    .map(|m| m.is_file())
+                    .unwrap_or(false)
+                {
+                    return Some(cand);
+                }
+            }
+        }
     }
     None
 }

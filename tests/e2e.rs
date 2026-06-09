@@ -1135,6 +1135,159 @@ fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
 }
 
 #[test]
+fn test_enter_remote_starts_fresh_session_when_original_is_gone() {
+    // Overnight scenario: transport drops (255), then the reconnect attaches
+    // to the original session which the remote reports gone
+    // (SESSION_NOT_FOUND_EXIT = 75) over and over. berth must retry a bounded
+    // number of times, then give up on the dead id and create a brand-new
+    // session instead of spinning forever.
+    let ctx = TestContext::new();
+    let log_path = ctx.temp_dir.join("fake-interactive-ssh.log");
+    let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");
+    let workspace = "morgaesis/runner-routes";
+
+    // attempt 1: 255 (transport loss) -> reconnect attach-only
+    // attempts 2..=5: 75 (session gone) -> 3 flaky retries, then give up
+    // attempt 6: 0 -> the freshly minted session attaches cleanly
+    let output = ctx
+        .berth()
+        .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "255,75,75,75,75,0")
+        .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+        .env("BERTH_FAKE_INTERACTIVE_SSH_LOG", &log_path)
+        .env("BERTH_RECONNECT_BACKOFF_MS", "1")
+        .env("BERTH_RECONNECT_BACKOFF_CAP_MS", "2")
+        .args([
+            "enter",
+            workspace,
+            "--remote",
+            "fakehost",
+            "--no-deploy",
+            "--",
+            "claude",
+        ])
+        .output()
+        .expect("Failed to run berth enter with fake session-gone reconnect");
+
+    assert!(
+        output.status.success(),
+        "enter should recover by starting a fresh session: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&log_path).expect("missing fake interactive ssh log");
+    let commands = log
+        .lines()
+        .map(|line| {
+            line.splitn(4, '\t')
+                .nth(3)
+                .unwrap_or_else(|| panic!("malformed fake ssh log line: {line}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 6, "fake ssh log:\n{log}");
+
+    // The first attempt creates the original session.
+    let original = quoted_value_after(commands[0], "--session '");
+    assert!(
+        commands[0].contains(&format!("attach --new --session '{original}'")),
+        "first attempt creates the original session:\n{}",
+        commands[0]
+    );
+
+    // The reconnect + flaky retries all attach-only to that SAME original id.
+    for cmd in &commands[1..=4] {
+        assert!(
+            cmd.contains(&format!("attach --session '{original}' '{workspace}'")),
+            "attempts 2..5 must attach-only to the original session:\n{cmd}"
+        );
+        assert!(
+            !cmd.contains("attach --new --session"),
+            "reconnect must not create a replacement session:\n{cmd}"
+        );
+    }
+
+    // The final attempt is a fresh CREATE with a DIFFERENT session id.
+    let fresh = quoted_value_after(commands[5], "--session '");
+    assert_ne!(
+        original, fresh,
+        "the recovery session must be a new id:\n{log}"
+    );
+    assert!(
+        commands[5].contains(&format!(
+            "attach --new --session '{fresh}' '{workspace}' -- 'claude'"
+        )),
+        "final attempt must create a fresh session running the same command:\n{}",
+        commands[5]
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("is gone; starting a fresh session"),
+        "user should be told a fresh session was started:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_enter_remote_new_tabs_get_distinct_sessions() {
+    // Two `berth enter` invocations (a parent tab and a new tab) on the same
+    // workspace must each get their OWN brand-new session via --new, never
+    // attach-only to a stale id.
+    let ctx = TestContext::new();
+    let log_path = ctx.temp_dir.join("fake-interactive-ssh.log");
+    let workspace = "morgaesis/dev";
+
+    for tab in 0..2 {
+        let state_path = ctx
+            .temp_dir
+            .join(format!("fake-interactive-ssh.state.{tab}"));
+        let output = ctx
+            .berth()
+            .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "0")
+            .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+            .env("BERTH_FAKE_INTERACTIVE_SSH_LOG", &log_path)
+            .args([
+                "enter",
+                workspace,
+                "--remote",
+                "fakehost",
+                "--no-deploy",
+                "--",
+                "claude",
+            ])
+            .output()
+            .expect("Failed to run berth enter for new-tab distinctness");
+        assert!(
+            output.status.success(),
+            "tab {tab} enter failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let log = fs::read_to_string(&log_path).expect("missing fake interactive ssh log");
+    let commands = log
+        .lines()
+        .map(|line| {
+            line.splitn(4, '\t')
+                .nth(3)
+                .unwrap_or_else(|| panic!("malformed fake ssh log line: {line}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 2, "one ssh per tab:\n{log}");
+
+    let first = quoted_value_after(commands[0], "--session '");
+    let second = quoted_value_after(commands[1], "--session '");
+    assert_ne!(
+        first, second,
+        "each tab must get a distinct session id:\n{log}"
+    );
+    for cmd in &commands {
+        assert!(
+            cmd.contains("attach --new --session '"),
+            "every fresh enter must create its own session:\n{cmd}"
+        );
+    }
+}
+
+#[test]
 fn test_enter_remote_status_255_no_reconnect_explains_start_phase() {
     let ctx = TestContext::new();
     let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");

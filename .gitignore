@@ -4,3 +4,8 @@ ACTIONLOG.md
 .cache/
 tmp/
 .env
+
+# Node tooling artifacts — not used by this Rust crate (stray `npm init` output)
+package.json
+package-lock.json
+node_modules/

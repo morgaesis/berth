@@ -6,6 +6,16 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
 
+/// Exit code a remote `berth attach --session <id>` returns when the
+/// requested session is genuinely gone (no socket / not in the inventory),
+/// as opposed to a transport failure (SSH's 255) or the attached command
+/// exiting with its own status. Chosen as `EX_TEMPFAIL` (75) so it does not
+/// collide with the common 0/1/2/126/127/130 codes a real inner command
+/// produces. The local `berth enter` reconnect loop keys off this to tell
+/// "the supervisor died, mint a fresh session" apart from "the program I was
+/// running exited", instead of spinning forever on a dead id.
+pub const SESSION_NOT_FOUND_EXIT: i32 = 75;
+
 pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("BERTH_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir));

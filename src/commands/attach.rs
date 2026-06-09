@@ -433,7 +433,13 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
     let target = match session {
         Some(id) => {
             if !sessions.iter().any(|s| s == &id) {
-                bail!(
+                // The exact session the caller asked for is gone. This is a
+                // routine, recoverable condition for the `berth enter`
+                // reconnect loop (the supervisor died while we were away),
+                // so report it with a dedicated exit code rather than a
+                // generic failure. The loop translates this into "mint a
+                // fresh session" instead of retrying a dead id forever.
+                eprintln!(
                     "no session '{id}' for workspace '{workspace}' (have: {})",
                     if sessions.is_empty() {
                         "none".to_string()
@@ -441,6 +447,14 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
                         sessions.join(", ")
                     }
                 );
+                tracing::warn!(
+                    workspace = %workspace,
+                    session_id = %id,
+                    available = sessions.len(),
+                    exit_code = session::SESSION_NOT_FOUND_EXIT,
+                    "requested session not found; returning session-not-found exit code"
+                );
+                return Ok(session::SESSION_NOT_FOUND_EXIT);
             }
             id
         }
@@ -461,12 +475,17 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
             workspace = %workspace,
             session_id = %target,
             socket = %socket_path.display(),
+            exit_code = session::SESSION_NOT_FOUND_EXIT,
             "resume target socket missing"
         );
-        bail!(
+        // The id was listed but its socket vanished between the scan and
+        // now — the supervisor exited under us. Same recoverable case as a
+        // missing id: hand the reconnect loop the session-not-found code.
+        eprintln!(
             "session socket '{}' missing; the supervisor may have just exited",
             socket_path.display()
         );
+        return Ok(session::SESSION_NOT_FOUND_EXIT);
     }
     tracing::info!(
         workspace = %workspace,
@@ -635,35 +654,89 @@ fn spawn_supervisor(workspace: &str, session_id: &str, command: &[String]) -> Re
         std::fs::create_dir_all(parent)
             .with_context(|| format!("creating supervisor log dir {}", parent.display()))?;
     }
+
+    // The supervisor's own argv (PID-1 of the session, give or take the
+    // wrapper below). Built once so both the systemd-managed and the plain
+    // detached spawn run exactly the same thing.
+    let mut inner: Vec<String> = vec![
+        "attach".into(),
+        "--supervisor".into(),
+        "--session".into(),
+        session_id.into(),
+        workspace.into(),
+    ];
+    if !command.is_empty() {
+        inner.push("--".into());
+        inner.extend(command.iter().cloned());
+    }
+
+    // Prefer launching under the per-user systemd manager. A bare detached
+    // child lives in the SSH login session's `session-NNN.scope`, which
+    // systemd reaps the instant that session ends (KillUserProcesses=yes is
+    // the default) — so the session would vanish the moment the user closes
+    // the laptop. `systemd-run --user --scope` moves the supervisor into
+    // `user@.service` instead, and enabling linger keeps that manager alive
+    // across logout, so the session survives until it's idle-reaped or the
+    // box reboots. Falls back to a plain detached spawn where there is no
+    // usable user manager (no systemd, no user bus, macOS, containers).
+    if let Some(systemd_run) = supervisor_systemd_run() {
+        best_effort_enable_linger();
+        match spawn_supervisor_via_systemd(
+            &systemd_run,
+            &exe,
+            workspace,
+            session_id,
+            &inner,
+            &log_path,
+        ) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                tracing::warn!(
+                    workspace,
+                    session_id,
+                    error = %format!("{err:#}"),
+                    "systemd-run supervisor launch failed; falling back to a plain detached spawn"
+                );
+            }
+        }
+    }
+
+    spawn_supervisor_detached(&exe, workspace, session_id, &inner, &log_path)
+}
+
+/// Open the supervisor logfile and return two clones (stdout + stderr).
+fn open_supervisor_log(log_path: &Path) -> Result<(std::fs::File, std::fs::File)> {
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(log_path)
         .with_context(|| format!("opening supervisor log {}", log_path.display()))?;
     let log_clone = log
         .try_clone()
         .with_context(|| "duplicating supervisor log fd")?;
-    let mut cmd = Command::new(&exe);
-    cmd.arg("attach")
-        .arg("--supervisor")
-        .arg("--session")
-        .arg(session_id)
-        .arg(workspace)
+    Ok((log, log_clone))
+}
+
+/// Plain detached spawn — the original behaviour. Used directly when no user
+/// systemd manager is available, and as the fallback if `systemd-run` fails.
+fn spawn_supervisor_detached(
+    exe: &Path,
+    workspace: &str,
+    session_id: &str,
+    inner: &[String],
+    log_path: &Path,
+) -> Result<()> {
+    let (log, log_clone) = open_supervisor_log(log_path)?;
+    let mut cmd = Command::new(exe);
+    cmd.args(inner)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_clone))
         .stderr(Stdio::from(log));
-    if !command.is_empty() {
-        cmd.arg("--");
-        for arg in command {
-            cmd.arg(arg);
-        }
-    }
     tracing::info!(
         workspace,
         session_id,
         exe = %exe.display(),
         log = %log_path.display(),
-        command_len = command.len(),
         "spawning detached session supervisor"
     );
     let child = cmd.spawn().context("spawning session supervisor")?;
@@ -675,6 +748,132 @@ fn spawn_supervisor(workspace: &str, session_id: &str, command: &[String]) -> Re
     );
     Ok(())
 }
+
+/// Launch the supervisor inside a transient `--user --scope` unit so it lives
+/// under `user@.service` and survives the SSH session that created it.
+fn spawn_supervisor_via_systemd(
+    systemd_run: &Path,
+    exe: &Path,
+    workspace: &str,
+    session_id: &str,
+    inner: &[String],
+    log_path: &Path,
+) -> Result<()> {
+    let (log, log_clone) = open_supervisor_log(log_path)?;
+    let unit = format!("berth-{}-{}", sanitize_unit(workspace), session_id);
+    let mut cmd = Command::new(systemd_run);
+    cmd.arg("--user")
+        .arg("--scope")
+        .arg("--quiet")
+        // Garbage-collect the transient unit when the supervisor exits so a
+        // dead session never leaves a lingering failed unit behind.
+        .arg("--collect")
+        .arg(format!("--unit={unit}"))
+        .arg("--")
+        .arg(exe)
+        .args(inner)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_clone))
+        .stderr(Stdio::from(log));
+    tracing::info!(
+        workspace,
+        session_id,
+        unit = %unit,
+        log = %log_path.display(),
+        "launching session supervisor under user@.service via systemd-run"
+    );
+    let mut child = cmd.spawn().context("spawning systemd-run supervisor")?;
+
+    // `systemd-run --scope` stays alive for the supervisor's lifetime, so a
+    // healthy launch is still running after a short grace period. If it has
+    // already exited, the user bus refused us (or the unit name clashed) —
+    // surface that to the caller so it can fall back to a plain spawn rather
+    // than leaving the user with a session that never appears.
+    std::thread::sleep(Duration::from_millis(250));
+    match child.try_wait().context("polling systemd-run")? {
+        Some(status) if !status.success() => {
+            anyhow::bail!("systemd-run exited early with {status}");
+        }
+        _ => {
+            tracing::info!(
+                workspace,
+                session_id,
+                unit = %unit,
+                "session supervisor scope is live under user@.service"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// systemd unit names allow `[A-Za-z0-9:_.\-]`; map everything else (notably
+/// the `/` in `org/project` workspaces) to `-` so the generated `--unit` name
+/// is always valid.
+fn sanitize_unit(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
+}
+
+/// Locate `systemd-run` only when a per-user systemd manager is actually
+/// reachable — the presence of the user D-Bus socket at
+/// `$XDG_RUNTIME_DIR/bus` is the reliable signal that `systemd-run --user`
+/// will succeed. Linux-only; everywhere else this returns None and callers
+/// take the plain-spawn path.
+#[cfg(target_os = "linux")]
+fn supervisor_systemd_run() -> Option<PathBuf> {
+    if std::env::var_os("BERTH_NO_SYSTEMD_SCOPE").is_some() {
+        return None;
+    }
+    let xdg = std::env::var_os("XDG_RUNTIME_DIR")?;
+    if !Path::new(&xdg).join("bus").exists() {
+        return None;
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("systemd-run"))
+        .find(|candidate| candidate.is_file())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn supervisor_systemd_run() -> Option<PathBuf> {
+    None
+}
+
+/// Best-effort `loginctl enable-linger` for the current user so the user
+/// systemd manager (and the supervisor scopes under it) keep running after
+/// the last login session ends. Self-linger is permitted without privilege
+/// on stock systemd via polkit; if it is denied we just proceed — the
+/// supervisor still survives an SSH drop, only a full logout would reap it.
+#[cfg(target_os = "linux")]
+fn best_effort_enable_linger() {
+    let result = Command::new("loginctl")
+        .arg("enable-linger")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    match result {
+        Ok(status) if status.success() => {
+            tracing::debug!("loginctl enable-linger ok");
+        }
+        Ok(status) => {
+            tracing::debug!(%status, "loginctl enable-linger denied; continuing without linger");
+        }
+        Err(err) => {
+            tracing::debug!(error = %err, "loginctl not available; continuing without linger");
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn best_effort_enable_linger() {}
 
 fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
@@ -696,4 +895,22 @@ fn has_io_kind(err: &anyhow::Error, kind: ErrorKind) -> bool {
 fn workspace_path(name: &str) -> Option<PathBuf> {
     let projects = dirs::data_dir()?.join("berth").join("projects").join(name);
     projects.exists().then_some(projects)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_unit;
+
+    #[test]
+    fn sanitize_unit_maps_slash_and_keeps_valid_chars() {
+        // `/` (org/project) and other separators become `-`; the systemd-safe
+        // set [A-Za-z0-9:_.-] passes through untouched.
+        assert_eq!(sanitize_unit("atlas/Atlas"), "atlas-Atlas");
+        assert_eq!(sanitize_unit("team/proj-1"), "team-proj-1");
+        assert_eq!(sanitize_unit("a.b_c-d:e"), "a.b_c-d:e");
+        // `.` is a valid unit-name char, so only the `/` is rewritten.
+        assert_eq!(sanitize_unit("../etc"), "..-etc");
+        // The result is always a single token a `--unit=` value can hold.
+        assert!(sanitize_unit("x y\tz").chars().all(|c| !c.is_whitespace()));
+    }
 }

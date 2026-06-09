@@ -63,8 +63,12 @@ berth doctor                                  # local runtime + hook status
 
 Remote workspaces work the same. `berth enter --remote <host> <name>` probes
 the host, offers a one-time binary deploy when there's no compatible berth
-on the other side. Each `berth enter` starts a fresh supervised session,
-then keeps reconnecting to that same session if the SSH link drops:
+on the other side. Each `berth enter` starts a fresh supervised session
+(so a new tab on the same workspace gets its own distinct session), then
+keeps reconnecting to that same session if the SSH link drops. If the
+remote supervisor is gone when the link returns — an overnight idle
+shutdown or reboot — berth retries briefly, then starts a fresh session
+instead of spinning forever on the dead one:
 
 ```bash
 berth enter --remote prod-box my-project                # prompts on first deploy
@@ -72,6 +76,13 @@ berth enter --remote prod-box my-project --auto-deploy  # skip the prompt
 berth enter --remote prod-box my-project --plain        # plain SSH, no resume
 berth deploy prod-box                                   # explicit one-shot deploy
 ```
+
+On Linux remotes, the session supervisor is launched under the per-user
+systemd manager (`systemd-run --user --scope`) and berth best-effort enables
+lingering, so a session keeps running after you disconnect or close the
+laptop — instead of being reaped with your SSH login by `KillUserProcesses`.
+Hosts without a usable user systemd manager fall back to a plain detached
+supervisor.
 
 Press `Ctrl-]` while attached to detach the client without stopping the
 session. Change `defaults.detach_key` in config to another key such as
