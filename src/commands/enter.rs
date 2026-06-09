@@ -945,8 +945,10 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             None => format!("berth {v}"),
         })
         .unwrap_or_else(|| "no remote berth".to_string());
-    let version_drift = env.berth_version.as_deref() != Some(local_version.as_str())
-        || env.berth_build.as_deref() != Some(local_build);
+    // Only surface the version banner on a genuine VERSION difference. A
+    // build-id-only drift (two `-dirty` builds of the same release, common
+    // when developing berth itself) is not worth a line on every enter.
+    let version_drift = env.berth_version.as_deref() != Some(local_version.as_str());
     if version_drift {
         eprintln!(
             "{} local v{} ({})  |  {host}: {}",
@@ -964,10 +966,9 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             // Trusted but auto-update disabled. Print a clear hint and
             // treat this run as no-deploy so the legacy mux cascade
             // takes over with whatever's on the remote.
-            if matches!(
-                decision,
-                DeployDecision::Deploy { .. } | DeployDecision::LocalBuildUnsupported { .. }
-            ) {
+            // Only nag about a deferred update for a real pending deploy —
+            // not for a same-version build refresh we couldn't do anyway.
+            if matches!(decision, DeployDecision::Deploy { .. }) {
                 eprintln!(
                     "berth: auto_update_remote is false; remote stays at {remote_ver_str}. \
                      Run `berth deploy --force {quoted_host}` to refresh."
@@ -992,10 +993,16 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             local_target,
             reason,
         } => {
-            eprintln!(
-                "berth: {reason}; local binary target {:?} cannot be deployed to remote target {target}. \
-                 Skipping same-version build refresh to avoid redeploying a stale release artifact.",
-                local_target
+            // Same-version, build-id-only difference we can't push across a
+            // target mismatch (e.g. an aarch64 dev box driving an x86_64
+            // remote). The remote already runs the same release version, so
+            // this is benign — keep it out of the user's way and leave the
+            // detail for `berth logs`.
+            tracing::debug!(
+                %reason,
+                ?local_target,
+                remote_target = %target,
+                "skipping cross-target same-version build refresh"
             );
             Ok(true)
         }
