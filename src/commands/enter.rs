@@ -1075,10 +1075,19 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
                             // published yet, no egress) must not block entry
                             // when the remote already has a working berth —
                             // warn and continue with what's installed.
+                            let cause = deploy::root_cause_line(&err);
+                            let reason = if cause.contains("404") {
+                                format!(
+                                    "release {tag} is not published yet — \
+                                     CI may still be building; the upgrade \
+                                     will retry on the next enter"
+                                )
+                            } else {
+                                cause
+                            };
                             eprintln!(
-                                "berth: could not deploy {tag} to {host} ({}); \
+                                "berth: could not deploy {tag} to {host} ({reason}); \
                                  continuing with remote berth {}",
-                                deploy::root_cause_line(&err),
                                 env.berth_version.as_deref().unwrap_or("unknown")
                             );
                             return Ok(true);
