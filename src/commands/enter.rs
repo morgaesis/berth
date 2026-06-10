@@ -1068,9 +1068,23 @@ async fn ensure_remote_ready(config: &mut Config, host: &str, opts: &EnterOption
             let info = match source {
                 deploy::DeploySource::Release => {
                     let tag = format!("v{local_version}");
-                    deploy::ensure_deployed(host, &tag, target)
-                        .await
-                        .with_context_hard_fail(host)?
+                    match deploy::ensure_deployed(host, &tag, target).await {
+                        Ok(info) => info,
+                        Err(err) if env.berth_version.is_some() => {
+                            // An upgrade we couldn't fetch (release not
+                            // published yet, no egress) must not block entry
+                            // when the remote already has a working berth —
+                            // warn and continue with what's installed.
+                            eprintln!(
+                                "berth: could not deploy {tag} to {host} ({}); \
+                                 continuing with remote berth {}",
+                                deploy::root_cause_line(&err),
+                                env.berth_version.as_deref().unwrap_or("unknown")
+                            );
+                            return Ok(true);
+                        }
+                        Err(err) => return Err(err).with_context_hard_fail(host),
+                    }
                 }
                 deploy::DeploySource::LocalBinary => deploy::ensure_deployed_local(host, target)
                     .await

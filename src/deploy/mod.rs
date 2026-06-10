@@ -15,6 +15,7 @@
 pub mod fetch;
 pub mod probe;
 pub mod push;
+pub mod remote_fetch;
 
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
@@ -197,14 +198,46 @@ fn split_target(target: &str) -> Option<(&str, &str, &str)> {
 #[tracing::instrument(level = "info", skip(host), fields(host = %host, tag = %tag, target = %target))]
 pub async fn ensure_deployed(host: &str, tag: &str, target: &'static str) -> Result<DeployedInfo> {
     tracing::info!("starting deploy");
-    // fetch_binary already renders its own bytes/Content-Length bar.
-    let local = fetch_binary(tag, target).await?;
-    tracing::info!(local_path = %local.display(), "fetched binary");
 
-    let scp_bar = phase_spinner(&format!("scp to {host}"));
-    let remote_path = push_binary(host, &local).await?;
-    scp_bar.finish_and_clear();
-    tracing::info!(remote_path = %remote_path.display(), "pushed binary");
+    // Preferred path: the remote pulls the release straight from GitHub —
+    // its egress is usually much faster than the local↔remote SSH link,
+    // and it works from clients (e.g. Windows) with no artifact of their
+    // own. Any failure (no curl/wget, no GitHub egress, checksum mismatch)
+    // falls back to proxying via the local machine: download here, scp up.
+    let remote_path = if remote_fetch::remote_fetch_enabled() {
+        let dl_bar = phase_spinner(&format!("{host} downloading release"));
+        let direct = remote_fetch::deploy_via_remote_download(host, tag, target).await;
+        dl_bar.finish_and_clear();
+        match direct {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "remote-direct download failed");
+                eprintln!(
+                    "  remote could not fetch the release directly ({}); \
+                     falling back to download via this machine",
+                    root_cause_line(&err)
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let remote_path = match remote_path {
+        Some(path) => path,
+        None => {
+            // fetch_binary already renders its own bytes/Content-Length bar.
+            let local = fetch_binary(tag, target).await?;
+            tracing::info!(local_path = %local.display(), "fetched binary");
+
+            let scp_bar = phase_spinner(&format!("scp to {host}"));
+            let remote_path = push_binary(host, &local).await?;
+            scp_bar.finish_and_clear();
+            remote_path
+        }
+    };
+    tracing::info!(remote_path = %remote_path.display(), "binary on remote");
 
     let smoke_bar = phase_spinner("smoke-test");
     smoke_test(host, &remote_path, tag.trim_start_matches('v'), None).await?;
@@ -241,6 +274,17 @@ pub async fn ensure_deployed_local(host: &str, target: &'static str) -> Result<D
         target: target.to_string(),
         version: crate::build_info::version().to_string(),
     })
+}
+
+/// First line of an error's root cause, for one-line status output.
+pub fn root_cause_line(err: &anyhow::Error) -> String {
+    err.root_cause()
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or("unknown error")
+        .trim()
+        .to_string()
 }
 
 fn phase_spinner(message: &str) -> indicatif::ProgressBar {

@@ -39,7 +39,7 @@ pub fn cache_dir() -> Result<PathBuf> {
 /// and well below "would make your laptop swap".
 const MAX_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
 
-fn base_url() -> Result<String> {
+pub(super) fn base_url() -> Result<String> {
     if let Ok(url) = std::env::var(BASE_URL_ENV) {
         let url = url.trim_end_matches('/').to_string();
         if !url.starts_with("https://") {
