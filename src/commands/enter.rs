@@ -717,7 +717,7 @@ async fn enter_remote(
         let from_hook = env::var_os("BERTH_FROM_HOOK").is_some();
         anyhow::bail!(
             "{}",
-            concise_remote_failure_message(&name, host, final_code, from_hook)
+            concise_remote_failure_message(&name, host, &session_id, final_code, from_hook)
         );
     }
     Ok(())
@@ -728,13 +728,19 @@ async fn enter_remote(
 /// `berth logs`; here we point at the two commands worth copy-pasting plus
 /// where to read the detail. Hook-driven (new-tab) entries get a single line
 /// since the shell hook already appends its own "Skipping" note.
-fn concise_remote_failure_message(workspace: &str, host: &str, code: i32, from_hook: bool) -> String {
+fn concise_remote_failure_message(
+    workspace: &str,
+    host: &str,
+    session_id: &str,
+    code: i32,
+    from_hook: bool,
+) -> String {
     let reason = if code == 255 {
         "ssh exited 255 (transport or remote setup)".to_string()
     } else {
         format!("remote exited {code}")
     };
-    let attach = format!("berth attach {workspace}");
+    let attach = format!("berth attach --session {session_id} {workspace}");
     let logs = "berth logs";
     if from_hook {
         format!(

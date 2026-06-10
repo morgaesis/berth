@@ -1324,8 +1324,8 @@ fn test_enter_remote_status_255_failure_is_concise_and_actionable() {
         "stderr should name workspace and host concisely:\n{stderr}"
     );
     assert!(
-        stderr.contains("berth attach atlas/atlas-docs"),
-        "stderr should offer a copy-pasteable attach command:\n{stderr}"
+        stderr.contains("berth attach --session ") && stderr.contains(" atlas/atlas-docs"),
+        "stderr should offer a copy-pasteable attach command with the session id:\n{stderr}"
     );
     assert!(
         stderr.contains("berth enter atlas/atlas-docs"),
