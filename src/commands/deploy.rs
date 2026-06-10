@@ -11,7 +11,7 @@ pub async fn run(host: String, tag: Option<String>, force: bool) -> Result<()> {
     let local_version = berth::build_info::version().to_string();
     let local_build = berth::build_info::build_id();
     let local_os = std::env::consts::OS;
-    let local_arch = std::env::consts::ARCH;
+    let local_arch = deploy::local::local_arch_description();
     let quoted_host = berth::ssh::shell_escape_arg(&host);
 
     let probe_spinner = phase_spinner(&format!("probing {host}"));

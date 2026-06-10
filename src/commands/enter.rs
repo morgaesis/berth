@@ -1114,7 +1114,7 @@ fn confirm_deploy(
     eprintln!(
         "  local:  {} / {}  (v{local_version})",
         std::env::consts::OS,
-        std::env::consts::ARCH
+        berth::deploy::local::local_arch_description()
     );
     eprintln!(
         "  remote: {} / {}  ({})",
