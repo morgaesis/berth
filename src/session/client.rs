@@ -21,7 +21,7 @@ impl std::fmt::Display for SessionBusy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "session is already attached by another client; pass --new to start a fresh one"
+            "session is already attached by another client; pass --force to detach it or --new to start a fresh one"
         )
     }
 }
@@ -37,6 +37,10 @@ fn lock_path_for(socket_path: &Path) -> PathBuf {
     };
     p.set_extension(new_ext);
     p
+}
+
+pub fn session_lock_path(socket_path: &Path) -> PathBuf {
+    lock_path_for(socket_path)
 }
 
 pub fn session_activity_time(socket_path: &Path) -> Option<std::time::SystemTime> {

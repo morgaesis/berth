@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub struct AttachOptions {
     pub supervisor: bool,
     pub new: bool,
+    pub force: bool,
     /// Attach to the newest free session, or create one if none are
     /// available. Kept for explicit attach workflows; `berth enter`
     /// uses a generated session id instead.
@@ -25,6 +26,20 @@ pub struct AttachOptions {
 }
 
 pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
+    match run_inner(workspace, opts).await {
+        Err(err) if err.is::<session::client::SessionBusy>() => {
+            if let Some(code) = configured_busy_exit_code()? {
+                eprintln!("{err}");
+                Ok(code)
+            } else {
+                Err(err)
+            }
+        }
+        result => result,
+    }
+}
+
+async fn run_inner(workspace: String, opts: AttachOptions) -> Result<i32> {
     if let Some(id) = &opts.session {
         berth::validate_session_id(id)?;
     }
@@ -32,6 +47,7 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
         workspace = %workspace,
         supervisor = opts.supervisor,
         new = opts.new,
+        force = opts.force,
         resume_or_new = opts.resume_or_new,
         session_id = opts.session.as_deref().unwrap_or(""),
         list = opts.list,
@@ -67,7 +83,7 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
     }
     if opts.new {
         return match opts.session {
-            Some(id) => start_or_attach_session(workspace, id, opts.command).await,
+            Some(id) => start_or_attach_session(workspace, id, opts.command, opts.force).await,
             None => start_fresh(workspace, opts.command).await,
         };
     }
@@ -79,7 +95,18 @@ pub async fn run(workspace: String, opts: AttachOptions) -> Result<i32> {
             "command override is only valid with --new (resuming an existing session inherits its original command)"
         );
     }
-    resume(workspace, opts.session).await
+    resume(workspace, opts.session, opts.force).await
+}
+
+fn configured_busy_exit_code() -> Result<Option<i32>> {
+    let Some(raw) = std::env::var_os("BERTH_ATTACH_BUSY_EXIT") else {
+        return Ok(None);
+    };
+    let raw = raw.to_string_lossy();
+    let code = raw
+        .parse::<i32>()
+        .with_context(|| format!("parsing BERTH_ATTACH_BUSY_EXIT={raw:?}"))?;
+    Ok(Some(code))
 }
 
 async fn maybe_remote_attach(workspace: &str, opts: &AttachOptions) -> Result<Option<i32>> {
@@ -157,6 +184,7 @@ async fn remote_attach_with_reconnect(
             opts.list_long,
             session,
             opts.new,
+            opts.force,
             &opts.command,
         )
         .await?;
@@ -284,7 +312,7 @@ async fn run_supervisor(
 ) -> Result<i32> {
     supervisor::detach_from_terminal().ok();
     let socket_path = session::session_socket(&workspace, &session_id)?;
-    let workdir = workspace_path(&workspace);
+    let workdir = supervisor_workdir(&workspace);
     tracing::info!(
         workspace = %workspace,
         session_id = %session_id,
@@ -308,6 +336,13 @@ async fn run_supervisor(
     supervisor::run(cfg).await
 }
 
+fn supervisor_workdir(workspace: &str) -> Option<PathBuf> {
+    std::env::var_os("BERTH_SUPERVISOR_CWD")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| workspace_path(workspace))
+}
+
 async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
     let id = session::new_session_id();
     tracing::info!(
@@ -315,13 +350,14 @@ async fn start_fresh(workspace: String, command: Vec<String>) -> Result<i32> {
         session_id = %id,
         "creating fresh session id"
     );
-    start_or_attach_session(workspace, id, command).await
+    start_or_attach_session(workspace, id, command, false).await
 }
 
 async fn start_or_attach_session(
     workspace: String,
     id: String,
     command: Vec<String>,
+    force: bool,
 ) -> Result<i32> {
     let sessions_dir = session::sessions_dir(&workspace)?;
     std::fs::create_dir_all(&sessions_dir)
@@ -334,7 +370,7 @@ async fn start_or_attach_session(
             socket = %socket_path.display(),
             "existing session socket found; attaching"
         );
-        return session::client::attach(&socket_path).await;
+        return attach_resuming_session(&workspace, &id, &socket_path, force).await;
     }
     let log_path = supervisor_log_path(&workspace, &id)?;
     tracing::info!(
@@ -422,7 +458,7 @@ fn command_exited_before_attach_error(command: &[String]) -> anyhow::Error {
     )
 }
 
-async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
+async fn resume(workspace: String, session: Option<String>, force: bool) -> Result<i32> {
     let sessions = session::list_sessions(&workspace)?;
     tracing::info!(
         workspace = %workspace,
@@ -493,7 +529,119 @@ async fn resume(workspace: String, session: Option<String>) -> Result<i32> {
         socket = %socket_path.display(),
         "resume attach found existing socket"
     );
-    session::client::attach(&socket_path).await
+    attach_resuming_session(&workspace, &target, &socket_path, force).await
+}
+
+async fn attach_resuming_session(
+    workspace: &str,
+    session_id: &str,
+    socket_path: &Path,
+    force: bool,
+) -> Result<i32> {
+    match session::client::attach(socket_path).await {
+        Err(err)
+            if err.is::<session::client::SessionBusy>()
+                && (force || std::env::var_os("BERTH_ATTACH_TAKEOVER").is_some()) =>
+        {
+            let mode = if force {
+                AttachReclaimMode::Force
+            } else {
+                AttachReclaimMode::StaleOnly
+            };
+            if reclaim_attach_owner(workspace, session_id, socket_path, mode)? {
+                return session::client::attach(socket_path).await;
+            }
+            Err(err)
+        }
+        result => result,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AttachReclaimMode {
+    StaleOnly,
+    Force,
+}
+
+fn reclaim_attach_owner(
+    workspace: &str,
+    session_id: &str,
+    socket_path: &Path,
+    mode: AttachReclaimMode,
+) -> Result<bool> {
+    #[cfg(not(unix))]
+    {
+        let _ = (workspace, session_id, socket_path, mode);
+        Ok(false)
+    }
+    #[cfg(unix)]
+    {
+        use nix::errno::Errno;
+        use nix::sys::signal::{kill, Signal};
+        use nix::unistd::Pid;
+
+        let lock_path = session::client::session_lock_path(socket_path);
+        let Some(pid) = read_attach_lock_pid(&lock_path)? else {
+            tracing::warn!(
+                workspace,
+                session_id,
+                lock = %lock_path.display(),
+                "cannot reclaim busy session because lock owner pid is missing"
+            );
+            return Ok(false);
+        };
+        let matching_owner = match mode {
+            AttachReclaimMode::StaleOnly => stale_attach_owner_matches(pid, workspace, session_id)?,
+            AttachReclaimMode::Force => attach_owner_matches(pid, workspace, session_id)?,
+        };
+        if !matching_owner {
+            tracing::warn!(
+                workspace,
+                session_id,
+                pid,
+                force = matches!(mode, AttachReclaimMode::Force),
+                "busy session owner is not a matching reclaimable attach process; not reclaiming"
+            );
+            return Ok(false);
+        }
+
+        match mode {
+            AttachReclaimMode::StaleOnly => {
+                tracing::warn!(
+                    workspace,
+                    session_id,
+                    pid,
+                    "reclaiming stale attach client for reconnect"
+                );
+                eprintln!(
+                    "session {session_id} is still held by stale attach pid {pid}; reclaiming..."
+                );
+            }
+            AttachReclaimMode::Force => {
+                tracing::warn!(
+                    workspace,
+                    session_id,
+                    pid,
+                    "force-detaching existing attach client"
+                );
+                eprintln!("session {session_id} is attached by pid {pid}; force-detaching it...");
+            }
+        }
+
+        match kill(Pid::from_raw(pid), Signal::SIGTERM) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(err) => return Err(anyhow::Error::new(err).context("terminating stale attach")),
+        }
+        if wait_until_session_free(socket_path, Duration::from_secs(2)) {
+            return Ok(true);
+        }
+
+        match kill(Pid::from_raw(pid), Signal::SIGKILL) {
+            Ok(()) | Err(Errno::ESRCH) => {}
+            Err(err) => return Err(anyhow::Error::new(err).context("killing stale attach")),
+        }
+        Ok(wait_until_session_free(socket_path, Duration::from_secs(1)))
+    }
 }
 
 fn list_sessions(workspace: &str, all: bool, long: bool) -> Result<i32> {
@@ -732,6 +880,9 @@ fn spawn_supervisor_detached(
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_clone))
         .stderr(Stdio::from(log));
+    if let Some(cwd) = std::env::var_os("BERTH_SUPERVISOR_CWD") {
+        cmd.env("BERTH_SUPERVISOR_CWD", cwd);
+    }
     tracing::info!(
         workspace,
         session_id,
@@ -768,8 +919,14 @@ fn spawn_supervisor_via_systemd(
         // Garbage-collect the transient unit when the supervisor exits so a
         // dead session never leaves a lingering failed unit behind.
         .arg("--collect")
-        .arg(format!("--unit={unit}"))
-        .arg("--")
+        .arg(format!("--unit={unit}"));
+    if let Some(cwd) = std::env::var_os("BERTH_SUPERVISOR_CWD") {
+        cmd.arg(format!(
+            "--setenv=BERTH_SUPERVISOR_CWD={}",
+            cwd.to_string_lossy()
+        ));
+    }
+    cmd.arg("--")
         .arg(exe)
         .args(inner)
         .stdin(Stdio::null())
@@ -897,9 +1054,98 @@ fn workspace_path(name: &str) -> Option<PathBuf> {
     projects.exists().then_some(projects)
 }
 
+#[cfg(unix)]
+fn read_attach_lock_pid(lock_path: &Path) -> Result<Option<i32>> {
+    let content = match std::fs::read_to_string(lock_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", lock_path.display())),
+    };
+    Ok(content.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|pid| pid.parse::<i32>().ok())
+    }))
+}
+
+#[cfg(unix)]
+fn wait_until_session_free(socket_path: &Path, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if session::client::is_session_free(socket_path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    session::client::is_session_free(socket_path)
+}
+
+#[cfg(unix)]
+fn stale_attach_owner_matches(pid: i32, workspace: &str, session_id: &str) -> Result<bool> {
+    if !attach_owner_matches(pid, workspace, session_id)? {
+        return Ok(false);
+    }
+    let Some(ppid) = proc_ppid(pid)? else {
+        return Ok(false);
+    };
+    Ok(ppid <= 1 || !Path::new("/proc").join(ppid.to_string()).exists())
+}
+
+#[cfg(unix)]
+fn attach_owner_matches(pid: i32, workspace: &str, session_id: &str) -> Result<bool> {
+    let args = proc_cmdline_args(pid)?;
+    Ok(attach_owner_cmdline_matches(&args, workspace, session_id))
+}
+
+#[cfg(unix)]
+fn proc_cmdline_args(pid: i32) -> Result<Vec<String>> {
+    let path = Path::new("/proc").join(pid.to_string()).join("cmdline");
+    let bytes = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(bytes
+        .split(|b| *b == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).to_string())
+        .collect())
+}
+
+#[cfg(unix)]
+fn proc_ppid(pid: i32) -> Result<Option<i32>> {
+    let path = Path::new("/proc").join(pid.to_string()).join("status");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+    };
+    Ok(content.lines().find_map(|line| {
+        line.strip_prefix("PPid:")
+            .and_then(|rest| rest.trim().parse::<i32>().ok())
+    }))
+}
+
+#[cfg(any(unix, test))]
+fn attach_owner_cmdline_matches(args: &[String], workspace: &str, session_id: &str) -> bool {
+    if args.iter().any(|arg| arg == "--supervisor") {
+        return false;
+    }
+    let Some(attach_idx) = args.iter().position(|arg| arg == "attach") else {
+        return false;
+    };
+    let Some(session_flag_idx) = args.iter().position(|arg| arg == "--session") else {
+        return false;
+    };
+    if session_flag_idx <= attach_idx {
+        return false;
+    }
+    if args.get(session_flag_idx + 1).map(String::as_str) != Some(session_id) {
+        return false;
+    }
+    args.iter().skip(attach_idx + 1).any(|arg| arg == workspace)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sanitize_unit;
+    use super::{attach_owner_cmdline_matches, sanitize_unit, supervisor_workdir};
+    use std::path::PathBuf;
 
     #[test]
     fn sanitize_unit_maps_slash_and_keeps_valid_chars() {
@@ -912,5 +1158,60 @@ mod tests {
         assert_eq!(sanitize_unit("../etc"), "..-etc");
         // The result is always a single token a `--unit=` value can hold.
         assert!(sanitize_unit("x y\tz").chars().all(|c| !c.is_whitespace()));
+    }
+
+    #[test]
+    fn supervisor_workdir_prefers_explicit_remote_enter_cwd() {
+        let prior = std::env::var_os("BERTH_SUPERVISOR_CWD");
+        std::env::set_var("BERTH_SUPERVISOR_CWD", "/home/ubuntu/Projects/postil-dev");
+        assert_eq!(
+            supervisor_workdir("postil/dev"),
+            Some(PathBuf::from("/home/ubuntu/Projects/postil-dev"))
+        );
+        match prior {
+            Some(value) => std::env::set_var("BERTH_SUPERVISOR_CWD", value),
+            None => std::env::remove_var("BERTH_SUPERVISOR_CWD"),
+        }
+    }
+
+    #[test]
+    fn attach_owner_cmdline_matches_same_workspace_and_session_only() {
+        let owner = vec![
+            "/home/ubuntu/.local/bin/berth".to_string(),
+            "attach".to_string(),
+            "--new".to_string(),
+            "--session".to_string(),
+            "1b02652d9683".to_string(),
+            "postil/dev".to_string(),
+        ];
+        assert!(attach_owner_cmdline_matches(
+            &owner,
+            "postil/dev",
+            "1b02652d9683"
+        ));
+        assert!(!attach_owner_cmdline_matches(
+            &owner,
+            "other/dev",
+            "1b02652d9683"
+        ));
+        assert!(!attach_owner_cmdline_matches(
+            &owner,
+            "postil/dev",
+            "different"
+        ));
+
+        let supervisor = vec![
+            "berth".to_string(),
+            "attach".to_string(),
+            "--supervisor".to_string(),
+            "--session".to_string(),
+            "1b02652d9683".to_string(),
+            "postil/dev".to_string(),
+        ];
+        assert!(!attach_owner_cmdline_matches(
+            &supervisor,
+            "postil/dev",
+            "1b02652d9683"
+        ));
     }
 }

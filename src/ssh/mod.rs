@@ -251,6 +251,7 @@ pub async fn ssh_attach_remote(
     list_long: bool,
     session: Option<&str>,
     new: bool,
+    force: bool,
     command: &[String],
 ) -> Result<i32> {
     let config = Config::load()?;
@@ -271,6 +272,9 @@ pub async fn ssh_attach_remote(
     }
     if new {
         remote.push_str(" --new");
+    }
+    if force {
+        remote.push_str(" --force");
     }
     if let Some(id) = session {
         remote.push_str(" --session ");
@@ -321,6 +325,7 @@ pub async fn ssh_attach_remote(
         workspace = %workspace_name,
         session_id = session.unwrap_or(""),
         new,
+        force,
         command_len = command.len(),
         "remote attach ssh command prepared"
     );
@@ -510,12 +515,20 @@ fn remote_enter_command_with(
     // creating/attaching the session locally. We have already SSHed to the
     // final host; this is where the session must live. `ssh_attach_remote`
     // sets the same guard — keep the two attach paths consistent.
+    let reconnect_env = if matches!(session_mode, RemoteSessionMode::AttachOnly) {
+        format!(
+            "BERTH_ATTACH_BUSY_EXIT={} BERTH_ATTACH_TAKEOVER=1 ",
+            crate::session::SESSION_BUSY_EXIT
+        )
+    } else {
+        String::new()
+    };
     let attach_env = match detach_key {
         Some(key) => format!(
-            "BERTH_ATTACH_LOCAL=1 BERTH_DETACH_KEY={} ",
+            "BERTH_ATTACH_LOCAL=1 {reconnect_env}BERTH_DETACH_KEY={} ",
             shell_escape_arg(key)
         ),
-        None => "BERTH_ATTACH_LOCAL=1 ".to_string(),
+        None => format!("BERTH_ATTACH_LOCAL=1 {reconnect_env}"),
     };
 
     // Resumability cascade. Best to worst:
@@ -577,7 +590,7 @@ fn remote_enter_command_with(
            berth_bin=$(command -v berth); \
          fi; \
          if [ -n \"$berth_bin\" ]; then \
-           {attach_env}exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
+           BERTH_SUPERVISOR_CWD=\"$PWD\" {attach_env}exec \"$berth_bin\" attach {attach_verb} {escaped_workspace}{attach_cmd_suffix}; \
          elif command -v tmux >/dev/null 2>&1; then \
            {legacy_tmux}; \
          elif command -v screen >/dev/null 2>&1; then \
@@ -608,6 +621,10 @@ fn normalize_remote_path(path: &str) -> String {
         return format!("\"$HOME\"/{}", shell_escape_arg(rest));
     }
     shell_escape_arg(path)
+}
+
+pub fn remote_path_expr(path: &str) -> String {
+    normalize_remote_path(path)
 }
 
 #[cfg(test)]
@@ -1005,6 +1022,7 @@ mod tests {
         );
 
         assert!(command.contains("exec \"$berth_bin\" attach --session 'abc123def456' 'work'"));
+        assert!(command.contains("BERTH_ATTACH_BUSY_EXIT=76 BERTH_ATTACH_TAKEOVER=1"));
         assert!(!command.contains("attach --new --session 'abc123def456'"));
         assert!(command.contains("exec tmux attach-session -t 'berth-work-abc123def456'"));
         assert!(!command.contains("tmux new-session"));

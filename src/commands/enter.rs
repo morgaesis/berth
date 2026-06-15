@@ -586,6 +586,26 @@ async fn enter_remote(
         // we recover from is "the session I was attaching to is gone";
         // anything else (the attached program exited non-zero, a genuine
         // failure) is propagated.
+        if reconnect_attach_only && code == berth::session::SESSION_BUSY_EXIT {
+            tracing::warn!(
+                workspace = %name,
+                host,
+                session_id = %session_id,
+                attempt,
+                backoff_ms,
+                "remote session is still attached elsewhere; retrying same session"
+            );
+            restore_terminal_modes_for_status();
+            eprintln!(
+                "{} session {} still attached elsewhere; retrying…  (Ctrl+C to abort)",
+                "·".dimmed(),
+                session_id.cyan()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+            continue;
+        }
+
         if reconnect_attach_only && code == berth::session::SESSION_NOT_FOUND_EXIT {
             session_gone_retries += 1;
             if session_gone_retries <= MAX_SESSION_GONE_RETRIES {

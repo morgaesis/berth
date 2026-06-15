@@ -4,15 +4,12 @@ use berth::runtime::{self, CommandSpec};
 use berth::ssh;
 use std::path::Path;
 
-fn remote_projects_path() -> String {
-    "$HOME/.local/share/berth/projects".to_string()
-}
-
 pub async fn run(
     name: String,
     command: Vec<String>,
     ports: Vec<u16>,
     remote_override: Option<String>,
+    dir_override: Option<String>,
 ) -> Result<()> {
     let config = Config::load()?;
 
@@ -21,18 +18,15 @@ pub async fn run(
         .get(&name)
         .ok_or_else(|| anyhow::anyhow!("Workspace '{}' not found", name))?;
 
-    // Determine remote - use override or workspace config
-    let remote = remote_override.or_else(|| workspace.remote.clone());
+    // Determine remote - use override, workspace config, or org config.
+    let remote = remote_override.or_else(|| config.resolved_remote(&name, workspace));
 
     // Ports require a remote
     if !ports.is_empty() && remote.is_none() {
         eprintln!("Ports (-p) have no effect for local workspaces. Ignoring.");
     }
 
-    let cmd_str = command.join(" ");
-    if cmd_str.is_empty() {
-        eprintln!("No command specified");
-    }
+    let cmd_str = remote_shell_command(&command)?;
 
     match remote {
         Some(host) => {
@@ -43,13 +37,10 @@ pub async fn run(
                 false
             };
 
-            let remote_path = format!("{}/{}", remote_projects_path(), name);
-            let full_cmd = format!(
-                "cd {} && nohup {} >/dev/null 2>&1 & disown",
-                remote_path, cmd_str
-            );
+            let remote_path = remote_run_path(&config, &name, workspace, dir_override.as_deref());
+            let full_cmd = format!("cd {remote_path} && {cmd_str}");
 
-            println!("Running on {}: cd {} && {}", host, remote_path, cmd_str);
+            println!("Running on {}: {}", host, full_cmd);
 
             let output = ssh::run_remote_command(&host, &full_cmd).await?;
 
@@ -85,6 +76,60 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+fn remote_run_path(
+    config: &Config,
+    name: &str,
+    workspace: &berth::config::Workspace,
+    dir_override: Option<&str>,
+) -> String {
+    dir_override
+        .map(ssh::remote_path_expr)
+        .or_else(|| {
+            config
+                .resolved_remote_dir(name, workspace)
+                .map(|dir| ssh::remote_path_expr(&dir))
+        })
+        .unwrap_or_else(|| {
+            format!(
+                "{}/{}",
+                remote_projects_path_expr(),
+                ssh::shell_escape_arg(name)
+            )
+        })
+}
+
+fn remote_projects_path_expr() -> String {
+    "\"$HOME\"/.local/share/berth/projects".to_string()
+}
+
+fn remote_shell_command(command: &[String]) -> Result<String> {
+    if command.is_empty() {
+        anyhow::bail!("No command specified");
+    }
+    if command.len() == 1 {
+        return Ok(command[0].clone());
+    }
+    Ok(command
+        .iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            if idx == 0 && is_shell_bareword(arg) {
+                arg.clone()
+            } else {
+                ssh::shell_escape_arg(arg)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+fn is_shell_bareword(arg: &str) -> bool {
+    !arg.is_empty()
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.' | '/'))
 }
 
 fn local_run_spec(

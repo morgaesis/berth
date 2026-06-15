@@ -16,6 +16,13 @@ use std::path::PathBuf;
 /// running exited", instead of spinning forever on a dead id.
 pub const SESSION_NOT_FOUND_EXIT: i32 = 75;
 
+/// Exit code returned by remote `berth attach` when the requested session
+/// exists but another attach client still holds the per-session client lock.
+/// During `berth enter` reconnect this is usually transient: the previous SSH
+/// attempt may have lost transport before the remote attach process observed
+/// EOF and released its lock.
+pub const SESSION_BUSY_EXIT: i32 = 76;
+
 pub fn runtime_dir() -> Result<PathBuf> {
     if let Ok(dir) = std::env::var("BERTH_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir));

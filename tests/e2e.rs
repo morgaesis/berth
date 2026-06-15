@@ -820,6 +820,38 @@ fn test_remote_attach_new_uses_stable_session_id_in_skip_mode() {
 }
 
 #[test]
+fn test_remote_attach_force_is_forwarded_in_skip_mode() {
+    let ctx = TestContext::new();
+    let created = ctx
+        .berth()
+        .args(["new", "remote-force", "--remote", "user@remotehost"])
+        .output()
+        .expect("Failed to create remote workspace");
+    assert!(created.status.success());
+
+    let output = ctx
+        .berth()
+        .args([
+            "attach",
+            "--force",
+            "--session",
+            "1dacb0459a4f",
+            "remote-force",
+        ])
+        .output()
+        .expect("Failed to run remote attach");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Would SSH to user@remotehost"));
+    assert!(stdout.contains(" attach --force --session '1dacb0459a4f' 'remote-force'"));
+}
+
+#[test]
 fn test_logs_remote_workspace_uses_resolved_host_in_skip_mode() {
     let ctx = TestContext::new();
     let created = ctx
@@ -1069,6 +1101,148 @@ fn test_enter_remote_prints_resumable_session_command_in_skip_mode() {
 }
 
 #[test]
+fn test_run_remote_uses_configured_dir_and_quotes_argv() {
+    let ctx = TestContext::new();
+
+    let set = ctx
+        .berth()
+        .args([
+            "config",
+            "set",
+            "--dir",
+            "~/Projects/postil-dev",
+            "--remote",
+            "morgaesis-dev",
+            "postil/dev",
+        ])
+        .output()
+        .expect("Failed to configure remote run workspace");
+    assert!(
+        set.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let output = ctx
+        .berth()
+        .args(["run", "postil/dev", "--", "bash", "-ic", "echo hiii && pwd"])
+        .output()
+        .expect("Failed to run remote command");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Running on morgaesis-dev: cd \"$HOME\"/'Projects/postil-dev' && bash '-ic' 'echo hiii && pwd'"),
+        "run should use configured dir and quote argv:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("$HOME/.local/share/berth/projects/postil/dev"),
+        "run should not use auto-managed path when remote_dir is configured:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("nohup"),
+        "run should execute one-shot commands in the foreground:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_run_remote_dir_override_wins() {
+    let ctx = TestContext::new();
+
+    let set = ctx
+        .berth()
+        .args(["config", "set", "--remote", "morgaesis-dev", "postil/dev"])
+        .output()
+        .expect("Failed to configure remote run workspace");
+    assert!(
+        set.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let output = ctx
+        .berth()
+        .args([
+            "run",
+            "--dir",
+            "~/Projects/postil-dev",
+            "postil/dev",
+            "--",
+            "hostname && pwd",
+        ])
+        .output()
+        .expect("Failed to run remote command with dir override");
+    assert!(
+        output.status.success(),
+        "run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "Running on morgaesis-dev: cd \"$HOME\"/'Projects/postil-dev' && hostname && pwd"
+        ),
+        "run should accept --dir and preserve a single shell expression:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_enter_remote_configured_dir_is_forwarded_to_supervisor() {
+    let ctx = TestContext::new();
+
+    let set = ctx
+        .berth()
+        .args([
+            "config",
+            "set",
+            "--dir",
+            "~/Projects/postil-dev",
+            "--remote",
+            "morgaesis-dev",
+            "postil/dev",
+        ])
+        .output()
+        .expect("Failed to run config set for remote dir");
+    assert!(
+        set.status.success(),
+        "config set failed: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+
+    let output = ctx
+        .berth()
+        .args(["enter", "postil/dev", "--no-deploy"])
+        .output()
+        .expect("Failed to run berth enter with configured remote dir");
+    assert!(
+        output.status.success(),
+        "enter failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(
+            "mkdir -p \"$HOME\"/'Projects/postil-dev' && cd \"$HOME\"/'Projects/postil-dev'"
+        ),
+        "remote command should cd to configured dir:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("BERTH_SUPERVISOR_CWD=\"$PWD\" BERTH_ATTACH_LOCAL=1"),
+        "remote attach must pass the chosen cwd through to the supervisor:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("mkdir -p \"$HOME\"/.local/share/berth/projects/'postil/dev'"),
+        "remote command should not use the auto-managed project dir:\n{stdout}"
+    );
+}
+
+#[test]
 fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
     let ctx = TestContext::new();
     let log_path = ctx.temp_dir.join("fake-interactive-ssh.log");
@@ -1137,6 +1311,65 @@ fn test_enter_remote_reconnect_reuses_same_session_without_recreating() {
         !commands[1].contains(" -- 'claude'"),
         "reconnect must not carry a command override:\n{}",
         commands[1]
+    );
+}
+
+#[test]
+fn test_enter_remote_reconnect_retries_temporarily_busy_session() {
+    let ctx = TestContext::new();
+    let log_path = ctx.temp_dir.join("fake-interactive-ssh.log");
+    let state_path = ctx.temp_dir.join("fake-interactive-ssh.state");
+    let workspace = "postil/dev";
+
+    let output = ctx
+        .berth()
+        .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "255,76,76,0")
+        .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+        .env("BERTH_FAKE_INTERACTIVE_SSH_LOG", &log_path)
+        .env("BERTH_RECONNECT_BACKOFF_MS", "1")
+        .env("BERTH_RECONNECT_BACKOFF_CAP_MS", "2")
+        .args(["enter", workspace, "--remote", "fakehost", "--no-deploy"])
+        .output()
+        .expect("Failed to run berth enter with fake busy reconnect");
+
+    assert!(
+        output.status.success(),
+        "busy reconnect should keep retrying the same session: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&log_path).expect("missing fake interactive ssh log");
+    let commands = log
+        .lines()
+        .map(|line| {
+            line.splitn(4, '\t')
+                .nth(3)
+                .unwrap_or_else(|| panic!("malformed fake ssh log line: {line}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 4, "fake ssh log:\n{log}");
+
+    let session = quoted_value_after(commands[0], "--session '");
+    assert!(
+        commands[0].contains(&format!("attach --new --session '{session}' '{workspace}'")),
+        "first attempt creates the session:\n{}",
+        commands[0]
+    );
+    for cmd in &commands[1..] {
+        assert!(
+            cmd.contains(&format!("attach --session '{session}' '{workspace}'")),
+            "busy reconnect must keep attaching to the same session:\n{cmd}"
+        );
+        assert!(
+            !cmd.contains("attach --new --session"),
+            "busy reconnect must not create a replacement session:\n{cmd}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("still attached elsewhere; retrying"),
+        "user should be told the reconnect is waiting for the old attach to clear:\n{stderr}"
     );
 }
 

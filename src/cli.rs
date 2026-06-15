@@ -340,6 +340,12 @@ enum Commands {
         )]
         new: bool,
         #[arg(
+            long = "force",
+            conflicts_with = "list",
+            help = "Detach the currently attached client when resuming a busy session"
+        )]
+        force: bool,
+        #[arg(
             long = "resume-or-new",
             conflicts_with = "new",
             hide = true,
@@ -394,6 +400,12 @@ enum Commands {
         name: String,
         #[arg(short = 'r', long = "remote", help = "Override remote SSH host")]
         remote: Option<String>,
+        #[arg(
+            short = 'd',
+            long = "dir",
+            help = "Override remote working directory for this run"
+        )]
+        dir: Option<String>,
         #[arg(
             short = 'p',
             long = "ports",
@@ -833,6 +845,7 @@ impl Cli {
                 Commands::Attach {
                     name,
                     new,
+                    force,
                     resume_or_new,
                     session,
                     list,
@@ -848,6 +861,7 @@ impl Cli {
                         commands::attach::AttachOptions {
                             supervisor,
                             new,
+                            force,
                             resume_or_new,
                             session,
                             list,
@@ -872,12 +886,13 @@ impl Cli {
                     command,
                     ports,
                     remote,
+                    dir,
                 } => {
                     berth::validate_workspace_name(&name)?;
                     if let Some(host) = &remote {
                         berth::validate_ssh_host(host)?;
                     }
-                    commands::run::run(name, command, ports, remote).await
+                    commands::run::run(name, command, ports, remote, dir).await
                 }
                 Commands::Tunnel { name, ports } => {
                     berth::validate_workspace_name(&name)?;
