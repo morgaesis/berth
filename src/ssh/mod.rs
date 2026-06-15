@@ -255,9 +255,18 @@ pub async fn ssh_attach_remote(
     command: &[String],
 ) -> Result<i32> {
     let config = Config::load()?;
+    let reconnect_env = if !list && session.is_some() {
+        format!(
+            "BERTH_ATTACH_BUSY_EXIT={} BERTH_ATTACH_TAKEOVER=1 ",
+            crate::session::SESSION_BUSY_EXIT
+        )
+    } else {
+        String::new()
+    };
     let mut remote = String::from(
         "berth_bin=; if [ -x \"$HOME/.local/bin/berth\" ]; then berth_bin=\"$HOME/.local/bin/berth\"; elif command -v berth >/dev/null 2>&1; then berth_bin=$(command -v berth); else printf 'berth not found on remote\\n' >&2; exit 127; fi; BERTH_ATTACH_LOCAL=1 ",
     );
+    remote.push_str(&reconnect_env);
     remote.push_str("BERTH_DETACH_KEY=");
     remote.push_str(&shell_escape_arg(&config.detach_key_env_value()));
     remote.push_str(" exec \"$berth_bin\" attach");

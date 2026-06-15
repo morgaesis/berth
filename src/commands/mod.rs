@@ -12,6 +12,7 @@ pub mod new;
 pub mod org;
 pub mod project;
 pub mod reap;
+pub mod reconnect;
 pub mod run;
 pub mod shell;
 pub mod stop;

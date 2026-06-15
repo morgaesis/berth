@@ -1,3 +1,4 @@
+use crate::commands::reconnect::{ReconnectBackoff, ReconnectWake};
 use anyhow::Result;
 use berth::config::{Config, Runtime, Workspace};
 use berth::deploy::{self, ConsentMode, DeployDecision};
@@ -461,8 +462,7 @@ async fn enter_remote(
     // identical session.
     const MAX_SESSION_GONE_RETRIES: u32 = 3;
     const MAX_FRESH_RESTARTS: u32 = 3;
-    let (backoff_start, backoff_cap) = reconnect_backoff_params();
-    let mut backoff_ms: u64 = backoff_start;
+    let mut reconnect_backoff = ReconnectBackoff::from_env();
     let mut attempt: u32 = 0;
     // False until a session has (probably) been created remotely; once set,
     // reconnects attach-only and never implicitly create a replacement.
@@ -549,6 +549,7 @@ async fn enter_remote(
             // unrelated to a missing session, so reset that counter.
             attach_only = true;
             session_gone_retries = 0;
+            let backoff_ms = reconnect_backoff.current_ms();
             tracing::warn!(
                 workspace = %name,
                 host,
@@ -560,25 +561,35 @@ async fn enter_remote(
             restore_terminal_modes_for_status();
             if !was_attach_only {
                 eprintln!(
-                    "{} connection lost while starting session {}; reconnecting to the same session…  (Ctrl+C to abort)",
+                    "{} connection lost while starting session {}; reconnecting to the same session…  (press any key to retry now, Ctrl+C to abort)",
                     "·".dimmed(),
                     session_id.cyan()
                 );
             } else if attempt.is_multiple_of(4) {
                 eprintln!(
-                    "{} still reconnecting session {} (attempt {attempt})…",
+                    "{} still reconnecting session {} (attempt {attempt})…  (press any key to retry now)",
                     "·".dimmed(),
                     session_id.cyan()
                 );
             } else {
                 eprintln!(
-                    "{} connection lost; reconnecting session {}…  (Ctrl+C to abort)",
+                    "{} connection lost; reconnecting session {}…  (press any key to retry now, Ctrl+C to abort)",
                     "·".dimmed(),
                     session_id.cyan()
                 );
             }
-            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+            if matches!(
+                reconnect_backoff.wait_and_advance().await?,
+                ReconnectWake::KeyPressed
+            ) {
+                tracing::info!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    "remote reconnect wait interrupted by keypress"
+                );
+            }
             continue;
         }
 
@@ -587,6 +598,7 @@ async fn enter_remote(
         // anything else (the attached program exited non-zero, a genuine
         // failure) is propagated.
         if reconnect_attach_only && code == berth::session::SESSION_BUSY_EXIT {
+            let backoff_ms = reconnect_backoff.current_ms();
             tracing::warn!(
                 workspace = %name,
                 host,
@@ -597,12 +609,22 @@ async fn enter_remote(
             );
             restore_terminal_modes_for_status();
             eprintln!(
-                "{} session {} still attached elsewhere; retrying…  (Ctrl+C to abort)",
+                "{} session {} still attached elsewhere; retrying…  (press any key to retry now, Ctrl+C to abort)",
                 "·".dimmed(),
                 session_id.cyan()
             );
-            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+            if matches!(
+                reconnect_backoff.wait_and_advance().await?,
+                ReconnectWake::KeyPressed
+            ) {
+                tracing::info!(
+                    workspace = %name,
+                    host,
+                    session_id = %session_id,
+                    attempt,
+                    "remote busy-session wait interrupted by keypress"
+                );
+            }
             continue;
         }
 
@@ -610,6 +632,7 @@ async fn enter_remote(
             session_gone_retries += 1;
             if session_gone_retries <= MAX_SESSION_GONE_RETRIES {
                 // Brief flakiness window — a supervisor may be restarting.
+                let backoff_ms = reconnect_backoff.current_ms();
                 tracing::warn!(
                     workspace = %name,
                     host,
@@ -621,14 +644,24 @@ async fn enter_remote(
                 );
                 restore_terminal_modes_for_status();
                 eprintln!(
-                    "{} session {} not found on remote; retrying ({}/{})…  (Ctrl+C to abort)",
+                    "{} session {} not found on remote; retrying ({}/{})…  (press any key to retry now, Ctrl+C to abort)",
                     "·".dimmed(),
                     session_id.cyan(),
                     session_gone_retries,
                     MAX_SESSION_GONE_RETRIES
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-                backoff_ms = (backoff_ms.saturating_mul(2)).min(backoff_cap);
+                if matches!(
+                    reconnect_backoff.wait_and_advance().await?,
+                    ReconnectWake::KeyPressed
+                ) {
+                    tracing::info!(
+                        workspace = %name,
+                        host,
+                        session_id = %session_id,
+                        attempt,
+                        "remote missing-session wait interrupted by keypress"
+                    );
+                }
                 continue;
             }
 
@@ -656,7 +689,7 @@ async fn enter_remote(
             let gone = std::mem::replace(&mut session_id, berth::session::new_session_id());
             attach_only = false;
             session_gone_retries = 0;
-            backoff_ms = backoff_start;
+            reconnect_backoff.reset();
             tracing::warn!(
                 workspace = %name,
                 host,
@@ -854,25 +887,6 @@ fn remote_exit_diagnostic(
             "remote SSH/attach returned status 255 while starting session {session_id} for workspace '{workspace}' on {host}. SSH uses 255 for transport loss, but a remote attach command can also return 255; retry, or run `ssh -tt {quoted_host}` to inspect SSH errors."
         ),
     }
-}
-
-/// Initial and capped backoff (ms) for the reconnect / session-recovery
-/// loop. Defaults to 500ms → 10s, overridable via `BERTH_RECONNECT_BACKOFF_MS`
-/// and `BERTH_RECONNECT_BACKOFF_CAP_MS` (operators who want a snappier or
-/// gentler retry cadence, and the test suite to keep its sleeps tiny). The
-/// cap is floored to the start so a misconfiguration can't invert them.
-fn reconnect_backoff_params() -> (u64, u64) {
-    let start = env::var("BERTH_RECONNECT_BACKOFF_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(500);
-    let cap = env::var("BERTH_RECONNECT_BACKOFF_CAP_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10_000)
-        .max(start);
-    (start, cap)
 }
 
 fn restore_terminal_modes_for_status() {

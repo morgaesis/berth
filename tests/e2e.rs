@@ -852,6 +852,69 @@ fn test_remote_attach_force_is_forwarded_in_skip_mode() {
 }
 
 #[test]
+fn test_remote_attach_reconnect_retries_busy_session_after_transport_loss() {
+    let ctx = TestContext::new();
+    let created = ctx
+        .berth()
+        .args(["new", "remote-busy", "--remote", "user@remotehost"])
+        .output()
+        .expect("Failed to create remote workspace");
+    assert!(created.status.success());
+
+    let log_path = ctx.temp_dir.join("fake-remote-attach.log");
+    let state_path = ctx.temp_dir.join("fake-remote-attach.state");
+    let session = "1dacb0459a4f";
+
+    let output = ctx
+        .berth()
+        .env("BERTH_FAKE_INTERACTIVE_SSH_CODES", "255,76,0")
+        .env("BERTH_FAKE_INTERACTIVE_SSH_STATE", &state_path)
+        .env("BERTH_FAKE_INTERACTIVE_SSH_LOG", &log_path)
+        .env("BERTH_RECONNECT_BACKOFF_MS", "1")
+        .env("BERTH_RECONNECT_BACKOFF_CAP_MS", "2")
+        .args(["attach", "--session", session, "remote-busy"])
+        .output()
+        .expect("Failed to run remote attach reconnect");
+
+    assert!(
+        output.status.success(),
+        "busy reconnect should eventually attach: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = fs::read_to_string(&log_path).expect("missing fake remote attach log");
+    let commands = log
+        .lines()
+        .map(|line| {
+            line.splitn(4, '\t')
+                .nth(3)
+                .unwrap_or_else(|| panic!("malformed fake ssh log line: {line}"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(commands.len(), 3, "fake ssh log:\n{log}");
+    for cmd in commands {
+        assert!(
+            cmd.contains(&format!("attach --session '{session}' 'remote-busy'")),
+            "reconnect must keep attaching to the requested session:\n{cmd}"
+        );
+        assert!(
+            cmd.contains("BERTH_ATTACH_BUSY_EXIT=76 BERTH_ATTACH_TAKEOVER=1"),
+            "remote command must surface retryable busy status:\n{cmd}"
+        );
+        assert!(
+            !cmd.contains("attach --new --session"),
+            "remote attach reconnect must not create a replacement session:\n{cmd}"
+        );
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("still attached elsewhere; retrying"),
+        "user should be told why reconnect is waiting:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_logs_remote_workspace_uses_resolved_host_in_skip_mode() {
     let ctx = TestContext::new();
     let created = ctx

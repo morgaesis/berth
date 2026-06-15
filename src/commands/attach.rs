@@ -1,3 +1,4 @@
+use crate::commands::reconnect::{ReconnectBackoff, ReconnectWake};
 use anyhow::{bail, Context, Result};
 use berth::config::Config;
 use berth::session::{self, supervisor};
@@ -172,7 +173,9 @@ async fn remote_attach_with_reconnect(
             .await
             .is_ok()
     };
-    let mut backoff_ms: u64 = 500;
+    let stable_session_target = session.is_some() && !opts.list;
+    let mut saw_transport_loss = false;
+    let mut reconnect_backoff = ReconnectBackoff::from_env();
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -198,7 +201,10 @@ async fn remote_attach_with_reconnect(
             "remote attach returned"
         );
 
-        if code != 255 || opts.list || session.is_none() {
+        let retrying_transport = code == 255 && stable_session_target;
+        let retrying_busy =
+            code == session::SESSION_BUSY_EXIT && stable_session_target && saw_transport_loss;
+        if !retrying_transport && !retrying_busy {
             tracing::info!(
                 code,
                 attempt,
@@ -209,6 +215,8 @@ async fn remote_attach_with_reconnect(
                     "list-complete"
                 } else if session.is_none() {
                     "no-stable-session-target"
+                } else if code == session::SESSION_BUSY_EXIT {
+                    "session-busy"
                 } else {
                     "remote-command-exit"
                 },
@@ -217,7 +225,7 @@ async fn remote_attach_with_reconnect(
             return Ok(code);
         }
 
-        if attempt == 1 && !remote_probe_succeeded {
+        if retrying_transport && attempt == 1 && !remote_probe_succeeded {
             tracing::warn!(
                 workspace,
                 host,
@@ -228,24 +236,55 @@ async fn remote_attach_with_reconnect(
             return Ok(code);
         }
 
-        tracing::warn!(
-            workspace,
-            host,
-            session_id = session_label,
-            attempt,
-            backoff_ms,
-            reused_session_id_on_next_attempt = session.is_some(),
-            "remote attach transport lost; reconnecting"
-        );
-        if attempt == 1 {
-            eprintln!(
-                "· connection lost; reconnecting remote session {session_label}...  (Ctrl+C to abort)"
+        let backoff_ms = reconnect_backoff.current_ms();
+        if retrying_transport {
+            saw_transport_loss = true;
+            tracing::warn!(
+                workspace,
+                host,
+                session_id = session_label,
+                attempt,
+                backoff_ms,
+                reused_session_id_on_next_attempt = session.is_some(),
+                "remote attach transport lost; reconnecting"
             );
-        } else if attempt.is_multiple_of(4) {
-            eprintln!("· still reconnecting remote session {session_label} (attempt {attempt})...");
+            if attempt == 1 {
+                eprintln!(
+                    "· connection lost; reconnecting remote session {session_label}...  (press any key to retry now, Ctrl+C to abort)"
+                );
+            } else if attempt.is_multiple_of(4) {
+                eprintln!(
+                    "· still reconnecting remote session {session_label} (attempt {attempt})...  (press any key to retry now)"
+                );
+            }
+        } else {
+            tracing::warn!(
+                workspace,
+                host,
+                session_id = session_label,
+                attempt,
+                backoff_ms,
+                "remote attach session is still attached elsewhere after transport loss; retrying"
+            );
+            eprintln!(
+                "· remote session {session_label} still attached elsewhere; retrying...  (press any key to retry now, Ctrl+C to abort)"
+            );
         }
-        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-        backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+
+        if matches!(
+            reconnect_backoff.wait_and_advance().await?,
+            ReconnectWake::KeyPressed
+        ) {
+            tracing::info!(
+                workspace,
+                host,
+                session_id = session_label,
+                attempt,
+                retrying_transport,
+                retrying_busy,
+                "remote attach reconnect wait interrupted by keypress"
+            );
+        }
     }
 }
 
